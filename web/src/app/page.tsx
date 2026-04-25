@@ -12,23 +12,46 @@ import { exportLgx, placeholderIcon } from "./lgxExport";
 // Run `python3 renderer/serve.py 8765` from the lgx-builder root.
 const RENDERER_URL = "http://127.0.0.1:8765/index.html";
 
-const PALETTE: { kind: NodeKind; label: string }[] = [
-  { kind: "Text",          label: "Text" },
-  { kind: "Button",        label: "Button" },
-  { kind: "Rectangle",     label: "Rectangle" },
-  { kind: "Frame",         label: "Frame" },
-  { kind: "Image",         label: "Image" },
-  { kind: "AnimatedImage", label: "Animated image" },
-  { kind: "TextField",     label: "Text field" },
-  { kind: "TextArea",      label: "Text area" },
-  { kind: "ComboBox",      label: "ComboBox" },
-  { kind: "CheckBox",      label: "Checkbox" },
-  { kind: "RadioButton",   label: "Radio button" },
-  { kind: "Switch",        label: "Switch" },
-  { kind: "Slider",        label: "Slider" },
-  { kind: "SpinBox",       label: "SpinBox" },
-  { kind: "ProgressBar",   label: "Progress bar" },
-  { kind: "BusyIndicator", label: "Busy indicator" },
+interface PaletteItem { kind: NodeKind; label: string }
+interface PaletteCategory { name: string; items: PaletteItem[] }
+
+const PALETTE: PaletteCategory[] = [
+  {
+    name: "Layout",
+    items: [
+      { kind: "Frame",     label: "Frame" },
+      { kind: "Rectangle", label: "Rectangle" },
+    ],
+  },
+  {
+    name: "Display",
+    items: [
+      { kind: "Text",          label: "Text" },
+      { kind: "Button",        label: "Button" },
+      { kind: "ProgressBar",   label: "Progress bar" },
+      { kind: "BusyIndicator", label: "Busy indicator" },
+    ],
+  },
+  {
+    name: "Inputs",
+    items: [
+      { kind: "TextField",   label: "Text field" },
+      { kind: "TextArea",    label: "Text area" },
+      { kind: "CheckBox",    label: "Checkbox" },
+      { kind: "RadioButton", label: "Radio button" },
+      { kind: "Switch",      label: "Switch" },
+      { kind: "Slider",      label: "Slider" },
+      { kind: "SpinBox",     label: "SpinBox" },
+      { kind: "ComboBox",    label: "ComboBox" },
+    ],
+  },
+  {
+    name: "Media",
+    items: [
+      { kind: "Image",         label: "Image" },
+      { kind: "AnimatedImage", label: "Animated image" },
+    ],
+  },
 ];
 
 const HISTORY_LIMIT = 50;
@@ -106,6 +129,76 @@ function absoluteRect(root: FrameNode, id: NodeId): { x: number; y: number; w: n
   const { node } = findNode(root, id);
   if (!node) return null;
   return { x, y, w: node.width, h: node.height };
+}
+
+// ── Snap to siblings + parent edges during drag ─────────────────────────────
+//
+// Returns the (dx, dy) deltas adjusted to snap, plus any guide lines to
+// draw. Snap targets per axis: parent left/center/right (top/center/bottom
+// for Y), and each sibling's left/center/right (top/center/bottom for Y).
+// Snap is per-axis: pick the closest target within SNAP_THRESHOLD for each
+// dragged edge (left/center/right) and adjust by the difference.
+//
+// Single-node drag only — multi-node snap with bounding-box semantics is
+// follow-up work.
+
+const SNAP_THRESHOLD = 4;
+
+export type GuideLine =
+  | { kind: "v"; x: number; y1: number; y2: number }
+  | { kind: "h"; y: number; x1: number; x2: number };
+
+interface SnapResult {
+  dx: number;
+  dy: number;
+  guides: GuideLine[];
+}
+
+function snapDrag(
+  baseRoot: FrameNode,
+  draggedId: NodeId,
+  dx: number,
+  dy: number,
+): SnapResult {
+  const found = findNode(baseRoot, draggedId);
+  if (!found.node || !found.parent) return { dx, dy, guides: [] };
+  const node = found.node;
+  const parent = found.parent;
+  const newX = node.x + dx;
+  const newY = node.y + dy;
+
+  const xCands: number[] = [0, parent.width / 2, parent.width];
+  const yCands: number[] = [0, parent.height / 2, parent.height];
+  for (const sib of parent.children) {
+    if (sib.id === draggedId) continue;
+    if (sib.hidden) continue;
+    xCands.push(sib.x, sib.x + sib.width / 2, sib.x + sib.width);
+    yCands.push(sib.y, sib.y + sib.height / 2, sib.y + sib.height);
+  }
+  const draggedX = [newX, newX + node.width / 2, newX + node.width];
+  const draggedY = [newY, newY + node.height / 2, newY + node.height];
+
+  const findBest = (cands: number[], edges: number[]) => {
+    let bestAdjust = 0, bestDist = SNAP_THRESHOLD + 1, bestLine = NaN;
+    for (const c of cands) {
+      for (const e of edges) {
+        const d = Math.abs(c - e);
+        if (d <= SNAP_THRESHOLD && d < bestDist) {
+          bestDist = d; bestAdjust = c - e; bestLine = c;
+        }
+      }
+    }
+    return Number.isNaN(bestLine) ? null : { adjust: bestAdjust, line: bestLine };
+  };
+  const x = findBest(xCands, draggedX);
+  const y = findBest(yCands, draggedY);
+
+  const parentAbs = absoluteRect(baseRoot, parent.id) ?? { x: 0, y: 0, w: parent.width, h: parent.height };
+  const guides: GuideLine[] = [];
+  if (x) guides.push({ kind: "v", x: parentAbs.x + x.line, y1: parentAbs.y, y2: parentAbs.y + parent.height });
+  if (y) guides.push({ kind: "h", y: parentAbs.y + y.line, x1: parentAbs.x, x2: parentAbs.x + parent.width });
+
+  return { dx: dx + (x?.adjust ?? 0), dy: dy + (y?.adjust ?? 0), guides };
 }
 
 // ── History reducer ─────────────────────────────────────────────────────────
@@ -248,7 +341,30 @@ export default function Page() {
   }));
   const root = hist.root;
 
-  const [selectedId, setSelectedId] = useState<NodeId | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<NodeId>>(new Set());
+  // Smart-guide overlay shown only during drag.
+  const [guideLines, setGuideLines] = useState<GuideLine[]>([]);
+  // In-app clipboard for Cmd+C / Cmd+V. Holds deep-cloned nodes WITH their
+  // original ids; reassignIds runs at paste time so each paste produces a
+  // fresh subtree even if you paste twice.
+  const [clipboard, setClipboard] = useState<Node[]>([]);
+
+  // Selection helpers — most callers want one of these instead of touching
+  // the Set directly. `selectSingle(null)` clears the selection.
+  const selectSingle = (id: NodeId | null) =>
+    setSelectedIds(id == null ? new Set() : new Set([id]));
+  const toggleSelected = (id: NodeId) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  // True multi-select select-handler used by canvas + layers rows.
+  const handleSelect = (id: NodeId | null, additive: boolean) => {
+    if (id == null) { setSelectedIds(new Set()); return; }
+    if (additive) toggleSelected(id);
+    else selectSingle(id);
+  };
   const [draggingKind, setDraggingKind] = useState<NodeKind | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -386,7 +502,7 @@ export default function Page() {
       fit: "contain",
     };
     insertChild(opts.parentId ?? root.id, node);
-    setSelectedId(node.id);
+    selectSingle(node.id);
   };
 
   const qmlPreview = useMemo(() => emitMainQml(root, false), [root]);
@@ -423,34 +539,90 @@ export default function Page() {
     });
   };
 
-  const deleteNode = (id: NodeId) => {
-    if (id === root.id) return;
+  // Delete every selected node (root excluded). One commit, one undo step.
+  // The mutate callback re-finds each id in the live clone so indices stay
+  // accurate after each splice — no need to pre-sort.
+  const deleteSelected = () => {
+    if (selectedIds.size === 0) return;
     dispatch({
       type: "commit",
       root: mutateTree(root, (clone) => {
-        const { parent, index } = findNode(clone, id);
-        if (parent && index >= 0) parent.children.splice(index, 1);
+        for (const id of selectedIds) {
+          if (id === root.id) continue;
+          const { parent, index } = findNode(clone, id);
+          if (parent && index >= 0) parent.children.splice(index, 1);
+        }
       }),
     });
-    setSelectedId(null);
+    setSelectedIds(new Set());
   };
 
-  const duplicateNode = (id: NodeId) => {
-    if (id === root.id) return;
-    let newSelectedId: NodeId | null = null;
+  // Snapshot the selection into the in-app clipboard. Deep-clones so later
+  // edits to the original don't bleed into the clipboard payload.
+  const copySelected = () => {
+    if (selectedIds.size === 0) return;
+    const cloned: Node[] = [];
+    for (const id of selectedIds) {
+      if (id === root.id) continue;
+      const { node } = findNode(root, id);
+      if (node) cloned.push(JSON.parse(JSON.stringify(node)) as Node);
+    }
+    if (cloned.length > 0) setClipboard(cloned);
+  };
+
+  const cutSelected = () => {
+    copySelected();
+    deleteSelected();
+  };
+
+  // Paste into the deepest selected Frame (or its parent), or the root if
+  // nothing is selected. Each paste re-assigns ids and offsets by 12px so
+  // repeated pastes stack visibly.
+  const pasteFromClipboard = () => {
+    if (clipboard.length === 0) return;
+    let parentId: NodeId = root.id;
+    const primary = selectedIds.size === 1 ? [...selectedIds][0] : null;
+    if (primary) {
+      const { node, parent } = findNode(root, primary);
+      if (node && isContainer(node)) parentId = node.id;
+      else if (parent) parentId = parent.id;
+    }
+    const newIds: NodeId[] = [];
     dispatch({
       type: "commit",
       root: mutateTree(root, (clone) => {
-        const { node, parent, index } = findNode(clone, id);
-        if (!node || !parent || index < 0) return;
-        const dup = reassignIds(node);
-        // Offset slightly so the duplicate is visible on top of the original.
-        dup.x += 12; dup.y += 12;
-        parent.children.splice(index + 1, 0, dup);
-        newSelectedId = dup.id;
+        const target = findNode(clone, parentId);
+        if (!target.node || !isContainer(target.node)) return;
+        for (const item of clipboard) {
+          const fresh = reassignIds(item);
+          fresh.x += 12; fresh.y += 12;
+          target.node.children.push(fresh);
+          newIds.push(fresh.id);
+        }
       }),
     });
-    if (newSelectedId) setSelectedId(newSelectedId);
+    if (newIds.length > 0) setSelectedIds(new Set(newIds));
+  };
+
+  // Duplicate every selected node, offset by 12px. Selects the new dups.
+  const duplicateSelected = () => {
+    if (selectedIds.size === 0) return;
+    const newIds: NodeId[] = [];
+    dispatch({
+      type: "commit",
+      root: mutateTree(root, (clone) => {
+        for (const id of selectedIds) {
+          if (id === root.id) continue;
+          const { node, parent, index } = findNode(clone, id);
+          if (!node || !parent || index < 0) continue;
+          const dup = reassignIds(node);
+          dup.x += 12; dup.y += 12;
+          parent.children.splice(index + 1, 0, dup);
+          newIds.push(dup.id);
+        }
+      }),
+    });
+    if (newIds.length > 0) setSelectedIds(new Set(newIds));
   };
 
   // Move an existing node to a new parent + index. Used by the layers
@@ -536,7 +708,7 @@ export default function Page() {
     if (s.iconBase64) setIconPng(base64ToU8(s.iconBase64));
     if (s.iconFilename) setIconFilename(s.iconFilename);
     setCollapsedIds(new Set(s.collapsedIds ?? []));
-    setSelectedId(null);
+    setSelectedIds(new Set());
   };
 
   const handleSaveDesign = () => {
@@ -576,37 +748,74 @@ export default function Page() {
     setIconPng(placeholderIcon());
     setIconFilename("icon.png");
     setCollapsedIds(new Set());
-    setSelectedId(null);
+    setSelectedIds(new Set());
   };
 
-  // ── Drag (move) — pointer-event based, captures initial root by reference ──
+  // ── Drag (move) — pointer-event based, supports multi-select ─────────────
+  //
+  // If the grabbed node is part of the current selection, drag every selected
+  // node by the same delta. Otherwise replace the selection with just this
+  // node and drag it solo. Shift-click for additive selection happens in the
+  // node click handler before we ever get here.
 
   const startMove = (e: React.PointerEvent, id: NodeId) => {
     if (e.button !== 0 || id === root.id) return;
     e.stopPropagation();
-    const baseRoot = root;                       // captured snapshot
-    const found = findNode(baseRoot, id);
-    if (!found.node) return;
+
+    // Decide which set of nodes participates in the drag.
+    let dragIds: Set<NodeId>;
+    if (selectedIds.has(id)) {
+      dragIds = new Set(selectedIds);
+    } else {
+      dragIds = new Set([id]);
+      selectSingle(id);
+    }
+    // The root is selectable but never draggable.
+    dragIds.delete(root.id);
+    if (dragIds.size === 0) return;
+
+    const baseRoot = root;
+    const initial = new Map<NodeId, { x: number; y: number }>();
+    for (const sid of dragIds) {
+      const f = findNode(baseRoot, sid);
+      if (f.node) initial.set(sid, { x: f.node.x, y: f.node.y });
+    }
+    if (initial.size === 0) return;
+
     const startCx = e.clientX, startCy = e.clientY;
-    const origX = found.node.x, origY = found.node.y;
     let snapshotted = false;
 
-    setSelectedId(id);
-
     const onMove = (ev: PointerEvent) => {
-      const dx = ev.clientX - startCx;
-      const dy = ev.clientY - startCy;
+      let dx = ev.clientX - startCx;
+      let dy = ev.clientY - startCy;
       if (!snapshotted && (Math.abs(dx) > 1 || Math.abs(dy) > 1)) {
         dispatch({ type: "snapshot" });
         snapshotted = true;
       }
+      // Snap to siblings + parent edges (single-node drags only — multi
+      // would need bounding-box semantics).
+      let guides: GuideLine[] = [];
+      if (initial.size === 1) {
+        const onlyId = [...initial.keys()][0];
+        const r = snapDrag(baseRoot, onlyId, dx, dy);
+        dx = r.dx;
+        dy = r.dy;
+        guides = r.guides;
+      }
+      setGuideLines(guides);
       const next = mutateTree(baseRoot, (clone) => {
-        const f = findNode(clone, id);
-        if (f.node) { f.node.x = Math.round(origX + dx); f.node.y = Math.round(origY + dy); }
+        for (const [sid, pos] of initial) {
+          const f = findNode(clone, sid);
+          if (f.node) {
+            f.node.x = Math.round(pos.x + dx);
+            f.node.y = Math.round(pos.y + dy);
+          }
+        }
       });
       dispatch({ type: "set", root: next });
     };
     const onUp = () => {
+      setGuideLines([]);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
@@ -716,7 +925,7 @@ export default function Page() {
       fresh.y = Math.max(0, Math.min(fresh.y, parent.height - fresh.height));
     }
     insertChild(targetFrameId, fresh);
-    setSelectedId(fresh.id);
+    selectSingle(fresh.id);
     setDraggingKind(null);
   };
 
@@ -741,15 +950,27 @@ export default function Page() {
         return;
       }
       if (meta && e.key.toLowerCase() === "d") {
-        if (selectedId) { e.preventDefault(); duplicateNode(selectedId); }
+        if (selectedIds.size > 0) { e.preventDefault(); duplicateSelected(); }
         return;
       }
-      if ((e.key === "Backspace" || e.key === "Delete") && selectedId) {
+      if (meta && e.key.toLowerCase() === "c") {
+        if (selectedIds.size > 0) { e.preventDefault(); copySelected(); }
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "x") {
+        if (selectedIds.size > 0) { e.preventDefault(); cutSelected(); }
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "v") {
+        if (clipboard.length > 0) { e.preventDefault(); pasteFromClipboard(); }
+        return;
+      }
+      if ((e.key === "Backspace" || e.key === "Delete") && selectedIds.size > 0) {
         e.preventDefault();
-        deleteNode(selectedId);
+        deleteSelected();
         return;
       }
-      if (selectedId && selectedId !== root.id) {
+      if (selectedIds.size > 0) {
         const step = e.shiftKey ? NUDGE_BIG : NUDGE;
         let dx = 0, dy = 0;
         if (e.key === "ArrowLeft")  dx = -step;
@@ -758,15 +979,24 @@ export default function Page() {
         if (e.key === "ArrowDown")  dy =  step;
         if (dx !== 0 || dy !== 0) {
           e.preventDefault();
-          const { node } = findNode(root, selectedId);
-          if (node) updateNode(selectedId, { x: node.x + dx, y: node.y + dy });
+          // Nudge each selected non-root node — single commit, single undo.
+          dispatch({
+            type: "commit",
+            root: mutateTree(root, (clone) => {
+              for (const sid of selectedIds) {
+                if (sid === root.id) continue;
+                const { node } = findNode(clone, sid);
+                if (node) { node.x += dx; node.y += dy; }
+              }
+            }),
+          });
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedId, root]);
+  }, [selectedIds, root, clipboard]);
 
   // ── Export ────────────────────────────────────────────────────────────────
 
@@ -826,8 +1056,11 @@ export default function Page() {
     URL.revokeObjectURL(url);
   };
 
-  const selectedNode = selectedId ? findNode(root, selectedId).node : null;
-  const selectedAbs = selectedId ? absoluteRect(root, selectedId) : null;
+  // The Inspector + ResizeOverlay are single-selection only. `primaryId` is
+  // the lone selected id; null when zero or many are selected.
+  const primaryId: NodeId | null = selectedIds.size === 1 ? [...selectedIds][0] : null;
+  const primaryNode = primaryId ? findNode(root, primaryId).node : null;
+  const primaryAbs = primaryId ? absoluteRect(root, primaryId) : null;
   const canUndo = hist.past.length > 0;
   const canRedo = hist.future.length > 0;
 
@@ -892,19 +1125,28 @@ export default function Page() {
             <div className="mb-2 text-xs font-semibold uppercase text-zinc-500">
               Components
             </div>
-            <div className="flex flex-col gap-1.5">
-              {PALETTE.map((p) => (
-                <button
-                  key={p.kind}
-                  draggable
-                  onDragStart={() => setDraggingKind(p.kind)}
-                  onDragEnd={() => setDraggingKind(null)}
-                  onClick={p.kind === "Image" ? () => imageFileInputRef.current?.click() : undefined}
-                  className="cursor-grab rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-left text-xs hover:border-zinc-400 active:cursor-grabbing"
-                  title={p.kind === "Image" ? "Click to upload, or drag for a placeholder" : undefined}
-                >
-                  {p.label}
-                </button>
+            <div className="flex flex-col gap-3">
+              {PALETTE.map((cat) => (
+                <div key={cat.name}>
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">
+                    {cat.name}
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    {cat.items.map((p) => (
+                      <button
+                        key={p.kind}
+                        draggable
+                        onDragStart={() => setDraggingKind(p.kind)}
+                        onDragEnd={() => setDraggingKind(null)}
+                        onClick={p.kind === "Image" ? () => imageFileInputRef.current?.click() : undefined}
+                        className="cursor-grab rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-left text-xs hover:border-zinc-400 active:cursor-grabbing"
+                        title={p.kind === "Image" ? "Click to upload, or drag for a placeholder" : undefined}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
             <input
@@ -923,7 +1165,10 @@ export default function Page() {
             </p>
             <div className="mt-4 border-t border-zinc-200 pt-3 text-[11px] leading-tight text-zinc-500">
               <div className="mb-1 font-semibold uppercase">Shortcuts</div>
-              <div>Cmd+Z / Shift undo · Cmd+D dup</div>
+              <div>Shift-click multi-select</div>
+              <div>Cmd+Z undo · Cmd+Shift+Z redo</div>
+              <div>Cmd+C/X/V copy/cut/paste</div>
+              <div>Cmd+D duplicate</div>
               <div>Del/Backspace remove</div>
               <div>Arrows nudge (Shift = 10px)</div>
             </div>
@@ -937,8 +1182,8 @@ export default function Page() {
             <div className="flex-1 overflow-y-auto py-1">
               <LayersPanel
                 root={root}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
+                selectedIds={selectedIds}
+                onSelect={handleSelect}
                 collapsedIds={collapsedIds}
                 onToggleCollapsed={toggleCollapsed}
                 onToggleHidden={toggleHidden}
@@ -966,24 +1211,25 @@ export default function Page() {
             <div
               ref={canvasRef}
               className="relative flex-1 overflow-hidden"
-              onClick={() => setSelectedId(null)}
+              onClick={() => handleSelect(null, false)}
             >
               <CanvasArea
                 root={root}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
+                selectedIds={selectedIds}
+                onSelect={handleSelect}
                 onStartMove={startMove}
                 onCanvasDrop={handleCanvasDrop}
                 onCanvasDragOver={handleCanvasDragOver}
                 draggingKind={draggingKind}
                 resizeOverlay={
-                  selectedAbs && selectedId && selectedId !== root.id && selectedNode && !selectedNode.locked ? (
+                  primaryAbs && primaryId && primaryId !== root.id && primaryNode && !primaryNode.locked ? (
                     <ResizeOverlay
-                      rect={selectedAbs}
-                      onStart={(anchor, e) => startResize(e, selectedId, anchor)}
+                      rect={primaryAbs}
+                      onStart={(anchor, e) => startResize(e, primaryId, anchor)}
                     />
                   ) : null
                 }
+                guideOverlay={guideLines.length > 0 ? <GuideOverlay lines={guideLines} /> : null}
               />
             </div>
           </section>
@@ -1022,30 +1268,36 @@ export default function Page() {
             <span className="text-xs font-semibold uppercase text-zinc-500">
               Inspector
             </span>
-            {selectedNode && selectedId !== root.id && (
+            {(selectedIds.size > 0 && (selectedIds.size > 1 || (primaryNode && primaryId !== root.id))) && (
               <div className="flex items-center gap-2">
                 <button
                   className="text-[11px] text-zinc-600 hover:underline"
-                  onClick={() => selectedId && duplicateNode(selectedId)}
+                  onClick={duplicateSelected}
                 >duplicate</button>
                 <button
                   className="text-[11px] text-red-600 hover:underline"
-                  onClick={() => selectedId && deleteNode(selectedId)}
+                  onClick={deleteSelected}
                 >delete</button>
               </div>
             )}
           </div>
-          {!selectedNode ? (
+          {selectedIds.size === 0 ? (
             <p className="text-xs text-zinc-500">
-              Click a node in the canvas to edit. Click empty space to deselect.
+              Click a node in the canvas to edit. Shift-click to add to selection.
+              Click empty space to deselect.
             </p>
-          ) : (
+          ) : selectedIds.size > 1 ? (
+            <p className="text-xs text-zinc-600">
+              <span className="font-mono">{selectedIds.size}</span> items selected.
+              Drag to move them together; Delete / Cmd+D / arrow keys apply to all.
+            </p>
+          ) : primaryNode ? (
             <Inspector
-              node={selectedNode}
-              isRoot={selectedId === root.id}
-              onChange={(patch) => selectedId && updateNode(selectedId, patch)}
+              node={primaryNode}
+              isRoot={primaryId === root.id}
+              onChange={(patch) => primaryId && updateNode(primaryId, patch)}
             />
-          )}
+          ) : null}
           <details className="mt-6">
             <summary className="cursor-pointer text-xs font-semibold uppercase text-zinc-500">
               Generated QML
@@ -1064,28 +1316,30 @@ export default function Page() {
 
 function CanvasArea({
   root,
-  selectedId,
+  selectedIds,
   onSelect,
   onStartMove,
   onCanvasDrop,
   onCanvasDragOver,
   draggingKind,
   resizeOverlay,
+  guideOverlay,
 }: {
   root: FrameNode;
-  selectedId: NodeId | null;
-  onSelect: (id: NodeId | null) => void;
+  selectedIds: Set<NodeId>;
+  onSelect: (id: NodeId | null, additive: boolean) => void;
   onStartMove: (e: React.PointerEvent, id: NodeId) => void;
   onCanvasDrop: (e: React.DragEvent, frameId: NodeId) => void;
   onCanvasDragOver: (e: React.DragEvent) => void;
   draggingKind: NodeKind | null;
   resizeOverlay: React.ReactNode;
+  guideOverlay: React.ReactNode;
 }) {
   return (
     <div
       className="relative inline-block bg-white"
       style={{ width: root.width, height: root.height }}
-      onClick={(e) => { e.stopPropagation(); onSelect(root.id); }}
+      onClick={(e) => { e.stopPropagation(); onSelect(root.id, e.shiftKey || e.metaKey); }}
       onDragOver={onCanvasDragOver}
       onDrop={(e) => onCanvasDrop(e, root.id)}
     >
@@ -1093,7 +1347,7 @@ function CanvasArea({
         <NodeView
           key={child.id}
           node={child}
-          selectedId={selectedId}
+          selectedIds={selectedIds}
           onSelect={onSelect}
           onStartMove={onStartMove}
           onCanvasDrop={onCanvasDrop}
@@ -1102,6 +1356,29 @@ function CanvasArea({
         />
       ))}
       {resizeOverlay}
+      {guideOverlay}
+    </div>
+  );
+}
+
+// Tiny pink guide-line overlay drawn during drag. Positioned in absolute
+// canvas coords (same coordinate space as ResizeOverlay).
+function GuideOverlay({ lines }: { lines: GuideLine[] }) {
+  return (
+    <div className="pointer-events-none absolute inset-0">
+      {lines.map((l, i) => l.kind === "v" ? (
+        <div key={i} style={{
+          position: "absolute",
+          left: l.x - 0.5, top: l.y1, height: l.y2 - l.y1, width: 1,
+          background: "rgb(236, 72, 153)",
+        }} />
+      ) : (
+        <div key={i} style={{
+          position: "absolute",
+          left: l.x1, top: l.y - 0.5, width: l.x2 - l.x1, height: 1,
+          background: "rgb(236, 72, 153)",
+        }} />
+      ))}
     </div>
   );
 }
@@ -1131,7 +1408,7 @@ function commonStyleCss(node: Node): React.CSSProperties {
 
 function NodeView({
   node,
-  selectedId,
+  selectedIds,
   onSelect,
   onStartMove,
   onCanvasDrop,
@@ -1139,8 +1416,8 @@ function NodeView({
   draggingKind,
 }: {
   node: Node;
-  selectedId: NodeId | null;
-  onSelect: (id: NodeId | null) => void;
+  selectedIds: Set<NodeId>;
+  onSelect: (id: NodeId | null, additive: boolean) => void;
   onStartMove: (e: React.PointerEvent, id: NodeId) => void;
   onCanvasDrop: (e: React.DragEvent, frameId: NodeId) => void;
   onCanvasDragOver: (e: React.DragEvent) => void;
@@ -1150,7 +1427,7 @@ function NodeView({
   // either — see qmlEmit.ts). Toggle in the layers panel to bring back.
   if (node.hidden) return null;
 
-  const isSelected = node.id === selectedId;
+  const isSelected = selectedIds.has(node.id);
   const cssStyle = commonStyleCss(node);
 
   // Selection outline lives on a separate transparent overlay so it doesn't
@@ -1165,7 +1442,10 @@ function NodeView({
     onPointerDown: node.locked
       ? undefined
       : (e: React.PointerEvent) => onStartMove(e, node.id),
-    onClick: (e: React.MouseEvent) => { e.stopPropagation(); onSelect(node.id); },
+    onClick: (e: React.MouseEvent) => {
+      e.stopPropagation();
+      onSelect(node.id, e.shiftKey || e.metaKey);
+    },
   };
 
   if (node.kind === "Frame") {
@@ -1187,7 +1467,7 @@ function NodeView({
           <NodeView
             key={c.id}
             node={c}
-            selectedId={selectedId}
+            selectedIds={selectedIds}
             onSelect={onSelect}
             onStartMove={onStartMove}
             onCanvasDrop={onCanvasDrop}
@@ -2399,7 +2679,7 @@ type DropWhere = "before" | "after" | "inside";
 
 function LayersPanel({
   root,
-  selectedId,
+  selectedIds,
   onSelect,
   collapsedIds,
   onToggleCollapsed,
@@ -2408,8 +2688,8 @@ function LayersPanel({
   onMove,
 }: {
   root: FrameNode;
-  selectedId: NodeId | null;
-  onSelect: (id: NodeId) => void;
+  selectedIds: Set<NodeId>;
+  onSelect: (id: NodeId | null, additive: boolean) => void;
   collapsedIds: Set<NodeId>;
   onToggleCollapsed: (id: NodeId) => void;
   onToggleHidden: (id: NodeId) => void;
@@ -2463,7 +2743,7 @@ function LayersPanel({
   const renderRow = (node: Node, depth: number) => {
     const isFrame = isContainer(node);
     const isCollapsed = collapsedIds.has(node.id);
-    const isSelected = node.id === selectedId;
+    const isSelected = selectedIds.has(node.id);
     const isRoot = node.id === root.id;
     const dropMark = dropTarget && dropTarget.id === node.id ? dropTarget.where : null;
 
@@ -2475,7 +2755,7 @@ function LayersPanel({
         onDragOver={(e) => handleDragOver(e, node.id, isFrame)}
         onDrop={handleDrop}
         onDragEnd={reset}
-        onClick={(e) => { e.stopPropagation(); onSelect(node.id); }}
+        onClick={(e) => { e.stopPropagation(); onSelect(node.id, e.shiftKey || e.metaKey); }}
         style={{ paddingLeft: 4 + depth * 12 }}
         className={[
           "relative flex items-center gap-1 py-1 pr-2 text-[11px] cursor-pointer select-none",
