@@ -1,0 +1,39 @@
+# ── External SDKs (gigabytes — never commit) ────────────────────────────────
+Qt/
+emsdk/
+.venv/
+aqtinstall.log
+LogosBasecamp.app/
+
+# ── Renderer build intermediates ────────────────────────────────────────────
+# Keep the runtime artifacts (qml-renderer.wasm/js/html, qtloader.js,
+# index.html) so anyone can clone + run the live preview without Qt
+# installed. Drop everything else (CMake state, Qt autogen, etc).
+renderer/build/CMakeFiles/
+renderer/build/CMakeCache.txt
+renderer/build/cmake_install.cmake
+renderer/build/build.ninja
+renderer/build/.ninja_deps
+renderer/build/.ninja_log
+renderer/build/Renderer/
+renderer/build/qml-renderer_autogen/
+renderer/build/qml-renderer_qmltyperegistrations.cpp
+renderer/build/meta_types/
+renderer/build/qmltypes/
+renderer/build/qtlogo.svg
+renderer/build/.qt/
+renderer/build/.rcc/
+
+# ── hello-world-ui Nix outputs ──────────────────────────────────────────────
+hello-world-ui/result*
+hello-world-ui/.direnv/
+
+# ── OS noise ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editor / tooling ────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo

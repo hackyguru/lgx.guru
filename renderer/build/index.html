@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, height=device-height, user-scalable=0" />
+    <title>qml-renderer</title>
+    <style>
+      html, body { padding: 0; margin: 0; overflow: hidden; height: 100%; background: #fff; }
+      #screen { width: 100%; height: 100%; }
+      #spinner {
+        position: absolute; inset: 0; display: flex; align-items: center;
+        justify-content: center; font: 13px/1.4 -apple-system, sans-serif;
+        color: #888;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="spinner">Loading Qt-WASM renderer…</div>
+    <div id="screen"></div>
+
+    <script src="qml-renderer.js"></script>
+    <script src="qtloader.js"></script>
+    <script>
+      // Boot Qt-WASM, then accept QML source updates via postMessage from the
+      // parent window (the Next.js builder app). Each message replaces the
+      // visible QML — the renderer handles error fallbacks.
+      let qtModule = null;
+      const pending = [];
+
+      (async () => {
+        try {
+          qtModule = await qtLoad({
+            qt: {
+              onLoaded: () => {
+                document.getElementById("spinner").style.display = "none";
+                // Drain any queued QML that arrived before the engine was ready.
+                while (pending.length) qtModule.loadQml(pending.shift());
+              },
+              onExit: (e) => {
+                document.getElementById("spinner").textContent =
+                  "Renderer exited: " + (e.text || e.code || "(unknown)");
+                document.getElementById("spinner").style.display = "flex";
+              },
+              entryFunction: window.qml_renderer_entry,
+              containerElements: [document.getElementById("screen")],
+            },
+          });
+        } catch (e) {
+          console.error(e);
+          document.getElementById("spinner").textContent = "Renderer failed: " + e;
+        }
+      })();
+
+      window.addEventListener("message", (ev) => {
+        const data = ev.data;
+        if (!data || data.type !== "loadQml" || typeof data.source !== "string") return;
+        if (!qtModule) {
+          pending.push(data.source);
+          return;
+        }
+        try { qtModule.loadQml(data.source); }
+        catch (e) { console.error("loadQml threw:", e); }
+      });
+    </script>
+  </body>
+</html>
