@@ -238,15 +238,11 @@ const saveToStorage = (s: SaveState) => {
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export default function Page() {
-  // Restore from localStorage on first mount. SSR-safe via the lazy
-  // initializer (loadFromStorage no-ops on server).
-  const restored = useRef<SaveState | null>(null);
-  if (restored.current === null && typeof window !== "undefined") {
-    restored.current = loadFromStorage();
-  }
-
+  // First render must produce identical HTML on the server and the client
+  // for hydration to succeed. We initialise from defaults and apply any
+  // localStorage-restored snapshot in a post-mount effect below.
   const [hist, dispatch] = useReducer(reducer, undefined, () => ({
-    root: restored.current?.root ?? newRoot(),
+    root: newRoot(),
     past: [],
     future: [],
   }));
@@ -268,6 +264,20 @@ export default function Page() {
   // changes (drag, keystrokes) only writes once the dust settles.
   // Skipped on the very first render — restore already populated state.
   const firstSaveSkip = useRef(true);
+
+  // Post-mount: hydrate from localStorage. Runs only on the client, so
+  // first paint matches SSR (defaults), then we swap in the saved state.
+  // The autosave effect below sees this dispatch as the "first change"
+  // and skips its own write so we don't immediately rewrite what we read.
+  useEffect(() => {
+    const saved = loadFromStorage();
+    if (!saved || saved.version !== 1) return;
+    if (saved.root) dispatch({ type: "set", root: saved.root });
+    if (saved.moduleMeta) setModuleMeta(saved.moduleMeta);
+    if (saved.iconBase64) setIconPng(base64ToU8(saved.iconBase64));
+    if (saved.iconFilename) setIconFilename(saved.iconFilename);
+    if (saved.collapsedIds) setCollapsedIds(new Set(saved.collapsedIds));
+  }, []);
 
   // The Qt-WASM renderer uses SizeRootObjectToView, so the QML root sizes to
   // whatever pixel dimensions the iframe gets from CSS layout. Mirror that
@@ -296,20 +306,15 @@ export default function Page() {
     };
   }, []);
 
-  const [moduleMeta, setModuleMeta] = useState<ModuleMeta>(() =>
-    restored.current?.moduleMeta ?? {
-      name: "my_widget",
-      version: "0.1.0",
-      description: "A widget built with lgx.guru",
-      category: "example",
-      author: "",
-    });
-  const [iconPng, setIconPng] = useState<Uint8Array>(() =>
-    restored.current?.iconBase64 ? base64ToU8(restored.current.iconBase64) : placeholderIcon()
-  );
-  const [iconFilename, setIconFilename] = useState<string>(
-    () => restored.current?.iconFilename ?? "icon.png"
-  );
+  const [moduleMeta, setModuleMeta] = useState<ModuleMeta>({
+    name: "my_widget",
+    version: "0.1.0",
+    description: "A widget built with lgx.guru",
+    category: "example",
+    author: "",
+  });
+  const [iconPng, setIconPng] = useState<Uint8Array>(() => placeholderIcon());
+  const [iconFilename, setIconFilename] = useState<string>("icon.png");
   const [iconPreviewUrl, setIconPreviewUrl] = useState<string | null>(null);
   const [iconError, setIconError] = useState<string | null>(null);
 
@@ -487,9 +492,7 @@ export default function Page() {
 
   // Layers-panel UI state — which Frame ids are collapsed (children hidden
   // in the tree). Independent of node.hidden.
-  const [collapsedIds, setCollapsedIds] = useState<Set<NodeId>>(
-    () => new Set(restored.current?.collapsedIds ?? [])
-  );
+  const [collapsedIds, setCollapsedIds] = useState<Set<NodeId>>(new Set());
   const toggleCollapsed = (id: NodeId) => {
     setCollapsedIds((prev) => {
       const next = new Set(prev);
