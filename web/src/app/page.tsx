@@ -7,6 +7,8 @@ import {
 } from "./types";
 import { emitMainQml } from "./qmlEmit";
 import { exportLgx, placeholderIcon } from "./lgxExport";
+import { readLgx } from "./lgxImport";
+import { TEMPLATES, Template } from "./templates";
 
 // Renderer iframe URL — served by renderer/serve.py on port 8765.
 // Run `python3 renderer/serve.py 8765` from the lgx-builder root.
@@ -129,6 +131,25 @@ function absoluteRect(root: FrameNode, id: NodeId): { x: number; y: number; w: n
   const { node } = findNode(root, id);
   if (!node) return null;
   return { x, y, w: node.width, h: node.height };
+}
+
+// All visible nodes (excluding root) whose absolute rect overlaps the given
+// canvas-coord rectangle. Used for marquee selection.
+function nodesIntersecting(root: FrameNode, x1: number, y1: number, x2: number, y2: number): NodeId[] {
+  const hits: NodeId[] = [];
+  const visit = (n: Node, ax: number, ay: number) => {
+    const nx = ax + n.x;
+    const ny = ay + n.y;
+    if (n.id !== root.id && !n.hidden) {
+      const overlaps = !(x2 < nx || x1 > nx + n.width || y2 < ny || y1 > ny + n.height);
+      if (overlaps) hits.push(n.id);
+    }
+    if (isContainer(n)) {
+      for (const c of n.children) visit(c, nx, ny);
+    }
+  };
+  visit(root, 0, 0);
+  return hits;
 }
 
 // ── Snap to siblings + parent edges during drag ─────────────────────────────
@@ -344,10 +365,19 @@ export default function Page() {
   const [selectedIds, setSelectedIds] = useState<Set<NodeId>>(new Set());
   // Smart-guide overlay shown only during drag.
   const [guideLines, setGuideLines] = useState<GuideLine[]>([]);
+  // Marquee rectangle (canvas-local px) drawn while the user drags on the
+  // canvas background. Null = no marquee in progress.
+  const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  // Grid snap pixel size. 0 = off; cycle through 0/8/16/24 with the header
+  // button. Applied at the end of drag and resize as a delta/position round.
+  const [gridSize, setGridSize] = useState(0);
+  const gridSizeRef = useRef(gridSize);
+  useEffect(() => { gridSizeRef.current = gridSize; }, [gridSize]);
   // In-app clipboard for Cmd+C / Cmd+V. Holds deep-cloned nodes WITH their
   // original ids; reassignIds runs at paste time so each paste produces a
   // fresh subtree even if you paste twice.
   const [clipboard, setClipboard] = useState<Node[]>([]);
+  const [templatesOpen, setTemplatesOpen] = useState(false);
 
   // Selection helpers — most callers want one of these instead of touching
   // the Set directly. `selectSingle(null)` clears the selection.
@@ -604,6 +634,135 @@ export default function Page() {
     if (newIds.length > 0) setSelectedIds(new Set(newIds));
   };
 
+  // ── Z-order (reorder within parent's children array) ─────────────────────
+  //
+  // Children render painter-style: later in the array = on top in canvas
+  // and emitted QML. The four ops match Wix/Figma vocabulary:
+  //   bringToFront    → move to end of parent.children
+  //   bringForward    → swap with the next sibling
+  //   sendBackward    → swap with the previous sibling
+  //   sendToBack      → move to start
+  //
+  // Operates on every selected node. Each op = one history entry.
+
+  type ZOrderOp = "front" | "forward" | "backward" | "back";
+
+  const zOrderSelected = (op: ZOrderOp) => {
+    if (selectedIds.size === 0) return;
+    const ids = [...selectedIds].filter((id) => id !== root.id);
+    if (ids.length === 0) return;
+    dispatch({
+      type: "commit",
+      root: mutateTree(root, (clone) => {
+        for (const id of ids) {
+          const f = findNode(clone, id);
+          if (!f.parent || f.index < 0) continue;
+          const arr = f.parent.children;
+          const i = f.index;
+          if (op === "front") {
+            const [n] = arr.splice(i, 1);
+            arr.push(n);
+          } else if (op === "back") {
+            const [n] = arr.splice(i, 1);
+            arr.unshift(n);
+          } else if (op === "forward" && i < arr.length - 1) {
+            [arr[i], arr[i + 1]] = [arr[i + 1], arr[i]];
+          } else if (op === "backward" && i > 0) {
+            [arr[i], arr[i - 1]] = [arr[i - 1], arr[i]];
+          }
+        }
+      }),
+    });
+  };
+
+  // ── Align + distribute (multi-select only) ───────────────────────────────
+  //
+  // Both operate on selected nodes that share the same parent (otherwise
+  // we'd be mixing absolute and relative coords). The toolbar is only
+  // shown when this precondition holds — see commonParentId below.
+
+  type AlignOp = "left" | "centerX" | "right" | "top" | "centerY" | "bottom";
+  type DistAxis = "horizontal" | "vertical";
+
+  const commonParentId = (): NodeId | null => {
+    let p: NodeId | null = null;
+    for (const id of selectedIds) {
+      const f = findNode(root, id);
+      if (!f.parent) return null;
+      if (p === null) p = f.parent.id;
+      else if (p !== f.parent.id) return null;
+    }
+    return p;
+  };
+
+  const alignSelected = (op: AlignOp) => {
+    if (selectedIds.size < 2 || commonParentId() === null) return;
+    const sel: { id: NodeId; n: Node }[] = [];
+    for (const id of selectedIds) {
+      const { node } = findNode(root, id);
+      if (node) sel.push({ id, n: node });
+    }
+    if (sel.length < 2) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const { n } of sel) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + n.width);
+      maxY = Math.max(maxY, n.y + n.height);
+    }
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    dispatch({
+      type: "commit",
+      root: mutateTree(root, (clone) => {
+        for (const { id } of sel) {
+          const f = findNode(clone, id);
+          if (!f.node) continue;
+          switch (op) {
+            case "left":    f.node.x = Math.round(minX); break;
+            case "right":   f.node.x = Math.round(maxX - f.node.width); break;
+            case "centerX": f.node.x = Math.round(cx - f.node.width / 2); break;
+            case "top":     f.node.y = Math.round(minY); break;
+            case "bottom":  f.node.y = Math.round(maxY - f.node.height); break;
+            case "centerY": f.node.y = Math.round(cy - f.node.height / 2); break;
+          }
+        }
+      }),
+    });
+  };
+
+  const distributeSelected = (axis: DistAxis) => {
+    if (selectedIds.size < 3 || commonParentId() === null) return;
+    const sel: { id: NodeId; n: Node }[] = [];
+    for (const id of selectedIds) {
+      const { node } = findNode(root, id);
+      if (node) sel.push({ id, n: node });
+    }
+    if (sel.length < 3) return;
+    // Sort by center on the relevant axis. Keep first + last fixed; spread
+    // the middle nodes evenly between their centers.
+    const centerOf = (n: Node) =>
+      axis === "horizontal" ? n.x + n.width / 2 : n.y + n.height / 2;
+    sel.sort((a, b) => centerOf(a.n) - centerOf(b.n));
+    const firstC = centerOf(sel[0].n);
+    const lastC  = centerOf(sel[sel.length - 1].n);
+    const step = (lastC - firstC) / (sel.length - 1);
+    dispatch({
+      type: "commit",
+      root: mutateTree(root, (clone) => {
+        for (let i = 1; i < sel.length - 1; i++) {
+          const f = findNode(clone, sel[i].id);
+          if (!f.node) continue;
+          const target = firstC + step * i;
+          if (axis === "horizontal") {
+            f.node.x = Math.round(target - f.node.width / 2);
+          } else {
+            f.node.y = Math.round(target - f.node.height / 2);
+          }
+        }
+      }),
+    });
+  };
+
   // Duplicate every selected node, offset by 12px. Selects the new dups.
   const duplicateSelected = () => {
     if (selectedIds.size === 0) return;
@@ -725,13 +884,44 @@ export default function Page() {
 
   const handleOpenDesign = async (file: File) => {
     try {
-      const text = await file.text();
-      const parsed = JSON.parse(text) as SaveState;
+      const isLgx = file.name.toLowerCase().endsWith(".lgx");
+      let json: string;
+      if (isLgx) {
+        const { designJson } = await readLgx(file);
+        if (!designJson) {
+          window.alert(
+            "That .lgx doesn't carry an editor snapshot — it was either built " +
+            "by a different tool or pre-dates the round-trip-import feature. " +
+            "Re-export from lgx.guru to get an importable file.",
+          );
+          return;
+        }
+        json = designJson;
+      } else {
+        json = await file.text();
+      }
+      const parsed = JSON.parse(json) as SaveState;
       applySaveState(parsed);
     } catch (e) {
       console.error("Failed to open design", e);
-      window.alert("Couldn't read that file — make sure it's a .lgx-design.json saved from this editor.");
+      window.alert("Couldn't read that file. Open accepts .lgx-design.json or .lgx exported from this editor.");
     }
+  };
+
+  // Replace the current design with a built-in template. Keeps the user's
+  // current icon/filename — only the canvas tree and the suggested module
+  // metadata change.
+  const applyTemplate = (t: Template) => {
+    const built = t.build();
+    dispatch({ type: "commit", root: built.root });
+    setModuleMeta((prev) => ({
+      ...prev,
+      name: built.meta.name,
+      description: built.meta.description,
+    }));
+    setSelectedIds(new Set());
+    setCollapsedIds(new Set());
+    setTemplatesOpen(false);
   };
 
   const handleNew = () => {
@@ -749,6 +939,51 @@ export default function Page() {
     setIconFilename("icon.png");
     setCollapsedIds(new Set());
     setSelectedIds(new Set());
+  };
+
+  // ── Marquee (rubber-band selection on empty canvas) ──────────────────────
+  //
+  // Pointerdown on the canvas background starts a rectangle that updates
+  // selection live as it grows. Shift-down marquees ADD to the existing
+  // selection; otherwise the existing selection is replaced. A pure click
+  // (no drag) deselects.
+
+  const startMarquee = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const additive = e.shiftKey || e.metaKey;
+    const canvasDiv = e.currentTarget;
+    const rect = canvasDiv.getBoundingClientRect();
+    const x0 = e.clientX - rect.left;
+    const y0 = e.clientY - rect.top;
+    const baseSelection = additive ? new Set(selectedIds) : new Set<NodeId>();
+    let moved = false;
+    setMarquee({ x: x0, y: y0, w: 0, h: 0 });
+
+    const onMove = (ev: PointerEvent) => {
+      const cx = ev.clientX - rect.left;
+      const cy = ev.clientY - rect.top;
+      const x1 = Math.min(x0, cx), x2 = Math.max(x0, cx);
+      const y1 = Math.min(y0, cy), y2 = Math.max(y0, cy);
+      const w = x2 - x1, h = y2 - y1;
+      if (!moved && (w > 2 || h > 2)) moved = true;
+      setMarquee({ x: x1, y: y1, w, h });
+      if (moved) {
+        const hits = nodesIntersecting(rootRef.current, x1, y1, x2, y2);
+        const next = new Set(baseSelection);
+        for (const id of hits) next.add(id);
+        setSelectedIds(next);
+      }
+    };
+    const onUp = () => {
+      setMarquee(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      // Plain click (no movement, no shift) → clear selection. With shift,
+      // leave the existing selection alone.
+      if (!moved && !additive) setSelectedIds(new Set());
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   };
 
   // ── Drag (move) — pointer-event based, supports multi-select ─────────────
@@ -802,6 +1037,9 @@ export default function Page() {
         dy = r.dy;
         guides = r.guides;
       }
+      // Snap delta to grid (preserves intra-selection spacing for multi).
+      const g = gridSizeRef.current;
+      if (g > 0) { dx = Math.round(dx / g) * g; dy = Math.round(dy / g) * g; }
       setGuideLines(guides);
       const next = mutateTree(baseRoot, (clone) => {
         for (const [sid, pos] of initial) {
@@ -861,6 +1099,13 @@ export default function Page() {
       if (anchor.includes("s")) {
         nh = Math.max(MIN_SIZE, sh + dy);
       }
+      const g = gridSizeRef.current;
+      if (g > 0) {
+        nx = Math.round(nx / g) * g;
+        ny = Math.round(ny / g) * g;
+        nw = Math.max(MIN_SIZE, Math.round(nw / g) * g);
+        nh = Math.max(MIN_SIZE, Math.round(nh / g) * g);
+      }
       const next = mutateTree(baseRoot, (clone) => {
         const f = findNode(clone, id);
         if (f.node) {
@@ -877,6 +1122,97 @@ export default function Page() {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };
+
+  // ── Multi-select resize ──────────────────────────────────────────────────
+  //
+  // When 2+ same-parent nodes are selected, the resize handles wrap their
+  // bounding box. Dragging a handle scales the bbox; each child's offset
+  // and size scale proportionally so their relative layout is preserved.
+
+  const startMultiResize = (e: React.PointerEvent, anchor: ResizeAnchor) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const baseRoot = root;
+    const initial: { id: NodeId; x: number; y: number; width: number; height: number }[] = [];
+    let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+    for (const id of selectedIds) {
+      if (id === root.id) continue;
+      const { node } = findNode(baseRoot, id);
+      if (!node || node.locked) continue;
+      initial.push({ id, x: node.x, y: node.y, width: node.width, height: node.height });
+      bx0 = Math.min(bx0, node.x);
+      by0 = Math.min(by0, node.y);
+      bx1 = Math.max(bx1, node.x + node.width);
+      by1 = Math.max(by1, node.y + node.height);
+    }
+    if (initial.length < 2) return;
+    const sw = bx1 - bx0, sh = by1 - by0;
+    if (sw === 0 || sh === 0) return;
+
+    const startCx = e.clientX, startCy = e.clientY;
+    let snapshotted = false;
+
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startCx, dy = ev.clientY - startCy;
+      if (!snapshotted && (Math.abs(dx) > 1 || Math.abs(dy) > 1)) {
+        dispatch({ type: "snapshot" });
+        snapshotted = true;
+      }
+      let nbx = bx0, nby = by0, nbw = sw, nbh = sh;
+      const minBox = MIN_SIZE;
+      if (anchor.includes("w")) { nbw = Math.max(minBox, sw - dx); nbx = bx0 + (sw - nbw); }
+      if (anchor.includes("e")) { nbw = Math.max(minBox, sw + dx); }
+      if (anchor.includes("n")) { nbh = Math.max(minBox, sh - dy); nby = by0 + (sh - nbh); }
+      if (anchor.includes("s")) { nbh = Math.max(minBox, sh + dy); }
+      const g = gridSizeRef.current;
+      if (g > 0) {
+        nbx = Math.round(nbx / g) * g; nby = Math.round(nby / g) * g;
+        nbw = Math.max(minBox, Math.round(nbw / g) * g);
+        nbh = Math.max(minBox, Math.round(nbh / g) * g);
+      }
+      const sxR = nbw / sw, syR = nbh / sh;
+      dispatch({
+        type: "set",
+        root: mutateTree(baseRoot, (clone) => {
+          for (const i of initial) {
+            const f = findNode(clone, i.id);
+            if (!f.node) continue;
+            f.node.x = Math.round(nbx + (i.x - bx0) * sxR);
+            f.node.y = Math.round(nby + (i.y - by0) * syR);
+            f.node.width = Math.max(MIN_SIZE, Math.round(i.width * sxR));
+            f.node.height = Math.max(MIN_SIZE, Math.round(i.height * syR));
+          }
+        }),
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  // Bounding box of the current selection in canvas coords. Null if not a
+  // multi-select-with-shared-parent (single-select uses primaryAbs instead).
+  const multiBbox = (() => {
+    if (selectedIds.size < 2 || commonParentId() === null) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let count = 0;
+    for (const id of selectedIds) {
+      if (id === root.id) continue;
+      const r = absoluteRect(root, id);
+      if (!r) continue;
+      minX = Math.min(minX, r.x);
+      minY = Math.min(minY, r.y);
+      maxX = Math.max(maxX, r.x + r.w);
+      maxY = Math.max(maxY, r.y + r.h);
+      count++;
+    }
+    if (count < 2) return null;
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+  })();
 
   // ── Drop handling: palette items or image files from the OS ──────────────
 
@@ -965,6 +1301,15 @@ export default function Page() {
         if (clipboard.length > 0) { e.preventDefault(); pasteFromClipboard(); }
         return;
       }
+      // Z-order: Cmd+] = forward, Cmd+[ = backward, plus Shift for to-front/back.
+      if (meta && e.key === "]") {
+        if (selectedIds.size > 0) { e.preventDefault(); zOrderSelected(e.shiftKey ? "front" : "forward"); }
+        return;
+      }
+      if (meta && e.key === "[") {
+        if (selectedIds.size > 0) { e.preventDefault(); zOrderSelected(e.shiftKey ? "back" : "backward"); }
+        return;
+      }
       if ((e.key === "Backspace" || e.key === "Delete") && selectedIds.size > 0) {
         e.preventDefault();
         deleteSelected();
@@ -1035,6 +1380,14 @@ export default function Page() {
     exportRoot.children.forEach(walk);
     const qmlSource = emitMainQml(exportRoot, true);
 
+    // Embed an editor-side snapshot so the .lgx is round-trip importable
+    // (Open button can read this back). Uses the *original* root with data
+    // URLs intact, not the asset-rewritten exportRoot — so re-imports get
+    // the in-editor representation back exactly.
+    const designSnapshot: SaveState = buildSaveState();
+    const designJsonBytes = new TextEncoder().encode(JSON.stringify(designSnapshot));
+    const allExtras = [...assets, { rel: "design.json", data: designJsonBytes }];
+
     const result = await exportLgx({
       name,
       version: moduleMeta.version.trim() || "0.1.0",
@@ -1044,7 +1397,7 @@ export default function Page() {
       iconPng,
       iconFilename,
       qmlSource,
-      extraFiles: assets,
+      extraFiles: allExtras,
     });
     const url = URL.createObjectURL(result.blob);
     const a = document.createElement("a");
@@ -1077,10 +1430,49 @@ export default function Page() {
             onClick={handleNew}
             title="Clear and start a new design"
           >New</button>
+          <div className="relative">
+            <button
+              className={`rounded border px-2 py-1 text-xs ${
+                templatesOpen
+                  ? "border-blue-400 bg-blue-50 text-blue-700"
+                  : "border-zinc-300 text-zinc-700 hover:bg-zinc-100"
+              }`}
+              onClick={() => setTemplatesOpen((v) => !v)}
+              title="Replace canvas with a starter template"
+            >Templates</button>
+            {templatesOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-10"
+                  onClick={() => setTemplatesOpen(false)}
+                />
+                <div
+                  className="absolute right-0 top-full z-20 mt-1 w-64 rounded border border-zinc-200 bg-white shadow-lg"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="border-b border-zinc-200 px-3 py-2 text-[10px] font-semibold uppercase text-zinc-500">
+                    Pick a template
+                  </div>
+                  <div className="max-h-80 overflow-y-auto py-1">
+                    {TEMPLATES.map((t) => (
+                      <button
+                        key={t.id}
+                        className="block w-full px-3 py-1.5 text-left hover:bg-zinc-50"
+                        onClick={() => applyTemplate(t)}
+                      >
+                        <div className="text-[12px] font-medium text-zinc-800">{t.name}</div>
+                        <div className="text-[10px] leading-tight text-zinc-500">{t.description}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
           <button
             className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
             onClick={() => designFileInputRef.current?.click()}
-            title="Open a saved .lgx-design.json"
+            title="Open a .lgx-design.json or a .lgx exported from this editor"
           >Open</button>
           <button
             className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
@@ -1090,7 +1482,7 @@ export default function Page() {
           <input
             ref={designFileInputRef}
             type="file"
-            accept="application/json,.json"
+            accept=".lgx,.json,application/json"
             className="hidden"
             onChange={(e) => {
               const f = e.target.files?.[0];
@@ -1204,14 +1596,26 @@ export default function Page() {
               <span className="text-xs font-semibold uppercase text-zinc-500">
                 Canvas
               </span>
-              <span className="text-[11px] text-zinc-400">
-                {root.width}×{root.height}px · drag · resize
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                    gridSize > 0
+                      ? "border-blue-400 bg-blue-50 text-blue-700"
+                      : "border-zinc-300 bg-white text-zinc-600 hover:bg-zinc-50"
+                  }`}
+                  onClick={() => setGridSize((g) => (g === 0 ? 8 : g === 8 ? 16 : g === 16 ? 24 : 0))}
+                  title="Toggle snap-to-grid (cycles off / 8 / 16 / 24 px)"
+                >
+                  grid {gridSize === 0 ? "off" : `${gridSize}px`}
+                </button>
+                <span className="text-[11px] text-zinc-400">
+                  {root.width}×{root.height}px
+                </span>
+              </div>
             </div>
             <div
               ref={canvasRef}
               className="relative flex-1 overflow-hidden"
-              onClick={() => handleSelect(null, false)}
             >
               <CanvasArea
                 root={root}
@@ -1220,16 +1624,24 @@ export default function Page() {
                 onStartMove={startMove}
                 onCanvasDrop={handleCanvasDrop}
                 onCanvasDragOver={handleCanvasDragOver}
+                onMarqueeStart={startMarquee}
                 draggingKind={draggingKind}
+                gridSize={gridSize}
                 resizeOverlay={
                   primaryAbs && primaryId && primaryId !== root.id && primaryNode && !primaryNode.locked ? (
                     <ResizeOverlay
                       rect={primaryAbs}
                       onStart={(anchor, e) => startResize(e, primaryId, anchor)}
                     />
+                  ) : multiBbox ? (
+                    <ResizeOverlay
+                      rect={multiBbox}
+                      onStart={(anchor, e) => startMultiResize(e, anchor)}
+                    />
                   ) : null
                 }
                 guideOverlay={guideLines.length > 0 ? <GuideOverlay lines={guideLines} /> : null}
+                marquee={marquee}
               />
             </div>
           </section>
@@ -1281,16 +1693,34 @@ export default function Page() {
               </div>
             )}
           </div>
+
+          {selectedIds.size > 0 && (selectedIds.size > 1 || (primaryNode && primaryId !== root.id)) && (
+            <div className="mb-3 flex items-center gap-1">
+              <IconBtn title="Send to back (Cmd+Shift+[)"  onClick={() => zOrderSelected("back")}     ><AlignIcon kind="left" /></IconBtn>
+              <IconBtn title="Send backward (Cmd+[)"        onClick={() => zOrderSelected("backward")} ><AlignIcon kind="centerX" /></IconBtn>
+              <IconBtn title="Bring forward (Cmd+])"        onClick={() => zOrderSelected("forward")}  ><AlignIcon kind="right" /></IconBtn>
+              <IconBtn title="Bring to front (Cmd+Shift+])" onClick={() => zOrderSelected("front")}    ><AlignIcon kind="distH" /></IconBtn>
+              <span className="ml-1 text-[10px] text-zinc-400">z-order</span>
+            </div>
+          )}
           {selectedIds.size === 0 ? (
             <p className="text-xs text-zinc-500">
               Click a node in the canvas to edit. Shift-click to add to selection.
               Click empty space to deselect.
             </p>
           ) : selectedIds.size > 1 ? (
-            <p className="text-xs text-zinc-600">
-              <span className="font-mono">{selectedIds.size}</span> items selected.
-              Drag to move them together; Delete / Cmd+D / arrow keys apply to all.
-            </p>
+            <div className="flex flex-col gap-3">
+              <p className="text-xs text-zinc-600">
+                <span className="font-mono">{selectedIds.size}</span> items selected.
+                Drag to move together; Delete / Cmd+D / arrows apply to all.
+              </p>
+              <AlignToolbar
+                canAlign={commonParentId() !== null}
+                canDistribute={commonParentId() !== null && selectedIds.size >= 3}
+                onAlign={alignSelected}
+                onDistribute={distributeSelected}
+              />
+            </div>
           ) : primaryNode ? (
             <Inspector
               node={primaryNode}
@@ -1321,9 +1751,12 @@ function CanvasArea({
   onStartMove,
   onCanvasDrop,
   onCanvasDragOver,
+  onMarqueeStart,
   draggingKind,
+  gridSize,
   resizeOverlay,
   guideOverlay,
+  marquee,
 }: {
   root: FrameNode;
   selectedIds: Set<NodeId>;
@@ -1331,15 +1764,26 @@ function CanvasArea({
   onStartMove: (e: React.PointerEvent, id: NodeId) => void;
   onCanvasDrop: (e: React.DragEvent, frameId: NodeId) => void;
   onCanvasDragOver: (e: React.DragEvent) => void;
+  onMarqueeStart: (e: React.PointerEvent<HTMLDivElement>) => void;
   draggingKind: NodeKind | null;
+  gridSize: number;
   resizeOverlay: React.ReactNode;
   guideOverlay: React.ReactNode;
+  marquee: { x: number; y: number; w: number; h: number } | null;
 }) {
+  const gridStyle: React.CSSProperties = gridSize > 0
+    ? {
+        backgroundImage:
+          "linear-gradient(rgba(0,0,0,0.06) 1px, transparent 1px)," +
+          "linear-gradient(90deg, rgba(0,0,0,0.06) 1px, transparent 1px)",
+        backgroundSize: `${gridSize}px ${gridSize}px`,
+      }
+    : {};
   return (
     <div
       className="relative inline-block bg-white"
-      style={{ width: root.width, height: root.height }}
-      onClick={(e) => { e.stopPropagation(); onSelect(root.id, e.shiftKey || e.metaKey); }}
+      style={{ width: root.width, height: root.height, ...gridStyle }}
+      onPointerDown={onMarqueeStart}
       onDragOver={onCanvasDragOver}
       onDrop={(e) => onCanvasDrop(e, root.id)}
     >
@@ -1357,6 +1801,134 @@ function CanvasArea({
       ))}
       {resizeOverlay}
       {guideOverlay}
+      {marquee && (
+        <div
+          className="pointer-events-none absolute"
+          style={{
+            left: marquee.x, top: marquee.y, width: marquee.w, height: marquee.h,
+            background: "rgba(59, 130, 246, 0.10)",
+            border: "1px solid rgb(59, 130, 246)",
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── AlignToolbar (visible only on multi-select with shared parent) ─────────
+
+function IconBtn({
+  title, disabled, onClick, children,
+}: {
+  title: string; disabled?: boolean; onClick: () => void; children: React.ReactNode;
+}) {
+  return (
+    <button
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex h-7 w-7 items-center justify-center rounded border border-zinc-300 bg-white text-zinc-700 hover:border-zinc-400 hover:bg-zinc-50 disabled:opacity-30 disabled:hover:bg-white"
+    >
+      {children}
+    </button>
+  );
+}
+
+// Each icon: a 16×16 svg of three little bars + a guide line indicating
+// which edge they snap to.
+const AlignIcon = ({ kind }: {
+  kind: "left" | "centerX" | "right" | "top" | "centerY" | "bottom" | "distH" | "distV";
+}) => {
+  const stroke = "currentColor";
+  if (kind === "left") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <line x1="2" y1="2" x2="2" y2="14" stroke={stroke} strokeWidth="1.4" />
+      <rect x="3.5" y="4" width="9" height="2.5" fill={stroke} />
+      <rect x="3.5" y="9.5" width="6" height="2.5" fill={stroke} />
+    </svg>
+  );
+  if (kind === "centerX") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <line x1="8" y1="2" x2="8" y2="14" stroke={stroke} strokeWidth="1.4" strokeDasharray="2 1.5" />
+      <rect x="2" y="4" width="12" height="2.5" fill={stroke} />
+      <rect x="4.5" y="9.5" width="7" height="2.5" fill={stroke} />
+    </svg>
+  );
+  if (kind === "right") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <line x1="14" y1="2" x2="14" y2="14" stroke={stroke} strokeWidth="1.4" />
+      <rect x="3.5" y="4" width="9" height="2.5" fill={stroke} />
+      <rect x="6.5" y="9.5" width="6" height="2.5" fill={stroke} />
+    </svg>
+  );
+  if (kind === "top") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <line x1="2" y1="2" x2="14" y2="2" stroke={stroke} strokeWidth="1.4" />
+      <rect x="4" y="3.5" width="2.5" height="9" fill={stroke} />
+      <rect x="9.5" y="3.5" width="2.5" height="6" fill={stroke} />
+    </svg>
+  );
+  if (kind === "centerY") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <line x1="2" y1="8" x2="14" y2="8" stroke={stroke} strokeWidth="1.4" strokeDasharray="2 1.5" />
+      <rect x="4" y="2" width="2.5" height="12" fill={stroke} />
+      <rect x="9.5" y="4.5" width="2.5" height="7" fill={stroke} />
+    </svg>
+  );
+  if (kind === "bottom") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <line x1="2" y1="14" x2="14" y2="14" stroke={stroke} strokeWidth="1.4" />
+      <rect x="4" y="3.5" width="2.5" height="9" fill={stroke} />
+      <rect x="9.5" y="6.5" width="2.5" height="6" fill={stroke} />
+    </svg>
+  );
+  if (kind === "distH") return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <rect x="1" y="4" width="2.5" height="8" fill={stroke} />
+      <rect x="6.75" y="4" width="2.5" height="8" fill={stroke} />
+      <rect x="12.5" y="4" width="2.5" height="8" fill={stroke} />
+    </svg>
+  );
+  // distV
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14">
+      <rect x="4" y="1" width="8" height="2.5" fill={stroke} />
+      <rect x="4" y="6.75" width="8" height="2.5" fill={stroke} />
+      <rect x="4" y="12.5" width="8" height="2.5" fill={stroke} />
+    </svg>
+  );
+};
+
+function AlignToolbar({
+  canAlign, canDistribute, onAlign, onDistribute,
+}: {
+  canAlign: boolean;
+  canDistribute: boolean;
+  onAlign: (op: "left" | "centerX" | "right" | "top" | "centerY" | "bottom") => void;
+  onDistribute: (axis: "horizontal" | "vertical") => void;
+}) {
+  return (
+    <div>
+      <div className="mb-1 text-[10px] font-semibold uppercase text-zinc-500">Align</div>
+      <div className="flex gap-1">
+        <IconBtn title="Align left"     disabled={!canAlign} onClick={() => onAlign("left")}    ><AlignIcon kind="left" /></IconBtn>
+        <IconBtn title="Align center X" disabled={!canAlign} onClick={() => onAlign("centerX")} ><AlignIcon kind="centerX" /></IconBtn>
+        <IconBtn title="Align right"    disabled={!canAlign} onClick={() => onAlign("right")}   ><AlignIcon kind="right" /></IconBtn>
+        <span className="mx-0.5 w-px self-stretch bg-zinc-200" />
+        <IconBtn title="Align top"      disabled={!canAlign} onClick={() => onAlign("top")}     ><AlignIcon kind="top" /></IconBtn>
+        <IconBtn title="Align center Y" disabled={!canAlign} onClick={() => onAlign("centerY")} ><AlignIcon kind="centerY" /></IconBtn>
+        <IconBtn title="Align bottom"   disabled={!canAlign} onClick={() => onAlign("bottom")}  ><AlignIcon kind="bottom" /></IconBtn>
+      </div>
+      <div className="mt-2 mb-1 text-[10px] font-semibold uppercase text-zinc-500">Distribute</div>
+      <div className="flex gap-1">
+        <IconBtn title="Distribute horizontally" disabled={!canDistribute} onClick={() => onDistribute("horizontal")}><AlignIcon kind="distH" /></IconBtn>
+        <IconBtn title="Distribute vertically"   disabled={!canDistribute} onClick={() => onDistribute("vertical")}  ><AlignIcon kind="distV" /></IconBtn>
+      </div>
+      {!canAlign && (
+        <p className="mt-1 text-[10px] text-zinc-400">
+          Align/distribute requires the selection to share one parent.
+        </p>
+      )}
     </div>
   );
 }
@@ -1437,11 +2009,13 @@ function NodeView({
     : "hover:outline hover:outline-1 hover:outline-offset-[-1px] hover:outline-blue-300";
 
   // Locked nodes are still selectable (so the user can unlock them) but
-  // can't be moved or resized; pointerdown skips startMove.
+  // can't be moved or resized. Either way we stop propagation here so the
+  // marquee (canvas-level pointerdown) doesn't fire.
   const commonProps = {
-    onPointerDown: node.locked
-      ? undefined
-      : (e: React.PointerEvent) => onStartMove(e, node.id),
+    onPointerDown: (e: React.PointerEvent) => {
+      e.stopPropagation();
+      if (!node.locked) onStartMove(e, node.id);
+    },
     onClick: (e: React.MouseEvent) => {
       e.stopPropagation();
       onSelect(node.id, e.shiftKey || e.metaKey);
