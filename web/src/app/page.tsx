@@ -2,13 +2,21 @@
 
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
-  FrameNode, ImageFit, ImageNode, LeafNode, Node, NodeId, NodeKind,
-  defaultNode, defaultStyle, isContainer, newId, newRoot,
+  AppState, ButtonAction, ButtonNode, CallModuleArg, CoreMethod, CoreModuleSpec,
+  CoreStateField, FrameNode, ImageFit, ImageNode, LeafNode, ListDirection,
+  ModuleId, ModuleParam, ModuleSpec, Node, NodeId, NodeKind, PageData, PageId,
+  ParamType, SetVariableMode, TextNode, Trigger, TriggerId, TriggerKind,
+  Variable, VariableId, VariableType,
+  defaultNode, defaultStyle, isContainer, newApp, newCoreMethod, newCoreModule,
+  newCoreStateField, newId, newPage, newRoot, newTrigger, newVariable,
 } from "./types";
-import { emitMainQml } from "./qmlEmit";
+import { MODULE_CATALOG, findModuleSpec, findModuleMethod } from "./modules/catalog";
+import { emitMainQml, usesDelivery } from "./qmlEmit";
 import { exportLgx, placeholderIcon } from "./lgxExport";
 import { readLgx } from "./lgxImport";
 import { TEMPLATES, Template } from "./templates";
+import { generateCoreModuleFiles } from "./codegen/coreModule";
+import { packTarGz } from "./codegen/sourceBundle";
 
 // Renderer iframe URL — served by renderer/serve.py on port 8765.
 // Run `python3 renderer/serve.py 8765` from the lgx-builder root.
@@ -52,6 +60,12 @@ const PALETTE: PaletteCategory[] = [
     items: [
       { kind: "Image",         label: "Image" },
       { kind: "AnimatedImage", label: "Animated image" },
+    ],
+  },
+  {
+    name: "Data",
+    items: [
+      { kind: "List", label: "List" },
     ],
   },
 ];
@@ -222,18 +236,18 @@ function snapDrag(
   return { dx: dx + (x?.adjust ?? 0), dy: dy + (y?.adjust ?? 0), guides };
 }
 
-// ── History reducer ─────────────────────────────────────────────────────────
+// ── History reducer (operates on the whole AppState, not a single root) ────
 
 interface HistoryState {
-  root: FrameNode;
-  past: FrameNode[];
-  future: FrameNode[];
+  app: AppState;
+  past: AppState[];
+  future: AppState[];
 }
 
 type Action =
-  | { type: "snapshot" }                      // push current root to past, clear future
-  | { type: "set"; root: FrameNode }          // replace root with no history change
-  | { type: "commit"; root: FrameNode }       // snapshot + set in one shot
+  | { type: "snapshot" }                  // push current app to past, clear future
+  | { type: "set"; app: AppState }        // replace app with no history change
+  | { type: "commit"; app: AppState }     // snapshot + set in one shot
   | { type: "undo" }
   | { type: "redo" };
 
@@ -242,15 +256,15 @@ function reducer(state: HistoryState, action: Action): HistoryState {
     case "snapshot":
       return {
         ...state,
-        past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.root],
+        past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.app],
         future: [],
       };
     case "set":
-      return { ...state, root: action.root };
+      return { ...state, app: action.app };
     case "commit":
       return {
-        root: action.root,
-        past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.root],
+        app: action.app,
+        past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.app],
         future: [],
       };
     case "undo": {
@@ -258,16 +272,16 @@ function reducer(state: HistoryState, action: Action): HistoryState {
       const prev = state.past[state.past.length - 1];
       return {
         past: state.past.slice(0, -1),
-        root: prev,
-        future: [...state.future, state.root],
+        app: prev,
+        future: [...state.future, state.app],
       };
     }
     case "redo": {
       if (state.future.length === 0) return state;
       const next = state.future[state.future.length - 1];
       return {
-        past: [...state.past, state.root],
-        root: next,
+        past: [...state.past, state.app],
+        app: next,
         future: state.future.slice(0, -1),
       };
     }
@@ -301,7 +315,22 @@ const isPng = (u8: Uint8Array) =>
 
 const SAVE_KEY = "lgx.guru/v1/save";
 
-interface SaveState {
+// v2 = multi-page format. v1 = legacy single-root; loadFromStorage migrates
+// it to v2 on read by wrapping the root in a single "Home" page.
+interface SaveStateV2 {
+  version: 2;
+  pages: PageData[];
+  currentPageId: PageId;
+  variables: Variable[];
+  modules: ModuleId[];
+  coreModule?: CoreModuleSpec;
+  triggers: Trigger[];
+  moduleMeta: ModuleMeta;
+  iconBase64: string;
+  iconFilename: string;
+  collapsedIds: NodeId[];
+}
+interface SaveStateV1 {
   version: 1;
   root: FrameNode;
   moduleMeta: ModuleMeta;
@@ -309,6 +338,7 @@ interface SaveState {
   iconFilename: string;
   collapsedIds: NodeId[];
 }
+type SaveState = SaveStateV2;
 
 const u8ToBase64 = (u8: Uint8Array): string => {
   let s = "";
@@ -326,14 +356,46 @@ const base64ToU8 = (s: string): Uint8Array => {
   return u8;
 };
 
+// Migrate v1 (single root) to v2 (single-page app). Returns null if the
+// payload is unparseable.
+const migrateSave = (parsed: unknown): SaveState | null => {
+  if (!parsed || typeof parsed !== "object") return null;
+  const p = parsed as Record<string, unknown>;
+  if (p.version === 2 && Array.isArray(p.pages) && typeof p.currentPageId === "string") {
+    const s = p as unknown as SaveStateV2;
+    // Back-fill missing fields — older v2 saves predate variables / modules.
+    return {
+      ...s,
+      variables: Array.isArray(s.variables) ? s.variables : [],
+      modules: Array.isArray(s.modules) ? s.modules : [],
+      triggers: Array.isArray(s.triggers) ? s.triggers : [],
+    };
+  }
+  if (p.version === 1 && p.root) {
+    const v1 = p as unknown as SaveStateV1;
+    const home: PageData = { id: newId(), name: "Home", root: v1.root };
+    return {
+      version: 2,
+      pages: [home],
+      currentPageId: home.id,
+      variables: [],
+      modules: [],
+      triggers: [],
+      moduleMeta: v1.moduleMeta,
+      iconBase64: v1.iconBase64,
+      iconFilename: v1.iconFilename,
+      collapsedIds: v1.collapsedIds,
+    };
+  }
+  return null;
+};
+
 const loadFromStorage = (): SaveState | null => {
   if (typeof window === "undefined") return null;
   try {
     const raw = window.localStorage.getItem(SAVE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as SaveState;
-    if (parsed?.version !== 1 || !parsed.root) return null;
-    return parsed;
+    return migrateSave(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -356,11 +418,28 @@ export default function Page() {
   // for hydration to succeed. We initialise from defaults and apply any
   // localStorage-restored snapshot in a post-mount effect below.
   const [hist, dispatch] = useReducer(reducer, undefined, () => ({
-    root: newRoot(),
+    app: newApp(),
     past: [],
     future: [],
   }));
-  const root = hist.root;
+  const app = hist.app;
+  // Active page derivation. If currentPageId points at a removed page we
+  // fall back to the first page so the editor keeps working.
+  const currentPage: PageData =
+    app.pages.find((p) => p.id === app.currentPageId) ?? app.pages[0];
+  const root = currentPage.root;
+
+  // Build a new AppState by mutating only the active page's tree. Used by
+  // every tree-edit dispatch so unrelated pages stay byte-identical.
+  const mutateActivePage = (
+    a: AppState,
+    fn: (clone: FrameNode) => void,
+  ): AppState => ({
+    ...a,
+    pages: a.pages.map((p) =>
+      p.id === a.currentPageId ? { ...p, root: mutateTree(p.root, fn) } : p
+    ),
+  });
 
   const [selectedIds, setSelectedIds] = useState<Set<NodeId>>(new Set());
   // Smart-guide overlay shown only during drag.
@@ -396,15 +475,24 @@ export default function Page() {
     else selectSingle(id);
   };
   const [draggingKind, setDraggingKind] = useState<NodeKind | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
+  // Canvas iframe — the only Qt-WASM instance. Renders the user's QML the
+  // exact same way Basecamp will. Click forwarding behavior depends on
+  // `runMode` (see the top-level toggle).
+  const canvasIframeRef = useRef<HTMLIFrameElement>(null);
+  // Run mode: false = Edit (React overlay absorbs clicks for selection &
+  // drag); true = Run (overlay hides, iframe takes events, the user can
+  // actually interact with their widget — click buttons, type, etc.).
+  const [runMode, setRunMode] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const designFileInputRef = useRef<HTMLInputElement>(null);
   const imageFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Track the latest root in a ref so async observers can read it without
-  // re-binding their callbacks on every state change.
+  // Track the latest root + app in refs so async observers can read them
+  // without re-binding their callbacks on every state change.
   const rootRef = useRef(root);
+  const appRef = useRef(app);
   useEffect(() => { rootRef.current = root; }, [root]);
+  useEffect(() => { appRef.current = app; }, [app]);
 
   // Auto-save the editor state to localStorage. Debounced so a flurry of
   // changes (drag, keystrokes) only writes once the dust settles.
@@ -417,8 +505,21 @@ export default function Page() {
   // and skips its own write so we don't immediately rewrite what we read.
   useEffect(() => {
     const saved = loadFromStorage();
-    if (!saved || saved.version !== 1) return;
-    if (saved.root) dispatch({ type: "set", root: saved.root });
+    if (!saved || saved.version !== 2) return;
+    if (saved.pages?.length) {
+      const cur = saved.pages.find((p) => p.id === saved.currentPageId)?.id ?? saved.pages[0].id;
+      dispatch({
+        type: "set",
+        app: {
+          pages: saved.pages,
+          currentPageId: cur,
+          variables: saved.variables ?? [],
+          modules: saved.modules ?? [],
+          coreModule: saved.coreModule,
+          triggers: saved.triggers ?? [],
+        },
+      });
+    }
     if (saved.moduleMeta) setModuleMeta(saved.moduleMeta);
     if (saved.iconBase64) setIconPng(base64ToU8(saved.iconBase64));
     if (saved.iconFilename) setIconFilename(saved.iconFilename);
@@ -426,13 +527,14 @@ export default function Page() {
   }, []);
 
   // The Qt-WASM renderer uses SizeRootObjectToView, so the QML root sizes to
-  // whatever pixel dimensions the iframe gets from CSS layout. Mirror that
-  // here: bind the editor root's width/height to the iframe's clientRect so
-  // the canvas you design in is the exact same surface the preview shows.
+  // whatever pixel dimensions the iframe gets from CSS layout. The canvas
+  // iframe defines the "design surface" — the editor's root width/height
+  // mirrors its clientRect so absolute coords match what gets exported.
+  // The bottom live-preview iframe trails along by sharing the same QML.
   // We don't snapshot history for layout-driven resizes — undo shouldn't
   // step through window-resize events.
   useEffect(() => {
-    const iframe = iframeRef.current;
+    const iframe = canvasIframeRef.current;
     if (!iframe) return;
     const sync = () => {
       const w = iframe.clientWidth;
@@ -440,7 +542,16 @@ export default function Page() {
       if (w <= 0 || h <= 0) return;
       const cur = rootRef.current;
       if (cur.width === w && cur.height === h) return;
-      dispatch({ type: "set", root: { ...cur, width: w, height: h } });
+      // Update every page's root size so switching pages doesn't desync.
+      dispatch({
+        type: "set",
+        app: {
+          ...appRef.current,
+          pages: appRef.current.pages.map((p) => ({
+            ...p, root: { ...p.root, width: w, height: h },
+          })),
+        },
+      });
     };
     const ro = new ResizeObserver(sync);
     ro.observe(iframe);
@@ -451,6 +562,36 @@ export default function Page() {
       window.removeEventListener("resize", sync);
     };
   }, []);
+
+  // ── Theme (light / dark / follow system) ───────────────────────────────
+  // The actual class flipping happens via an inline bootstrap script in
+  // layout.tsx (so first paint is correct). This hook keeps state in sync
+  // with later toggles and writes the preference back to localStorage.
+  type ThemePref = "light" | "dark" | "system";
+  const [themePref, setThemePref] = useState<ThemePref>("system");
+  useEffect(() => {
+    const stored = (typeof window !== "undefined" ? window.localStorage.getItem("lgx.theme") : null) as ThemePref | null;
+    if (stored === "light" || stored === "dark" || stored === "system") setThemePref(stored);
+  }, []);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const apply = () => {
+      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const dark = themePref === "dark" || (themePref === "system" && prefersDark);
+      document.documentElement.classList.toggle("dark", dark);
+    };
+    apply();
+    if (themePref === "system") {
+      const mq = window.matchMedia("(prefers-color-scheme: dark)");
+      mq.addEventListener("change", apply);
+      return () => mq.removeEventListener("change", apply);
+    }
+  }, [themePref]);
+  const cycleTheme = () => {
+    const next: ThemePref = themePref === "light" ? "dark" : themePref === "dark" ? "system" : "light";
+    setThemePref(next);
+    try { window.localStorage.setItem("lgx.theme", next); } catch {}
+  };
 
   const [moduleMeta, setModuleMeta] = useState<ModuleMeta>({
     name: "my_widget",
@@ -535,14 +676,13 @@ export default function Page() {
     selectSingle(node.id);
   };
 
-  const qmlPreview = useMemo(() => emitMainQml(root, false), [root]);
-  const qmlExport = useMemo(() => emitMainQml(root, true), [root]);
+  const qmlPreview = useMemo(() => emitMainQml(app, false), [app]);
+  const qmlExport = useMemo(() => emitMainQml(app, true), [app]);
 
   useEffect(() => {
     const id = setTimeout(() => {
-      iframeRef.current?.contentWindow?.postMessage(
-        { type: "loadQml", source: qmlPreview }, "*",
-      );
+      const msg = { type: "loadQml", source: qmlPreview };
+      canvasIframeRef.current?.contentWindow?.postMessage(msg, "*");
     }, 100);
     return () => clearTimeout(id);
   }, [qmlPreview]);
@@ -552,7 +692,7 @@ export default function Page() {
   const updateNode = (id: NodeId, patch: Partial<Node>) => {
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         const { node } = findNode(clone, id);
         if (node) Object.assign(node, patch);
       }),
@@ -562,7 +702,7 @@ export default function Page() {
   const insertChild = (parentId: NodeId, child: Node) => {
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         const { node } = findNode(clone, parentId);
         if (node && isContainer(node)) node.children.push(child);
       }),
@@ -576,7 +716,7 @@ export default function Page() {
     if (selectedIds.size === 0) return;
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         for (const id of selectedIds) {
           if (id === root.id) continue;
           const { parent, index } = findNode(clone, id);
@@ -620,7 +760,7 @@ export default function Page() {
     const newIds: NodeId[] = [];
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         const target = findNode(clone, parentId);
         if (!target.node || !isContainer(target.node)) return;
         for (const item of clipboard) {
@@ -653,7 +793,7 @@ export default function Page() {
     if (ids.length === 0) return;
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         for (const id of ids) {
           const f = findNode(clone, id);
           if (!f.parent || f.index < 0) continue;
@@ -713,7 +853,7 @@ export default function Page() {
     const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         for (const { id } of sel) {
           const f = findNode(clone, id);
           if (!f.node) continue;
@@ -748,7 +888,7 @@ export default function Page() {
     const step = (lastC - firstC) / (sel.length - 1);
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         for (let i = 1; i < sel.length - 1; i++) {
           const f = findNode(clone, sel[i].id);
           if (!f.node) continue;
@@ -769,7 +909,7 @@ export default function Page() {
     const newIds: NodeId[] = [];
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         for (const id of selectedIds) {
           if (id === root.id) continue;
           const { node, parent, index } = findNode(clone, id);
@@ -792,7 +932,7 @@ export default function Page() {
     if (isSelfOrDescendant(root, sourceId, newParentId)) return;
     dispatch({
       type: "commit",
-      root: mutateTree(root, (clone) => {
+      app: mutateActivePage(app, (clone) => {
         const src = findNode(clone, sourceId);
         if (!src.node || !src.parent || src.index < 0) return;
         const node = src.node;
@@ -836,33 +976,43 @@ export default function Page() {
   useEffect(() => {
     if (firstSaveSkip.current) { firstSaveSkip.current = false; return; }
     const handle = setTimeout(() => {
-      const snap: SaveState = {
-        version: 1,
-        root,
-        moduleMeta,
-        iconBase64: u8ToBase64(iconPng),
-        iconFilename,
-        collapsedIds: [...collapsedIds],
-      };
-      saveToStorage(snap);
+      saveToStorage(buildSaveState());
     }, 400);
     return () => clearTimeout(handle);
-  }, [root, moduleMeta, iconPng, iconFilename, collapsedIds]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [app, moduleMeta, iconPng, iconFilename, collapsedIds]);
 
   // ── Save / Open / New ─────────────────────────────────────────────────────
 
   const buildSaveState = (): SaveState => ({
-    version: 1,
-    root,
+    version: 2,
+    pages: app.pages,
+    currentPageId: app.currentPageId,
+    variables: app.variables,
+    modules: app.modules,
+    coreModule: app.coreModule,
+    triggers: app.triggers,
     moduleMeta,
     iconBase64: u8ToBase64(iconPng),
     iconFilename,
     collapsedIds: [...collapsedIds],
   });
 
-  const applySaveState = (s: SaveState) => {
-    if (s.version !== 1 || !s.root) return;
-    dispatch({ type: "set", root: s.root });
+  const applySaveState = (raw: unknown) => {
+    const s = migrateSave(raw);
+    if (!s || !s.pages?.length) return;
+    const cur = s.pages.find((p) => p.id === s.currentPageId)?.id ?? s.pages[0].id;
+    dispatch({
+      type: "set",
+      app: {
+        pages: s.pages,
+        currentPageId: cur,
+        variables: s.variables ?? [],
+        modules: s.modules ?? [],
+        coreModule: s.coreModule,
+        triggers: s.triggers ?? [],
+      },
+    });
     if (s.moduleMeta) setModuleMeta(s.moduleMeta);
     if (s.iconBase64) setIconPng(base64ToU8(s.iconBase64));
     if (s.iconFilename) setIconFilename(s.iconFilename);
@@ -900,12 +1050,291 @@ export default function Page() {
       } else {
         json = await file.text();
       }
-      const parsed = JSON.parse(json) as SaveState;
-      applySaveState(parsed);
+      applySaveState(JSON.parse(json));
     } catch (e) {
       console.error("Failed to open design", e);
       window.alert("Couldn't read that file. Open accepts .lgx-design.json or .lgx exported from this editor.");
     }
+  };
+
+  // ── Page CRUD ────────────────────────────────────────────────────────────
+  //
+  // Pages are the multi-page layer above the canvas. Switching is just UI
+  // state (no history snapshot); add/rename/delete are committed.
+
+  const switchPage = (id: PageId) => {
+    if (!app.pages.some((p) => p.id === id)) return;
+    if (id === app.currentPageId) return;
+    dispatch({ type: "set", app: { ...app, currentPageId: id } });
+    setSelectedIds(new Set());
+  };
+
+  const addPage = () => {
+    const used = new Set(app.pages.map((p) => p.name.toLowerCase()));
+    let name = `Page ${app.pages.length + 1}`;
+    let n = app.pages.length + 1;
+    while (used.has(name.toLowerCase())) { n++; name = `Page ${n}`; }
+    const pg = newPage(name);
+    // Inherit the active page's dimensions so the new page looks consistent.
+    pg.root.width = root.width;
+    pg.root.height = root.height;
+    dispatch({
+      type: "commit",
+      app: { ...app, pages: [...app.pages, pg], currentPageId: pg.id },
+    });
+    setSelectedIds(new Set());
+  };
+
+  const renamePage = (id: PageId, name: string) => {
+    const trimmed = name.trim() || "Untitled";
+    dispatch({
+      type: "commit",
+      app: { ...app, pages: app.pages.map((p) => p.id === id ? { ...p, name: trimmed } : p) },
+    });
+  };
+
+  const deletePage = (id: PageId) => {
+    if (app.pages.length <= 1) return;
+    if (!window.confirm("Delete this page? Its content will be lost.")) return;
+    const idx = app.pages.findIndex((p) => p.id === id);
+    if (idx < 0) return;
+    const remaining = app.pages.filter((p) => p.id !== id);
+    const nextCurrent = id === app.currentPageId
+      ? remaining[Math.min(idx, remaining.length - 1)].id
+      : app.currentPageId;
+    // After delete, also rewrite any Button.onClick navigate actions that
+    // pointed at the removed page back to "none".
+    const cleaned = remaining.map((p) => ({
+      ...p,
+      root: mutateTree(p.root, (clone) => {
+        const walk = (n: Node) => {
+          if (n.kind === "Button" && n.onClick?.kind === "navigate" && n.onClick.pageId === id) {
+            n.onClick = { kind: "none" };
+          }
+          if (isContainer(n)) n.children.forEach(walk);
+        };
+        walk(clone);
+      }),
+    }));
+    dispatch({
+      type: "commit",
+      app: { ...app, pages: cleaned, currentPageId: nextCurrent },
+    });
+    setSelectedIds(new Set());
+  };
+
+  // ── Variables CRUD ──────────────────────────────────────────────────────
+  //
+  // Variables are app-level state slots. Each has a stable id (used by
+  // bindings + setVariable actions), a user-edited name (sanitised at QML
+  // emit time), a type, and an `initial` string (parsed by emit per type).
+  //
+  // Deleting a variable cleans up: any TextNode.binding pointing at it
+  // becomes undefined, and any Button.onClick = setVariable on it resets
+  // to none.
+
+  // Returns the new variable's id so callers (e.g. the inline "+ new"
+  // button in the setVariable action picker) can wire it up immediately
+  // without a render round-trip.
+  const addVariable = (preferName?: string): VariableId => {
+    const used = new Set(app.variables.map((v) => v.name));
+    let name = preferName?.trim() || "var";
+    if (used.has(name)) {
+      let n = 1;
+      while (used.has(`${name}${n}`)) n++;
+      name = `${name}${n}`;
+    }
+    const v = newVariable(name);
+    dispatch({
+      type: "commit",
+      app: { ...app, variables: [...app.variables, v] },
+    });
+    return v.id;
+  };
+
+  const updateVariable = (id: VariableId, patch: Partial<Variable>) => {
+    dispatch({
+      type: "commit",
+      app: {
+        ...app,
+        variables: app.variables.map((v) => (v.id === id ? { ...v, ...patch } : v)),
+      },
+    });
+  };
+
+  const deleteVariable = (id: VariableId) => {
+    if (!app.variables.some((v) => v.id === id)) return;
+    if (!window.confirm("Delete this variable? Any bindings or set-variable actions referencing it will be cleared.")) return;
+    const cleanedPages = app.pages.map((p) => ({
+      ...p,
+      root: mutateTree(p.root, (clone) => {
+        const walk = (n: Node) => {
+          // Text binding (display)
+          if (n.kind === "Text" && n.binding === id) n.binding = undefined;
+          // Two-way input bindings
+          if ((n.kind === "TextField" || n.kind === "TextArea" ||
+               n.kind === "Slider" || n.kind === "Switch" ||
+               n.kind === "CheckBox") && n.binding === id) {
+            n.binding = undefined;
+          }
+          // Button setVariable action targeting this var
+          if (n.kind === "Button" && n.onClick?.kind === "setVariable" && n.onClick.varId === id) {
+            n.onClick = { kind: "none" };
+          }
+          if (isContainer(n)) n.children.forEach(walk);
+        };
+        walk(clone);
+      }),
+    }));
+    dispatch({
+      type: "commit",
+      app: {
+        ...app,
+        pages: cleanedPages,
+        variables: app.variables.filter((v) => v.id !== id),
+      },
+    });
+  };
+
+  // ── Triggers (event-driven actions) ──────────────────────────────────────
+  //
+  // Each trigger fires actions in response to either app load (`appStart`)
+  // or a module event (`moduleEvent`). Actions are the same union we use
+  // for Button.onClick. When a trigger has multiple actions they run
+  // sequentially.
+
+  const addTrigger = (kind: TriggerKind) => {
+    const t = newTrigger(kind);
+    let extraVars: Variable[] = [];
+    if (kind === "moduleEvent") {
+      // Default to the first enabled module + its first event so the
+      // dropdowns aren't blank.
+      const mod = app.modules.map(findModuleSpec).find((m) => m && (m.events?.length ?? 0) > 0);
+      if (mod) {
+        t.moduleId = mod.id;
+        t.eventName = mod.events?.[0]?.name;
+      }
+    } else if (kind === "onMessageReceived") {
+      // Sensible default topic so the editor renders something readable;
+      // the user is expected to overwrite this with their app's topic.
+      t.topic = "/myapp/1/messages/json";
+      // Pre-populate a working setup so "+ message" results in something
+      // that already works instead of a hollow trigger that the user then
+      // has to wire up. Auto-create a `lastMessage` variable + a default
+      // action that captures the incoming payload into it. The user can
+      // bind a Text widget to var_lastMessage and immediately see receives;
+      // they're free to delete / rename / customize from there.
+      const v: Variable = { id: newId(), name: "lastMessage", type: "string", initial: "(none yet)" };
+      extraVars = [v];
+      t.actions = [
+        { kind: "setVariable", varId: v.id, value: "payload", mode: "expression" } as ButtonAction,
+      ];
+    }
+    dispatch({
+      type: "commit",
+      app: {
+        ...app,
+        variables: [...app.variables, ...extraVars],
+        triggers: [...app.triggers, t],
+      },
+    });
+  };
+  const updateTrigger = (id: TriggerId, patch: Partial<Trigger>) => {
+    dispatch({
+      type: "commit",
+      app: { ...app, triggers: app.triggers.map((t) => t.id === id ? { ...t, ...patch } : t) },
+    });
+  };
+  const deleteTrigger = (id: TriggerId) => {
+    dispatch({
+      type: "commit",
+      app: { ...app, triggers: app.triggers.filter((t) => t.id !== id) },
+    });
+  };
+  const addTriggerAction = (id: TriggerId) => {
+    const t = app.triggers.find((tt) => tt.id === id);
+    if (!t) return;
+    updateTrigger(id, { actions: [...t.actions, { kind: "none" }] });
+  };
+  const updateTriggerAction = (id: TriggerId, idx: number, action: ButtonAction) => {
+    const t = app.triggers.find((tt) => tt.id === id);
+    if (!t) return;
+    updateTrigger(id, {
+      actions: t.actions.map((a, i) => (i === idx ? action : a)),
+    });
+  };
+  const deleteTriggerAction = (id: TriggerId, idx: number) => {
+    const t = app.triggers.find((tt) => tt.id === id);
+    if (!t) return;
+    updateTrigger(id, { actions: t.actions.filter((_, i) => i !== idx) });
+  };
+
+  // ── Core module authoring ────────────────────────────────────────────────
+  //
+  // The user's own backend module spec — optional. When present, its
+  // methods join the inspector's callModule picker (alongside primitives)
+  // and the export modal exposes a "Core source" download.
+
+  const enableCoreModule = () => {
+    if (app.coreModule) return;
+    dispatch({ type: "commit", app: { ...app, coreModule: newCoreModule() } });
+  };
+  const disableCoreModule = () => {
+    if (!app.coreModule) return;
+    if (!window.confirm("Remove your core module from this project? Any Button onClick → callModule actions targeting it will reset.")) return;
+    const goneId = app.coreModule.id;
+    const cleanedPages = app.pages.map((p) => ({
+      ...p,
+      root: mutateTree(p.root, (clone) => {
+        const walk = (n: Node) => {
+          if (n.kind === "Button" && n.onClick?.kind === "callModule" && n.onClick.moduleId === goneId) {
+            n.onClick = { kind: "none" };
+          }
+          if (isContainer(n)) n.children.forEach(walk);
+        };
+        walk(clone);
+      }),
+    }));
+    dispatch({ type: "commit", app: { ...app, pages: cleanedPages, coreModule: undefined } });
+  };
+  const updateCoreModule = (patch: Partial<CoreModuleSpec>) => {
+    if (!app.coreModule) return;
+    dispatch({ type: "commit", app: { ...app, coreModule: { ...app.coreModule, ...patch } } });
+  };
+  const addCoreMethod = () => {
+    if (!app.coreModule) return;
+    updateCoreModule({ methods: [...app.coreModule.methods, newCoreMethod()] });
+  };
+  const updateCoreMethod = (idx: number, patch: Partial<CoreMethod>) => {
+    if (!app.coreModule) return;
+    const methods = app.coreModule.methods.map((m, i) => (i === idx ? { ...m, ...patch } : m));
+    updateCoreModule({ methods });
+  };
+  const deleteCoreMethod = (idx: number) => {
+    if (!app.coreModule) return;
+    updateCoreModule({ methods: app.coreModule.methods.filter((_, i) => i !== idx) });
+  };
+  const toggleCoreDep = (depId: string) => {
+    if (!app.coreModule) return;
+    const has = app.coreModule.dependencies.includes(depId);
+    updateCoreModule({
+      dependencies: has
+        ? app.coreModule.dependencies.filter((d) => d !== depId)
+        : [...app.coreModule.dependencies, depId],
+    });
+  };
+  const addCoreStateField = () => {
+    if (!app.coreModule) return;
+    updateCoreModule({ state: [...app.coreModule.state, newCoreStateField()] });
+  };
+  const updateCoreStateField = (idx: number, patch: Partial<CoreStateField>) => {
+    if (!app.coreModule) return;
+    const state = app.coreModule.state.map((s, i) => (i === idx ? { ...s, ...patch } : s));
+    updateCoreModule({ state });
+  };
+  const deleteCoreStateField = (idx: number) => {
+    if (!app.coreModule) return;
+    updateCoreModule({ state: app.coreModule.state.filter((_, i) => i !== idx) });
   };
 
   // Replace the current design with a built-in template. Keeps the user's
@@ -913,7 +1342,23 @@ export default function Page() {
   // metadata change.
   const applyTemplate = (t: Template) => {
     const built = t.build();
-    dispatch({ type: "commit", root: built.root });
+    // Templates produce a single page. Replace the current app with a one-
+    // page app named after the template; existing pages are discarded.
+    // Variables/triggers from the template overwrite when present (they're
+    // wired up to the new layout); otherwise the user's existing state is
+    // preserved so layout-only templates don't wipe their work.
+    const home: PageData = { id: newId(), name: built.meta.name || "Home", root: built.root };
+    dispatch({
+      type: "commit",
+      app: {
+        pages: [home],
+        currentPageId: home.id,
+        variables: built.variables ?? app.variables,
+        modules: app.modules,
+        coreModule: app.coreModule,
+        triggers: built.triggers ?? app.triggers,
+      },
+    });
     setModuleMeta((prev) => ({
       ...prev,
       name: built.meta.name,
@@ -927,7 +1372,7 @@ export default function Page() {
   const handleNew = () => {
     if (!window.confirm("Clear the canvas and start over? This wipes the current design.")) return;
     if (typeof window !== "undefined") window.localStorage.removeItem(SAVE_KEY);
-    dispatch({ type: "set", root: newRoot() });
+    dispatch({ type: "set", app: newApp() });
     setModuleMeta({
       name: "my_widget",
       version: "0.1.0",
@@ -1009,6 +1454,7 @@ export default function Page() {
     dragIds.delete(root.id);
     if (dragIds.size === 0) return;
 
+    const baseApp = app;
     const baseRoot = root;
     const initial = new Map<NodeId, { x: number; y: number }>();
     for (const sid of dragIds) {
@@ -1041,7 +1487,7 @@ export default function Page() {
       const g = gridSizeRef.current;
       if (g > 0) { dx = Math.round(dx / g) * g; dy = Math.round(dy / g) * g; }
       setGuideLines(guides);
-      const next = mutateTree(baseRoot, (clone) => {
+      const nextApp = mutateActivePage(baseApp, (clone) => {
         for (const [sid, pos] of initial) {
           const f = findNode(clone, sid);
           if (f.node) {
@@ -1050,7 +1496,7 @@ export default function Page() {
           }
         }
       });
-      dispatch({ type: "set", root: next });
+      dispatch({ type: "set", app: nextApp });
     };
     const onUp = () => {
       setGuideLines([]);
@@ -1069,6 +1515,7 @@ export default function Page() {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+    const baseApp = app;
     const baseRoot = root;
     const found = findNode(baseRoot, id);
     if (!found.node) return;
@@ -1106,14 +1553,14 @@ export default function Page() {
         nw = Math.max(MIN_SIZE, Math.round(nw / g) * g);
         nh = Math.max(MIN_SIZE, Math.round(nh / g) * g);
       }
-      const next = mutateTree(baseRoot, (clone) => {
+      const nextApp = mutateActivePage(baseApp, (clone) => {
         const f = findNode(clone, id);
         if (f.node) {
           f.node.x = Math.round(nx); f.node.y = Math.round(ny);
           f.node.width = Math.round(nw); f.node.height = Math.round(nh);
         }
       });
-      dispatch({ type: "set", root: next });
+      dispatch({ type: "set", app: nextApp });
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
@@ -1133,6 +1580,7 @@ export default function Page() {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+    const baseApp = app;
     const baseRoot = root;
     const initial: { id: NodeId; x: number; y: number; width: number; height: number }[] = [];
     let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
@@ -1174,7 +1622,7 @@ export default function Page() {
       const sxR = nbw / sw, syR = nbh / sh;
       dispatch({
         type: "set",
-        root: mutateTree(baseRoot, (clone) => {
+        app: mutateActivePage(baseApp, (clone) => {
           for (const i of initial) {
             const f = findNode(clone, i.id);
             if (!f.node) continue;
@@ -1327,7 +1775,7 @@ export default function Page() {
           // Nudge each selected non-root node — single commit, single undo.
           dispatch({
             type: "commit",
-            root: mutateTree(root, (clone) => {
+            app: mutateActivePage(app, (clone) => {
               for (const sid of selectedIds) {
                 if (sid === root.id) continue;
                 const { node } = findNode(clone, sid);
@@ -1345,19 +1793,24 @@ export default function Page() {
 
   // ── Export ────────────────────────────────────────────────────────────────
 
-  const handleExport = async () => {
+  // True when the user has at least drafted a core module (id + ≥1 method).
+  const hasCoreModule = !!app.coreModule && app.coreModule.id.trim().length > 0;
+
+  // ── Export: UI plugin (.lgx) ─────────────────────────────────────────────
+  const handleExportUi = async () => {
     const name = sanitizeName(moduleMeta.name) || "my_widget";
 
-    // Collect every Image node's data URL, write each to assets/<n>.<ext>,
-    // and rewrite the tree so the emitted QML references those files
-    // instead of inline base64. The tree clone is throwaway — never mounted.
+    // Collect every Image node's data URL across every page, write each to
+    // assets/<n>.<ext>, and rewrite the trees so the emitted QML references
+    // those files instead of inline base64. We deep-clone the whole AppState
+    // so the editor state is untouched.
     type AssetEntry = { rel: string; data: Uint8Array };
     const assets: AssetEntry[] = [];
-    const seen = new Map<string, string>();   // dataURL -> assetPath
-    const exportRoot: FrameNode = JSON.parse(JSON.stringify(root));
+    const seen = new Map<string, string>();
+    const exportApp: AppState = JSON.parse(JSON.stringify(app));
     let assetCounter = 0;
     const walk = (n: Node) => {
-      if (n.kind === "Image" && n.src.startsWith("data:")) {
+      if ((n.kind === "Image" || n.kind === "AnimatedImage") && n.src.startsWith("data:")) {
         let assetPath = seen.get(n.src);
         if (!assetPath) {
           const m = /^data:([^;]+);base64,(.+)$/.exec(n.src);
@@ -1377,8 +1830,8 @@ export default function Page() {
         n.children.forEach(walk);
       }
     };
-    exportRoot.children.forEach(walk);
-    const qmlSource = emitMainQml(exportRoot, true);
+    for (const p of exportApp.pages) p.root.children.forEach(walk);
+    const qmlSource = emitMainQml(exportApp, true);
 
     // Embed an editor-side snapshot so the .lgx is round-trip importable
     // (Open button can read this back). Uses the *original* root with data
@@ -1387,6 +1840,16 @@ export default function Page() {
     const designSnapshot: SaveState = buildSaveState();
     const designJsonBytes = new TextEncoder().encode(JSON.stringify(designSnapshot));
     const allExtras = [...assets, { rel: "design.json", data: designJsonBytes }];
+
+    // UI dependencies — primitives the user picked + the user's core
+    // (if any) + the shared delivery_relay (auto-included when any send/
+    // receive action exists). Without declaring delivery_relay here,
+    // Basecamp would silently skip the UI install on dep-resolution.
+    const uiDeps = [
+      ...app.modules,
+      ...(hasCoreModule ? [app.coreModule!.id] : []),
+      ...(usesDelivery(app) ? ["delivery_relay"] : []),
+    ];
 
     const result = await exportLgx({
       name,
@@ -1398,6 +1861,7 @@ export default function Page() {
       iconFilename,
       qmlSource,
       extraFiles: allExtras,
+      dependencies: uiDeps,
     });
     const url = URL.createObjectURL(result.blob);
     const a = document.createElement("a");
@@ -1409,6 +1873,64 @@ export default function Page() {
     URL.revokeObjectURL(url);
   };
 
+  // ── Export: custom core source bundle ────────────────────────────────────
+  // Source archive of the user's *own* backend module — separate from the
+  // shared delivery_relay. This is for users who want custom C++ logic
+  // beyond pub/sub. The archive needs to be `nix build`-ed before install.
+  const handleExportCore = () => {
+    if (!app.coreModule) return;
+    const files = generateCoreModuleFiles(app.coreModule);
+    const id = app.coreModule.id || "my_module";
+    const blob = packTarGz(files, `${id}-core`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${id}-core-source.lgx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // ── Export: shared delivery_relay (pre-built, ships with the editor) ────
+  // Same .lgx for every project. Just fetches the bundled static asset and
+  // triggers a download. User installs once per Basecamp; every delivery-
+  // enabled widget reuses it.
+  const handleExportRelay = async () => {
+    const res = await fetch("/delivery_relay.lgx");
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "delivery_relay.lgx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // Modal-driven export. The user picks UI + (optionally) the relay + their
+  // custom core. When delivery is in use, the relay download is forced on.
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportUi, setExportUi] = useState(true);
+  const [exportCore, setExportCore] = useState(false);
+  const [exportRelay, setExportRelay] = useState(false);
+  const deliveryNeedsRelay = usesDelivery(app);
+  // Default checkboxes when opening: relay on if delivery is used; custom
+  // core on if the user has authored one.
+  useEffect(() => {
+    if (exportOpen) {
+      setExportRelay(deliveryNeedsRelay);
+      setExportCore(hasCoreModule);
+    }
+  }, [exportOpen, hasCoreModule, deliveryNeedsRelay]);
+  const runExport = async () => {
+    if (exportUi) await handleExportUi();
+    if (exportRelay || deliveryNeedsRelay) await handleExportRelay();
+    if (hasCoreModule && exportCore) handleExportCore();
+    setExportOpen(false);
+  };
+
   // The Inspector + ResizeOverlay are single-selection only. `primaryId` is
   // the lone selected id; null when zero or many are selected.
   const primaryId: NodeId | null = selectedIds.size === 1 ? [...selectedIds][0] : null;
@@ -1418,15 +1940,24 @@ export default function Page() {
   const canRedo = hist.future.length > 0;
 
   return (
-    <div className="flex h-screen flex-col bg-zinc-50 text-zinc-900">
-      <header className="flex h-12 items-center justify-between border-b border-zinc-200 bg-white px-4">
-        <h1 className="text-sm font-semibold tracking-tight">
-          <span className="text-zinc-900">lgx</span>
-          <span className="text-zinc-400">.guru</span>
+    <div className="flex h-screen flex-col bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100">
+      <header className="flex h-12 items-center justify-between border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-4">
+        <h1 className="flex items-center gap-2 text-sm font-semibold tracking-tight">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/lgx-logo.svg"
+            alt="lgx.guru"
+            width={28}
+            height={28}
+            // The logo's main strokes are near-black so they vanish on dark
+            // backgrounds; invert in dark mode for legibility.
+            className="h-7 w-7 dark:invert"
+          />
+          <span className="sr-only">lgx.guru</span>
         </h1>
         <div className="flex items-center gap-2">
           <button
-            className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
             onClick={handleNew}
             title="Clear and start a new design"
           >New</button>
@@ -1434,8 +1965,8 @@ export default function Page() {
             <button
               className={`rounded border px-2 py-1 text-xs ${
                 templatesOpen
-                  ? "border-blue-400 bg-blue-50 text-blue-700"
-                  : "border-zinc-300 text-zinc-700 hover:bg-zinc-100"
+                  ? "border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300"
+                  : "border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
               }`}
               onClick={() => setTemplatesOpen((v) => !v)}
               title="Replace canvas with a starter template"
@@ -1447,21 +1978,21 @@ export default function Page() {
                   onClick={() => setTemplatesOpen(false)}
                 />
                 <div
-                  className="absolute right-0 top-full z-20 mt-1 w-64 rounded border border-zinc-200 bg-white shadow-lg"
+                  className="absolute right-0 top-full z-20 mt-1 w-64 rounded border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-lg"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="border-b border-zinc-200 px-3 py-2 text-[10px] font-semibold uppercase text-zinc-500">
+                  <div className="border-b border-zinc-200 dark:border-zinc-700 px-3 py-2 text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
                     Pick a template
                   </div>
                   <div className="max-h-80 overflow-y-auto py-1">
                     {TEMPLATES.map((t) => (
                       <button
                         key={t.id}
-                        className="block w-full px-3 py-1.5 text-left hover:bg-zinc-50"
+                        className="block w-full px-3 py-1.5 text-left hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
                         onClick={() => applyTemplate(t)}
                       >
-                        <div className="text-[12px] font-medium text-zinc-800">{t.name}</div>
-                        <div className="text-[10px] leading-tight text-zinc-500">{t.description}</div>
+                        <div className="text-[12px] font-medium text-zinc-800 dark:text-zinc-200">{t.name}</div>
+                        <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">{t.description}</div>
                       </button>
                     ))}
                   </div>
@@ -1470,12 +2001,12 @@ export default function Page() {
             )}
           </div>
           <button
-            className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
             onClick={() => designFileInputRef.current?.click()}
             title="Open a .lgx-design.json or a .lgx exported from this editor"
           >Open</button>
           <button
-            className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
             onClick={handleSaveDesign}
             title="Download a .lgx-design.json snapshot"
           >Save</button>
@@ -1492,84 +2023,152 @@ export default function Page() {
           />
           <span className="mx-1 h-5 w-px bg-zinc-200" />
           <button
-            className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 disabled:opacity-30"
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
             disabled={!canUndo}
             onClick={() => dispatch({ type: "undo" })}
             title="Undo (Cmd+Z)"
           >Undo</button>
           <button
-            className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 disabled:opacity-30"
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
             disabled={!canRedo}
             onClick={() => dispatch({ type: "redo" })}
             title="Redo (Cmd+Shift+Z)"
           >Redo</button>
           <button
-            className="ml-2 rounded bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700"
-            onClick={handleExport}
-          >Export .lgx</button>
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            onClick={cycleTheme}
+            title={`Theme: ${themePref} (click to cycle light → dark → system)`}
+            aria-label="Cycle theme"
+          >
+            {themePref === "light" ? "☀" : themePref === "dark" ? "☾" : "◐"}
+          </button>
+          <button
+            className="ml-2 rounded bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700 dark:hover:bg-zinc-200 dark:bg-zinc-100 dark:bg-zinc-800 dark:text-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-300 dark:hover:bg-zinc-700"
+            onClick={() => setExportOpen(true)}
+          >Export…</button>
         </div>
       </header>
 
       <div className="flex flex-1 min-h-0">
-        {/* Left column: palette (top) + layers (bottom, scrollable) */}
-        <aside className="flex w-52 shrink-0 flex-col border-r border-zinc-200 bg-white">
-          <div className="shrink-0 border-b border-zinc-200 p-3">
-            <div className="mb-2 text-xs font-semibold uppercase text-zinc-500">
-              Components
-            </div>
-            <div className="flex flex-col gap-3">
-              {PALETTE.map((cat) => (
-                <div key={cat.name}>
-                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">
-                    {cat.name}
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    {cat.items.map((p) => (
-                      <button
-                        key={p.kind}
-                        draggable
-                        onDragStart={() => setDraggingKind(p.kind)}
-                        onDragEnd={() => setDraggingKind(null)}
-                        onClick={p.kind === "Image" ? () => imageFileInputRef.current?.click() : undefined}
-                        className="cursor-grab rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-left text-xs hover:border-zinc-400 active:cursor-grabbing"
-                        title={p.kind === "Image" ? "Click to upload, or drag for a placeholder" : undefined}
-                      >
-                        {p.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <input
-              ref={imageFileInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleImageUpload(f);
-                e.target.value = "";
-              }}
+        {/* Left column. Two scroll regions, anchored to the column:
+            - top: panels (Pages, Variables, Triggers, Networking, Build a
+              module, Components). Scrolls so any combination of panels fits.
+            - bottom: Layers, capped to 40% of the column height with its own
+              scroll so deeply-nested designs stay manageable. */}
+        <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 min-h-0">
+          <div className="flex-1 overflow-y-auto min-h-0">
+            <PagesPanel
+              pages={app.pages}
+              currentPageId={app.currentPageId}
+              onSwitch={switchPage}
+              onAdd={addPage}
+              onRename={renamePage}
+              onDelete={deletePage}
             />
-            <p className="mt-3 text-[11px] leading-tight text-zinc-500">
-              Drag onto the canvas, or drop image files from your OS.
-            </p>
-            <div className="mt-4 border-t border-zinc-200 pt-3 text-[11px] leading-tight text-zinc-500">
-              <div className="mb-1 font-semibold uppercase">Shortcuts</div>
-              <div>Shift-click multi-select</div>
-              <div>Cmd+Z undo · Cmd+Shift+Z redo</div>
-              <div>Cmd+C/X/V copy/cut/paste</div>
-              <div>Cmd+D duplicate</div>
-              <div>Del/Backspace remove</div>
-              <div>Arrows nudge (Shift = 10px)</div>
-            </div>
+            <VariablesPanel
+              variables={app.variables}
+              onAdd={addVariable}
+              onUpdate={updateVariable}
+              onDelete={deleteVariable}
+            />
+            <TriggersPanel
+              triggers={app.triggers}
+              pages={app.pages}
+              variables={app.variables}
+              enabledModuleIds={app.modules}
+              coreModule={app.coreModule}
+              onAdd={addTrigger}
+              onUpdate={updateTrigger}
+              onDelete={deleteTrigger}
+              onAddAction={addTriggerAction}
+              onUpdateAction={updateTriggerAction}
+              onDeleteAction={deleteTriggerAction}
+              onAddVariable={addVariable}
+            />
+            <ModulesPanel app={app} />
+            <CoreModulePanel
+              spec={app.coreModule}
+              onEnable={enableCoreModule}
+              onDisable={disableCoreModule}
+              onUpdate={updateCoreModule}
+              onAddMethod={addCoreMethod}
+              onUpdateMethod={updateCoreMethod}
+              onDeleteMethod={deleteCoreMethod}
+              onToggleDep={toggleCoreDep}
+              onAddStateField={addCoreStateField}
+              onUpdateStateField={updateCoreStateField}
+              onDeleteStateField={deleteCoreStateField}
+            />
+            <SidebarSection
+              title="Components"
+              defaultOpen
+              headerRight={
+                <button
+                  type="button"
+                  className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  title={[
+                    "Shortcuts",
+                    "Shift-click multi-select",
+                    "Cmd+Z undo · Cmd+Shift+Z redo",
+                    "Cmd+C/X/V copy/cut/paste",
+                    "Cmd+D duplicate",
+                    "Del/Backspace remove",
+                    "Arrows nudge (Shift = 10px)",
+                  ].join("\n")}
+                >?</button>
+              }
+            >
+              <div className="flex flex-col gap-2">
+                {PALETTE.map((cat) => (
+                  <div key={cat.name}>
+                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                      {cat.name}
+                    </div>
+                    {/* Two-column grid — packs ~2x denser than the previous
+                        single-column stack, eliminating most palette overflow. */}
+                    <div className="grid grid-cols-2 gap-1">
+                      {cat.items.map((p) => (
+                        <button
+                          key={p.kind}
+                          draggable
+                          onDragStart={() => setDraggingKind(p.kind)}
+                          onDragEnd={() => setDraggingKind(null)}
+                          onClick={p.kind === "Image" ? () => imageFileInputRef.current?.click() : undefined}
+                          className="flex cursor-grab items-center gap-1.5 truncate rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 px-1.5 py-1 text-left text-[11px] hover:border-zinc-400 dark:hover:border-zinc-500 active:cursor-grabbing"
+                          title={p.kind === "Image" ? "Click to upload, or drag for a placeholder" : p.label}
+                        >
+                          <NodeIcon kind={p.kind} className="text-zinc-500 dark:text-zinc-400" />
+                          <span className="truncate">{p.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <input
+                ref={imageFileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleImageUpload(f);
+                  e.target.value = "";
+                }}
+              />
+              <p className="mt-2 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                Drag onto the canvas, or drop image files from your OS.
+              </p>
+            </SidebarSection>
           </div>
 
-          <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-3 py-1.5">
-              <span className="text-xs font-semibold uppercase text-zinc-500">Layers</span>
-              <span className="text-[10px] text-zinc-400">drag to reorder</span>
+          {/* Layers — anchored at the bottom, capped to 40vh so it shares
+              column height fairly with the panels above. Internal scroll for
+              deep trees. */}
+          <div className="shrink-0 flex flex-col border-t border-zinc-200 dark:border-zinc-700 max-h-[40vh] min-h-[120px]">
+            <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 dark:border-zinc-700 px-2.5 py-1.5">
+              <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Layers</span>
+              <span className="text-[10px] text-zinc-400 dark:text-zinc-500">drag to reorder</span>
             </div>
             <div className="flex-1 overflow-y-auto py-1">
               <LayersPanel
@@ -1586,29 +2185,48 @@ export default function Page() {
           </div>
         </aside>
 
-        {/* Canvas + preview */}
+        {/* Single-pane canvas. The Qt-WASM iframe IS the canvas — it
+            renders the QML the same way Basecamp will. The React overlay
+            on top captures pointer events for selection / drag / resize.
+            A Run-mode toggle lifts that overlay's pointer-events-auto so
+            clicks fall through to Qt and the user can interact with their
+            widget (test buttons, type into fields, send messages). */}
         <main className="flex flex-1 flex-col min-w-0">
-          {/* Canvas section — same inner shape as the preview section below
-              (bar header + flex-1 full-bleed content area) so their content
-              dimensions match exactly and the canvas == preview pixel-for-pixel. */}
-          <section className="flex flex-1 flex-col bg-zinc-100 min-h-0">
-            <div className="flex items-center justify-between border-b border-zinc-200 bg-white px-3 py-1.5">
-              <span className="text-xs font-semibold uppercase text-zinc-500">
-                Canvas
-              </span>
+          <section className="flex flex-1 flex-col bg-zinc-100 dark:bg-zinc-800 min-h-0">
+            <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400">
+                  {runMode ? "Run" : "Canvas"}
+                </span>
+                <span className="text-[11px] text-zinc-400 dark:text-zinc-500">
+                  Qt-WASM @ {RENDERER_URL}
+                </span>
+              </div>
               <div className="flex items-center gap-2">
                 <button
                   className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                    runMode
+                      ? "border-emerald-400 dark:border-emerald-600 bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300"
+                      : "border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  }`}
+                  onClick={() => setRunMode((v) => !v)}
+                  title="Toggle Edit ↔ Run. Edit lets you select & drag widgets; Run forwards clicks to Qt so you can test the live widget."
+                >
+                  {runMode ? "▶ Run" : "✎ Edit"}
+                </button>
+                <button
+                  className={`rounded border px-1.5 py-0.5 text-[11px] ${
                     gridSize > 0
-                      ? "border-blue-400 bg-blue-50 text-blue-700"
-                      : "border-zinc-300 bg-white text-zinc-600 hover:bg-zinc-50"
+                      ? "border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300"
+                      : "border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
                   }`}
                   onClick={() => setGridSize((g) => (g === 0 ? 8 : g === 8 ? 16 : g === 16 ? 24 : 0))}
                   title="Toggle snap-to-grid (cycles off / 8 / 16 / 24 px)"
+                  disabled={runMode}
                 >
                   grid {gridSize === 0 ? "off" : `${gridSize}px`}
                 </button>
-                <span className="text-[11px] text-zinc-400">
+                <span className="text-[11px] text-zinc-400 dark:text-zinc-500">
                   {root.width}×{root.height}px
                 </span>
               </div>
@@ -1617,53 +2235,52 @@ export default function Page() {
               ref={canvasRef}
               className="relative flex-1 overflow-hidden"
             >
-              <CanvasArea
-                root={root}
-                selectedIds={selectedIds}
-                onSelect={handleSelect}
-                onStartMove={startMove}
-                onCanvasDrop={handleCanvasDrop}
-                onCanvasDragOver={handleCanvasDragOver}
-                onMarqueeStart={startMarquee}
-                draggingKind={draggingKind}
-                gridSize={gridSize}
-                resizeOverlay={
-                  primaryAbs && primaryId && primaryId !== root.id && primaryNode && !primaryNode.locked ? (
-                    <ResizeOverlay
-                      rect={primaryAbs}
-                      onStart={(anchor, e) => startResize(e, primaryId, anchor)}
-                    />
-                  ) : multiBbox ? (
-                    <ResizeOverlay
-                      rect={multiBbox}
-                      onStart={(anchor, e) => startMultiResize(e, anchor)}
-                    />
-                  ) : null
-                }
-                guideOverlay={guideLines.length > 0 ? <GuideOverlay lines={guideLines} /> : null}
-                marquee={marquee}
+              {/* Qt-WASM rendering of the user's QML — the only renderer in
+                  the editor now. In Edit mode this iframe gets `pointer-events:
+                  none` so the React overlay captures clicks for selection /
+                  drag. In Run mode the React overlay disappears, the iframe
+                  takes events, and the user can interact with their widget. */}
+              <iframe
+                ref={canvasIframeRef}
+                src={RENDERER_URL}
+                className="absolute inset-0 h-full w-full bg-zinc-50 dark:bg-zinc-800"
+                style={{ pointerEvents: runMode ? "auto" : "none" }}
+                title="canvas-renderer"
               />
+              {!runMode && (
+                <CanvasArea
+                  root={root}
+                  selectedIds={selectedIds}
+                  onSelect={handleSelect}
+                  onStartMove={startMove}
+                  onCanvasDrop={handleCanvasDrop}
+                  onCanvasDragOver={handleCanvasDragOver}
+                  onMarqueeStart={startMarquee}
+                  draggingKind={draggingKind}
+                  gridSize={gridSize}
+                  resizeOverlay={
+                    primaryAbs && primaryId && primaryId !== root.id && primaryNode && !primaryNode.locked ? (
+                      <ResizeOverlay
+                        rect={primaryAbs}
+                        onStart={(anchor, e) => startResize(e, primaryId, anchor)}
+                      />
+                    ) : multiBbox ? (
+                      <ResizeOverlay
+                        rect={multiBbox}
+                        onStart={(anchor, e) => startMultiResize(e, anchor)}
+                      />
+                    ) : null
+                  }
+                  guideOverlay={guideLines.length > 0 ? <GuideOverlay lines={guideLines} /> : null}
+                  marquee={marquee}
+                />
+              )}
             </div>
-          </section>
-
-          <section className="flex h-1/2 flex-col bg-zinc-100 min-h-0">
-            <div className="flex items-center justify-between border-t border-zinc-200 bg-white px-3 py-1.5">
-              <span className="text-xs font-semibold uppercase text-zinc-500">
-                Live preview (Qt-WASM)
-              </span>
-              <span className="text-[11px] text-zinc-400">renderer @ {RENDERER_URL}</span>
-            </div>
-            <iframe
-              ref={iframeRef}
-              src={RENDERER_URL}
-              className="h-full w-full bg-white"
-              title="qml-renderer"
-            />
           </section>
         </main>
 
         {/* Inspector */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 bg-white p-3">
+        <aside className="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-3">
           <ModulePanel
             meta={moduleMeta}
             onChange={setModuleMeta}
@@ -1674,20 +2291,20 @@ export default function Page() {
             sanitizedName={sanitizeName(moduleMeta.name) || "my_widget"}
           />
 
-          <div className="my-4 border-t border-zinc-200" />
+          <div className="my-4 border-t border-zinc-200 dark:border-zinc-700" />
 
           <div className="mb-2 flex items-center justify-between">
-            <span className="text-xs font-semibold uppercase text-zinc-500">
+            <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
               Inspector
             </span>
             {(selectedIds.size > 0 && (selectedIds.size > 1 || (primaryNode && primaryId !== root.id))) && (
               <div className="flex items-center gap-2">
                 <button
-                  className="text-[11px] text-zinc-600 hover:underline"
+                  className="text-[11px] text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
                   onClick={duplicateSelected}
                 >duplicate</button>
                 <button
-                  className="text-[11px] text-red-600 hover:underline"
+                  className="text-[11px] text-red-600 dark:text-red-400 hover:underline"
                   onClick={deleteSelected}
                 >delete</button>
               </div>
@@ -1700,17 +2317,17 @@ export default function Page() {
               <IconBtn title="Send backward (Cmd+[)"        onClick={() => zOrderSelected("backward")} ><AlignIcon kind="centerX" /></IconBtn>
               <IconBtn title="Bring forward (Cmd+])"        onClick={() => zOrderSelected("forward")}  ><AlignIcon kind="right" /></IconBtn>
               <IconBtn title="Bring to front (Cmd+Shift+])" onClick={() => zOrderSelected("front")}    ><AlignIcon kind="distH" /></IconBtn>
-              <span className="ml-1 text-[10px] text-zinc-400">z-order</span>
+              <span className="ml-1 text-[10px] text-zinc-400 dark:text-zinc-500">z-order</span>
             </div>
           )}
           {selectedIds.size === 0 ? (
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
               Click a node in the canvas to edit. Shift-click to add to selection.
               Click empty space to deselect.
             </p>
           ) : selectedIds.size > 1 ? (
             <div className="flex flex-col gap-3">
-              <p className="text-xs text-zinc-600">
+              <p className="text-xs text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">
                 <span className="font-mono">{selectedIds.size}</span> items selected.
                 Drag to move together; Delete / Cmd+D / arrows apply to all.
               </p>
@@ -1726,18 +2343,144 @@ export default function Page() {
               node={primaryNode}
               isRoot={primaryId === root.id}
               onChange={(patch) => primaryId && updateNode(primaryId, patch)}
+              pages={app.pages}
+              variables={app.variables}
+              enabledModuleIds={app.modules}
+              coreModule={app.coreModule}
+              onAddVariable={addVariable}
             />
           ) : null}
           <details className="mt-6">
-            <summary className="cursor-pointer text-xs font-semibold uppercase text-zinc-500">
+            <summary className="cursor-pointer text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
               Generated QML
             </summary>
-            <pre className="mt-2 max-h-64 overflow-auto rounded bg-zinc-50 p-2 text-[10px] leading-tight text-zinc-700">
+            {/*
+              The generated QML embeds page-id-derived nav keys; ids are
+              made with Date.now() so server and client diverge. Marking the
+              <pre> as hydration-safe lets React swap to the client value
+              silently instead of throwing a mismatch.
+            */}
+            <pre
+              suppressHydrationWarning
+              className="mt-2 max-h-64 overflow-auto rounded bg-zinc-50 dark:bg-zinc-800 p-2 text-[10px] leading-tight text-zinc-700 dark:text-zinc-300"
+            >
               {qmlExport}
             </pre>
           </details>
         </aside>
       </div>
+
+      {exportOpen && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-black/30"
+          onClick={() => setExportOpen(false)}
+        >
+          <div
+            className="w-[440px] rounded-lg bg-white dark:bg-zinc-900 p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3">
+              <div className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">Export project</div>
+              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                Pick what to download. Each artifact ships as a separate <span className="font-mono">.lgx</span>; install whichever ones aren&apos;t already in your Basecamp.
+              </div>
+              {deliveryNeedsRelay && (
+                <div className="mt-2 rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950 p-2 text-[11px] leading-tight text-amber-900 dark:text-amber-200">
+                  <span className="font-semibold">Delivery is enabled.</span> Install both the UI and the bundled <span className="font-mono">delivery_relay.lgx</span> on every Basecamp instance. The relay is the same file for every project — install once, reuse forever.
+                </div>
+              )}
+            </div>
+            <div className="flex flex-col gap-3">
+              <label className="flex items-start gap-2 rounded border border-zinc-200 dark:border-zinc-700 p-2 cursor-pointer hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800">
+                <input
+                  type="checkbox"
+                  checked={exportUi}
+                  onChange={(e) => setExportUi(e.target.checked)}
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div>
+                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                    UI plugin (<span className="font-mono">.lgx</span>, portable)
+                  </div>
+                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                    The QML widget — the thing the user sees. Always available; UI-only widgets are complete with just this. Built and packaged in the canonical portable shape, ready to drop into Basecamp.
+                  </div>
+                </div>
+              </label>
+
+              <label
+                className={`flex items-start gap-2 rounded border p-2 ${
+                  deliveryNeedsRelay
+                    ? "border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 cursor-pointer hover:bg-amber-50 dark:bg-amber-950"
+                    : "border-zinc-200 dark:border-zinc-700 cursor-pointer hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={exportRelay || deliveryNeedsRelay}
+                  disabled={deliveryNeedsRelay}
+                  onChange={(e) => setExportRelay(e.target.checked)}
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div>
+                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                    <span className="font-mono">delivery_relay.lgx</span> (pre-built, ready to install){" "}
+                    {deliveryNeedsRelay && (
+                      <span className="ml-1 rounded bg-amber-100 dark:bg-amber-900 px-1 py-0.5 text-[9px] font-mono text-amber-900 dark:text-amber-200">required</span>
+                    )}
+                  </div>
+                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                    Bundled C++ relay that owns <span className="font-mono">delivery_module</span>&apos;s lifecycle and exposes <span className="font-mono">sendMessage</span> / <span className="font-mono">subscribeToTopic</span> / <span className="font-mono">takeRecentMessages</span> to widgets. Same file for every project — install once per Basecamp; reuse across all your delivery widgets.
+                  </div>
+                </div>
+              </label>
+
+              <label
+                className={`flex items-start gap-2 rounded border p-2 ${
+                  hasCoreModule
+                    ? "border-zinc-200 dark:border-zinc-700 cursor-pointer hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+                    : "border-zinc-100 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50 opacity-60"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={exportCore && hasCoreModule}
+                  disabled={!hasCoreModule}
+                  onChange={(e) => setExportCore(e.target.checked)}
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div>
+                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                    Custom backend source (<span className="font-mono">.lgx</span>, buildable)
+                  </div>
+                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                    {hasCoreModule ? (
+                      <>
+                        Source archive for your authored backend <span className="font-mono">{app.coreModule!.id}</span>. <span className="font-mono">tar -xzf</span>, then <span className="font-mono">nix build &apos;.#lgx-portable&apos;</span> produces the installable <span className="font-mono">.lgx</span> in <span className="font-mono">result/</span>. Only needed if you&apos;ve added custom C++ logic beyond pub/sub.
+                      </>
+                    ) : (
+                      <>
+                        Only available when you&apos;ve added a module under <span className="font-semibold">Build a module</span> in the sidebar. Most apps don&apos;t need this.
+                      </>
+                    )}
+                  </div>
+                </div>
+              </label>
+            </div>
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setExportOpen(false)}
+                className="rounded border border-zinc-300 dark:border-zinc-600 px-3 py-1.5 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+              >Cancel</button>
+              <button
+                onClick={runExport}
+                disabled={!exportUi && !(exportCore && hasCoreModule) && !(exportRelay || deliveryNeedsRelay)}
+                className="rounded bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-40"
+              >Export</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1780,8 +2523,11 @@ function CanvasArea({
       }
     : {};
   return (
+    // Transparent background — the Qt-WASM canvas iframe BEHIND this layer
+    // draws the actual widget pixels. A solid bg here would just hide them.
+    // The grid overlay (when enabled) is composited on top of the iframe.
     <div
-      className="relative inline-block bg-white"
+      className="relative inline-block"
       style={{ width: root.width, height: root.height, ...gridStyle }}
       onPointerDown={onMarqueeStart}
       onDragOver={onCanvasDragOver}
@@ -1827,7 +2573,7 @@ function IconBtn({
       title={title}
       disabled={disabled}
       onClick={onClick}
-      className="flex h-7 w-7 items-center justify-center rounded border border-zinc-300 bg-white text-zinc-700 hover:border-zinc-400 hover:bg-zinc-50 disabled:opacity-30 disabled:hover:bg-white"
+      className="flex h-7 w-7 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:border-zinc-400 dark:border-zinc-500 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800 disabled:opacity-30 disabled:hover:bg-white dark:bg-zinc-900"
     >
       {children}
     </button>
@@ -1909,7 +2655,7 @@ function AlignToolbar({
 }) {
   return (
     <div>
-      <div className="mb-1 text-[10px] font-semibold uppercase text-zinc-500">Align</div>
+      <div className="mb-1 text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Align</div>
       <div className="flex gap-1">
         <IconBtn title="Align left"     disabled={!canAlign} onClick={() => onAlign("left")}    ><AlignIcon kind="left" /></IconBtn>
         <IconBtn title="Align center X" disabled={!canAlign} onClick={() => onAlign("centerX")} ><AlignIcon kind="centerX" /></IconBtn>
@@ -1919,13 +2665,13 @@ function AlignToolbar({
         <IconBtn title="Align center Y" disabled={!canAlign} onClick={() => onAlign("centerY")} ><AlignIcon kind="centerY" /></IconBtn>
         <IconBtn title="Align bottom"   disabled={!canAlign} onClick={() => onAlign("bottom")}  ><AlignIcon kind="bottom" /></IconBtn>
       </div>
-      <div className="mt-2 mb-1 text-[10px] font-semibold uppercase text-zinc-500">Distribute</div>
+      <div className="mt-2 mb-1 text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Distribute</div>
       <div className="flex gap-1">
         <IconBtn title="Distribute horizontally" disabled={!canDistribute} onClick={() => onDistribute("horizontal")}><AlignIcon kind="distH" /></IconBtn>
         <IconBtn title="Distribute vertically"   disabled={!canDistribute} onClick={() => onDistribute("vertical")}  ><AlignIcon kind="distV" /></IconBtn>
       </div>
       {!canAlign && (
-        <p className="mt-1 text-[10px] text-zinc-400">
+        <p className="mt-1 text-[10px] text-zinc-400 dark:text-zinc-500">
           Align/distribute requires the selection to share one parent.
         </p>
       )}
@@ -1958,6 +2704,14 @@ function GuideOverlay({ lines }: { lines: GuideLine[] }) {
 // Build the CSS-equivalent of the node's CommonStyle, plus its absolute
 // positioning. `box-sizing: border-box` matches Qt's Rectangle (border draws
 // inside the bounds, not outside).
+// Geometry-only positioning. The Qt-WASM canvas iframe behind the React
+// layer already draws the visible widget (background, border, text, button
+// chrome, image, etc.) — keeping React's visual content too would either
+// double-up or, worse, diverge from what Basecamp actually renders.
+//
+// React keeps just the bounding box + rotation here so selection outlines,
+// resize handles, and pointer-event capture all line up with the Qt pixels
+// underneath.
 function commonStyleCss(node: Node): React.CSSProperties {
   const s = node.style;
   return {
@@ -1966,15 +2720,8 @@ function commonStyleCss(node: Node): React.CSSProperties {
     top: node.y,
     width: node.width,
     height: node.height,
-    backgroundColor: s.backgroundColor,
-    opacity: s.opacity,
-    borderColor: s.borderColor,
-    borderWidth: s.borderWidth,
-    borderStyle: s.borderWidth > 0 ? "solid" : "none",
-    borderRadius: s.borderRadius,
     transform: s.rotation !== 0 ? `rotate(${s.rotation}deg)` : undefined,
     boxSizing: "border-box",
-    overflow: "hidden",
   };
 }
 
@@ -2022,10 +2769,20 @@ function NodeView({
     },
   };
 
+  // ── Transparent click-target rendering ─────────────────────────────────
+  // The visible widget (text, button chrome, image, slider, …) is drawn by
+  // the Qt-WASM canvas iframe behind us — that's the same rendering the
+  // user gets in Basecamp, byte-for-byte. The React layer's job here is
+  // ONLY to capture pointer events and host editor affordances (selection
+  // outline, hover halo, drop highlighting on Frames). All visual content
+  // is intentionally absent.
+  //
+  // Frame is the one exception: when a user has a transparent background
+  // we add an editor-only dashed outline so the frame is grabbable in the
+  // canvas. Once they assign a background color, Qt draws it and the
+  // dashed chrome falls away.
+
   if (node.kind === "Frame") {
-    // Frames get a faint dashed editor-only border when transparent so users
-    // can see and grab them. If the user sets a backgroundColor, drop the
-    // dashed chrome (the real bg makes the frame visible on its own).
     const editorChrome = node.style.backgroundColor === "transparent"
       ? { border: "1px dashed rgba(0,0,0,0.15)" }
       : null;
@@ -2053,402 +2810,8 @@ function NodeView({
     );
   }
 
-  if (node.kind === "Text") {
-    // Inner div so text-align works with vertical centering via flex.
-    return (
-      <div
-        {...commonProps}
-        className={`cursor-grab active:cursor-grabbing ${selectionOutline}`}
-        style={{
-          ...cssStyle,
-          display: "flex",
-          alignItems: "center",
-          userSelect: "none",
-          fontSize: node.pixelSize,
-          color: node.color,
-          fontWeight: node.fontWeight,
-          fontStyle: node.italic ? "italic" : "normal",
-          fontFamily: node.fontFamily || undefined,
-          letterSpacing: node.letterSpacing,
-          lineHeight: node.lineHeight,
-        }}
-      >
-        <div style={{ width: "100%", textAlign: node.textAlign }}>
-          {node.text || <span className="italic text-zinc-400">(empty)</span>}
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "Button") {
-    return (
-      <div
-        {...commonProps}
-        className={`cursor-grab active:cursor-grabbing ${selectionOutline}`}
-        style={cssStyle}
-      >
-        <button
-          type="button"
-          tabIndex={-1}
-          onClick={(e) => e.preventDefault()}
-          style={{
-            width: "100%",
-            height: "100%",
-            color: node.textColor,
-            fontWeight: node.fontWeight,
-            background: node.style.backgroundColor === "transparent"
-              ? "rgb(244, 244, 245)"  // zinc-100 default chrome
-              : "transparent",         // honor the user's bg via outer wrapper
-            border: node.style.borderWidth > 0 ? "none" : "1px solid rgb(161, 161, 170)",
-            borderRadius: "inherit",
-            cursor: "inherit",
-            pointerEvents: "none",
-            fontFamily: "inherit",
-            fontSize: "inherit",
-          }}
-        >
-          {node.text}
-        </button>
-      </div>
-    );
-  }
-
-  if (node.kind === "Image") {
-    return (
-      <div
-        {...commonProps}
-        className={`cursor-grab active:cursor-grabbing ${selectionOutline}`}
-        style={cssStyle}
-      >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={node.src}
-          alt=""
-          draggable={false}
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: node.fit,
-            display: "block",
-            pointerEvents: "none",
-            userSelect: "none",
-          }}
-        />
-      </div>
-    );
-  }
-
-  // The Controls 2 family below: render an approximation of the Qt control
-  // with its own internal events disabled so the canvas drag/select wins.
-  // These are previews — not interactive in the editor.
-  const innerNoInteract: React.CSSProperties = {
-    pointerEvents: "none",
-    userSelect: "none",
-  };
-
-  if (node.kind === "TextField") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <input
-          type="text"
-          value={node.text}
-          placeholder={node.placeholder}
-          readOnly
-          tabIndex={-1}
-          onChange={() => {}}
-          style={{
-            ...innerNoInteract,
-            width: "100%",
-            height: "100%",
-            padding: "0 8px",
-            border: "1px solid rgb(161, 161, 170)",
-            borderRadius: "inherit",
-            fontSize: node.pixelSize,
-            background: node.style.backgroundColor === "transparent" ? "white" : "transparent",
-            boxSizing: "border-box",
-          }}
-        />
-      </div>
-    );
-  }
-
-  if (node.kind === "CheckBox") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          display: "flex", alignItems: "center", gap: 6, height: "100%", padding: "0 4px",
-        }}>
-          <span style={{
-            display: "inline-block",
-            width: 16, height: 16,
-            border: "1px solid rgb(115, 115, 115)",
-            borderRadius: 3,
-            background: node.checked ? "rgb(37, 99, 235)" : "white",
-            position: "relative",
-          }}>
-            {node.checked && (
-              <svg viewBox="0 0 16 16" width="14" height="14" style={{ position: "absolute", top: 0, left: 0 }}>
-                <path d="M3 8 L 7 12 L 13 4" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            )}
-          </span>
-          <span style={{ fontSize: node.pixelSize, color: "rgb(39, 39, 42)" }}>{node.text}</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "Switch") {
-    const trackW = 36, trackH = 20, dotR = 8;
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          display: "flex", alignItems: "center", gap: 8, height: "100%", padding: "0 4px",
-        }}>
-          <span style={{
-            position: "relative",
-            display: "inline-block",
-            width: trackW, height: trackH,
-            borderRadius: trackH / 2,
-            background: node.checked ? "rgb(37, 99, 235)" : "rgb(212, 212, 216)",
-          }}>
-            <span style={{
-              position: "absolute",
-              top: (trackH - dotR * 2) / 2,
-              left: node.checked ? trackW - dotR * 2 - 2 : 2,
-              width: dotR * 2, height: dotR * 2,
-              borderRadius: "50%",
-              background: "white",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-            }} />
-          </span>
-          <span style={{ fontSize: node.pixelSize, color: "rgb(39, 39, 42)" }}>{node.text}</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "Slider") {
-    const range = node.to - node.from || 1;
-    const pct = Math.max(0, Math.min(1, (node.value - node.from) / range));
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          position: "relative",
-          height: "100%", display: "flex", alignItems: "center", padding: "0 8px",
-        }}>
-          <div style={{ position: "relative", width: "100%", height: 4 }}>
-            <div style={{
-              position: "absolute", inset: 0,
-              background: "rgb(212, 212, 216)", borderRadius: 2,
-            }} />
-            <div style={{
-              position: "absolute", left: 0, top: 0, bottom: 0,
-              width: `${pct * 100}%`,
-              background: "rgb(37, 99, 235)", borderRadius: 2,
-            }} />
-            <div style={{
-              position: "absolute", top: -6, left: `calc(${pct * 100}% - 8px)`,
-              width: 16, height: 16, borderRadius: "50%",
-              background: "white", border: "1px solid rgb(115, 115, 115)",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.15)",
-            }} />
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "ProgressBar") {
-    const range = node.to - node.from || 1;
-    const pct = Math.max(0, Math.min(1, (node.value - node.from) / range));
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          position: "relative", height: "100%", width: "100%",
-          background: "rgb(212, 212, 216)", borderRadius: "inherit", overflow: "hidden",
-        }}>
-          {node.indeterminate ? (
-            <div style={{
-              position: "absolute", inset: 0,
-              background: "linear-gradient(90deg, transparent 0%, rgb(37, 99, 235) 50%, transparent 100%)",
-              backgroundSize: "200% 100%",
-            }} />
-          ) : (
-            <div style={{
-              position: "absolute", left: 0, top: 0, bottom: 0,
-              width: `${pct * 100}%`,
-              background: "rgb(37, 99, 235)",
-            }} />
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "TextArea") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <textarea
-          value={node.text}
-          placeholder={node.placeholder}
-          readOnly
-          tabIndex={-1}
-          onChange={() => {}}
-          style={{
-            ...innerNoInteract,
-            width: "100%", height: "100%",
-            padding: "6px 8px",
-            border: "1px solid rgb(161, 161, 170)",
-            borderRadius: "inherit",
-            fontSize: node.pixelSize,
-            background: node.style.backgroundColor === "transparent" ? "white" : "transparent",
-            boxSizing: "border-box",
-            resize: "none",
-            whiteSpace: node.wrapMode === "word" ? "pre-wrap" : "pre",
-            overflow: "auto",
-            fontFamily: "inherit",
-          }}
-        />
-      </div>
-    );
-  }
-
-  if (node.kind === "RadioButton") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          display: "flex", alignItems: "center", gap: 6, height: "100%", padding: "0 4px",
-        }}>
-          <span style={{
-            display: "inline-flex", alignItems: "center", justifyContent: "center",
-            width: 16, height: 16,
-            border: "1.5px solid rgb(115, 115, 115)",
-            borderRadius: "50%",
-            background: "white",
-          }}>
-            {node.checked && (
-              <span style={{
-                width: 8, height: 8, borderRadius: "50%",
-                background: "rgb(37, 99, 235)",
-              }} />
-            )}
-          </span>
-          <span style={{ fontSize: node.pixelSize, color: "rgb(39, 39, 42)" }}>{node.text}</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "ComboBox") {
-    const current = node.model[node.currentIndex] ?? "";
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          display: "flex", alignItems: "center", justifyContent: "space-between",
-          height: "100%", padding: "0 8px",
-          border: "1px solid rgb(161, 161, 170)",
-          borderRadius: "inherit",
-          background: node.style.backgroundColor === "transparent" ? "white" : "transparent",
-          fontSize: node.pixelSize,
-        }}>
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {current || <span style={{ color: "rgb(161, 161, 170)" }}>(empty)</span>}
-          </span>
-          <span style={{ marginLeft: 8, color: "rgb(115, 115, 115)" }}>▾</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "SpinBox") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          display: "grid", gridTemplateColumns: "28px 1fr 28px",
-          height: "100%",
-          border: "1px solid rgb(161, 161, 170)",
-          borderRadius: "inherit",
-          background: node.style.backgroundColor === "transparent" ? "white" : "transparent",
-          overflow: "hidden",
-        }}>
-          <div style={{
-            display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgb(244, 244, 245)", color: "rgb(115, 115, 115)",
-            borderRight: "1px solid rgb(212, 212, 216)",
-          }}>−</div>
-          <div style={{
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontVariantNumeric: "tabular-nums",
-          }}>{node.value}</div>
-          <div style={{
-            display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgb(244, 244, 245)", color: "rgb(115, 115, 115)",
-            borderLeft: "1px solid rgb(212, 212, 216)",
-          }}>+</div>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "BusyIndicator") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        <div style={{
-          ...innerNoInteract,
-          width: "100%", height: "100%",
-          display: "flex", alignItems: "center", justifyContent: "center",
-        }}>
-          {node.running ? (
-            <div style={{
-              width: "60%", height: "60%", aspectRatio: "1 / 1",
-              borderRadius: "50%",
-              border: "3px solid rgb(212, 212, 216)",
-              borderTopColor: "rgb(37, 99, 235)",
-              animation: "spin 0.9s linear infinite",
-            }} />
-          ) : (
-            <div style={{
-              width: "60%", height: "60%", aspectRatio: "1 / 1",
-              borderRadius: "50%",
-              border: "3px solid rgb(212, 212, 216)",
-            }} />
-          )}
-          <style>{"@keyframes spin { to { transform: rotate(360deg); } }"}</style>
-        </div>
-      </div>
-    );
-  }
-
-  if (node.kind === "AnimatedImage") {
-    return (
-      <div {...commonProps} className={`cursor-grab active:cursor-grabbing ${selectionOutline}`} style={cssStyle}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={node.src}
-          alt=""
-          draggable={false}
-          style={{
-            width: "100%", height: "100%",
-            objectFit: node.fit,
-            display: "block",
-            pointerEvents: "none",
-            userSelect: "none",
-            opacity: node.playing ? 1 : 0.5,
-          }}
-        />
-      </div>
-    );
-  }
-
-  // Rectangle — visual is entirely the CommonStyle.
+  // All other node kinds: bare wrapper, no inner content. The Qt iframe
+  // shows the widget; the React layer just captures the click.
   return (
     <div
       {...commonProps}
@@ -2492,7 +2855,7 @@ function ResizeOverlay({
       {ANCHORS.map((a) => (
         <div
           key={a.anchor}
-          className="pointer-events-auto absolute rounded-sm border border-blue-500 bg-white"
+          className="pointer-events-auto absolute rounded-sm border border-blue-500 bg-white dark:bg-zinc-900"
           style={{
             width: HANDLE,
             height: HANDLE,
@@ -2509,11 +2872,52 @@ function ResizeOverlay({
 
 // ── Inspector ──────────────────────────────────────────────────────────────
 
-const I_LABEL = "block text-[11px] font-medium text-zinc-600 mb-0.5";
+const I_LABEL = "block text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 mb-0.5";
 const I_INPUT =
-  "w-full rounded border border-zinc-300 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none";
+  "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none";
 const I_SUMMARY =
-  "cursor-pointer text-[11px] font-semibold uppercase text-zinc-500 select-none mb-2";
+  "cursor-pointer text-[11px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 select-none mb-2";
+
+// Sidebar-panel chrome: one shared `<details>` container that gives every
+// left-aside panel a uniform header + collapse affordance. Children are the
+// panel's body content (rendered inside a padded container only when open).
+// Used so every panel reads as a peer in the sidebar's vertical rhythm
+// instead of a series of one-off custom layouts.
+function SidebarSection({
+  title, defaultOpen = false, badge, headerRight, children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  badge?: string | number;     // small count / status pill, e.g. "3" or "in use"
+  headerRight?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <details open={defaultOpen} className="shrink-0 border-b border-zinc-200 dark:border-zinc-700 [&[open]>summary>span.chev]:rotate-90">
+      <summary
+        // Reset the native disclosure triangle (`list-none` / Webkit) so we
+        // own the visual; the rotating ▸ glyph below is the open indicator.
+        className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-2 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 list-none [&::-webkit-details-marker]:hidden"
+      >
+        <span className="chev inline-block text-[10px] text-zinc-400 dark:text-zinc-500 transition-transform">▸</span>
+        <span className="flex-1 text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400">{title}</span>
+        {badge !== undefined && badge !== "" && (
+          <span className="rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 text-[9px] font-medium text-zinc-500 dark:text-zinc-400 leading-none">{badge}</span>
+        )}
+        {/* Right-side button area (e.g. "+") — stop propagation so clicking
+            it doesn't toggle the section. */}
+        {headerRight && (
+          <span onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+            {headerRight}
+          </span>
+        )}
+      </summary>
+      <div className="px-2.5 pb-2.5">
+        {children}
+      </div>
+    </details>
+  );
+}
 
 function NumField({
   label, value, onChange, step = 1,
@@ -2572,12 +2976,12 @@ function CheckboxField({
   label, checked, onChange,
 }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <label className="flex items-center gap-2 text-[11px] text-zinc-600">
+    <label className="flex items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        className="h-3.5 w-3.5 rounded border-zinc-300"
+        className="h-3.5 w-3.5 rounded border-zinc-300 dark:border-zinc-600"
       />
       {label}
     </label>
@@ -2591,6 +2995,7 @@ function ColorField({
   label, value, onChange,
 }: { label: string; value: string; onChange: (v: string) => void }) {
   const isHex = /^#[0-9a-fA-F]{6}$/.test(value);
+  const isTransparent = value === "transparent" || value === "";
   return (
     <div>
       <label className={I_LABEL}>{label}</label>
@@ -2599,7 +3004,7 @@ function ColorField({
           type="color"
           value={isHex ? value : "#000000"}
           onChange={(e) => onChange(e.target.value)}
-          className="h-7 w-7 shrink-0 cursor-pointer rounded border border-zinc-300 p-0"
+          className="h-7 w-7 shrink-0 cursor-pointer rounded border border-zinc-300 dark:border-zinc-600 p-0"
           title="Pick color"
         />
         <input
@@ -2608,7 +3013,487 @@ function ColorField({
           onChange={(e) => onChange(e.target.value)}
           placeholder="#rrggbb / transparent"
         />
+        <button
+          type="button"
+          onClick={() => onChange(isTransparent ? "#ffffff" : "transparent")}
+          className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${
+            isTransparent
+              ? "border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300"
+              : "border-zinc-300 dark:border-zinc-600 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+          }`}
+          title={isTransparent ? "Currently transparent — click to switch to a color" : "Make this transparent (no fill)"}
+        >∅</button>
       </div>
+    </div>
+  );
+}
+
+// Two-way binding selector for input widgets. Filters the variable list
+// by `acceptType` so users can't bind a TextField to a number variable.
+function BindingSelect({
+  value, variables, acceptType, onChange,
+}: {
+  value: string | undefined;
+  variables: Variable[];
+  acceptType: VariableType;
+  onChange: (id: string | undefined) => void;
+}) {
+  const compatible = variables.filter((v) => v.type === acceptType);
+  const stillBound = value && variables.find((v) => v.id === value);
+  return (
+    <div>
+      <label className={I_LABEL}>bind to variable ({acceptType})</label>
+      <select
+        className={I_INPUT}
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value || undefined)}
+      >
+        <option value="">(no binding — use literal)</option>
+        {compatible.map((v) => (
+          <option key={v.id} value={v.id}>{v.name}</option>
+        ))}
+      </select>
+      {value && !stillBound && (
+        <p className="mt-1 text-[10px] text-amber-600">
+          Bound variable was deleted — clear or pick a new one.
+        </p>
+      )}
+      {compatible.length === 0 && !value && (
+        <p className="mt-1 text-[10px] text-zinc-400 dark:text-zinc-500">
+          No {acceptType} variables defined yet — add one in the left sidebar.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Button onClick editor — picks an action kind, then shows kind-specific
+// sub-fields. Disabled gracefully when prerequisites are missing
+// (e.g. setVariable with no variables defined yet).
+function ButtonOnClickEditor({
+  action,
+  pages,
+  variables,
+  enabledModuleIds,
+  coreModule,
+  onChange,
+  onAddVariable,
+}: {
+  action: ButtonAction | undefined;
+  pages: PageData[];
+  variables: Variable[];
+  enabledModuleIds: ModuleId[];
+  coreModule: CoreModuleSpec | undefined;
+  onChange: (a: ButtonAction) => void;
+  // Inline variable creation — when present, the setVariable picker shows
+  // a "+ new" button that calls this and immediately wires up the action
+  // to the just-created variable id. Saves users a context switch to the
+  // sidebar Variables panel.
+  onAddVariable?: (preferName?: string) => string;
+}) {
+  // Catalog primitives + (optionally) the user's own module appear in the
+  // same picker. The user's module is shaped into a ModuleSpec so the rest
+  // of the editor doesn't need to special-case it.
+  const enabledModules: ModuleSpec[] = [
+    ...enabledModuleIds
+      .map((id) => findModuleSpec(id))
+      .filter((m): m is ModuleSpec => m !== undefined),
+    ...(coreModule
+      ? [{
+          id: coreModule.id,
+          name: `${coreModule.name || coreModule.id} (this project)`,
+          description: coreModule.description || "Your project's own backend module.",
+          methods: coreModule.methods.map((m) => ({
+            name: m.name, args: m.args,
+            returns: m.returns, description: m.description,
+          })),
+        }]
+      : []),
+  ];
+  const kind = action?.kind ?? "none";
+  type ActionKind = "none" | "navigate" | "setVariable" | "openUrl" | "callModule" | "sendMessage" | "appendToList";
+  const setKind = (next: ActionKind) => {
+    if (next === "none") onChange({ kind: "none" });
+    else if (next === "navigate") onChange({ kind: "navigate", pageId: pages[0]?.id ?? "" });
+    else if (next === "setVariable") onChange({ kind: "setVariable", varId: variables[0]?.id ?? "", value: "" });
+    else if (next === "appendToList") onChange({ kind: "appendToList", varId: variables[0]?.id ?? "", value: "payload", mode: "expression" });
+    else if (next === "callModule") {
+      const m = enabledModules[0];
+      const method = m?.methods[0];
+      onChange({
+        kind: "callModule",
+        moduleId: m?.id ?? "",
+        method: method?.name ?? "",
+        args: (method?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
+      });
+    }
+    else if (next === "sendMessage") {
+      onChange({ kind: "sendMessage", topic: "/myapp/1/messages/json", payload: "", payloadMode: "literal" });
+    }
+    else onChange({ kind: "openUrl", url: "" });
+  };
+  return (
+    <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+      <label className={I_LABEL}>on click</label>
+      <select
+        className={I_INPUT}
+        value={kind}
+        onChange={(e) => setKind(e.target.value as ActionKind)}
+      >
+        <option value="none">Do nothing</option>
+        <option value="navigate" disabled={pages.length === 0}>Navigate to page</option>
+        <option value="setVariable" disabled={variables.length === 0}>Set variable</option>
+        <option value="appendToList" disabled={variables.length === 0}>Append to list</option>
+        <option value="openUrl">Open URL</option>
+        <option value="sendMessage">Send message (delivery)</option>
+        <option value="callModule" disabled={enabledModules.length === 0}>Call module method (advanced)</option>
+      </select>
+      {action?.kind === "navigate" && (
+        <div className="mt-2">
+          <label className={I_LABEL}>page</label>
+          <select
+            className={I_INPUT}
+            value={action.pageId}
+            onChange={(e) => onChange({ kind: "navigate", pageId: e.target.value })}
+          >
+            {pages.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+      )}
+      {action?.kind === "setVariable" && (() => {
+        const target = variables.find((v) => v.id === action.varId);
+        const mode = action.mode ?? "literal";
+        const setAction = (patch: Partial<{ varId: string; value: string; mode: SetVariableMode }>) =>
+          onChange({
+            kind: "setVariable",
+            varId: patch.varId ?? action.varId,
+            value: patch.value ?? action.value,
+            mode: patch.mode ?? mode,
+          });
+        return (
+          <div className="mt-2 flex flex-col gap-2">
+            <div>
+              <div className="flex items-center justify-between">
+                <label className={I_LABEL}>variable</label>
+                {onAddVariable && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const id = onAddVariable("var");
+                      // Apply immediately so the action points at the new id
+                      // without waiting for the parent's variables prop to
+                      // re-flow back down.
+                      setAction({ varId: id });
+                    }}
+                    className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline"
+                  >+ new</button>
+                )}
+              </div>
+              <select
+                className={I_INPUT}
+                value={action.varId}
+                onChange={(e) => setAction({ varId: e.target.value })}
+              >
+                {variables.length === 0 && <option value="">(create one with + new)</option>}
+                {variables.map((v) => <option key={v.id} value={v.id}>{v.name} ({v.type})</option>)}
+              </select>
+            </div>
+            <div className="flex items-center justify-between">
+              <label className={I_LABEL}>set to</label>
+              <button
+                onClick={() => setAction({ mode: mode === "literal" ? "expression" : "literal" })}
+                className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                title="Switch between literal value and JS-style expression"
+              >{mode === "literal" ? "use expression →" : "← use literal"}</button>
+            </div>
+            {mode === "expression" ? (
+              <input
+                className={I_INPUT}
+                value={action.value}
+                onChange={(e) => setAction({ value: e.target.value })}
+                placeholder={
+                  target?.type === "number" ? "app.var_count + 1" :
+                  target?.type === "boolean" ? "!app.var_flag" :
+                  '"Hello, " + app.var_name'
+                }
+              />
+            ) : target?.type === "boolean" ? (
+              <select
+                className={I_INPUT}
+                value={action.value === "true" ? "true" : "false"}
+                onChange={(e) => setAction({ value: e.target.value })}
+              >
+                <option value="false">false</option>
+                <option value="true">true</option>
+              </select>
+            ) : (
+              <input
+                type={target?.type === "number" ? "number" : "text"}
+                className={I_INPUT}
+                value={action.value}
+                onChange={(e) => setAction({ value: e.target.value })}
+                placeholder={target?.type === "number" ? "0" : "value"}
+              />
+            )}
+            {mode === "expression" && (
+              <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                Spliced into QML as-is. Reference state via{" "}
+                <span className="font-mono">app.var_*</span>; quote string
+                literals.
+              </p>
+            )}
+          </div>
+        );
+      })()}
+      {action?.kind === "openUrl" && (
+        <div className="mt-2">
+          <label className={I_LABEL}>url</label>
+          <input
+            type="url"
+            className={I_INPUT}
+            value={action.url}
+            placeholder="https://example.com"
+            onChange={(e) => onChange({ kind: "openUrl", url: e.target.value })}
+          />
+        </div>
+      )}
+      {action?.kind === "appendToList" && (() => {
+        const mode = action.mode ?? "expression";
+        const setAppend = (patch: Partial<{ varId: string; value: string; mode: SetVariableMode }>) =>
+          onChange({
+            kind: "appendToList",
+            varId: patch.varId ?? action.varId,
+            value: patch.value ?? action.value,
+            mode: patch.mode ?? mode,
+          });
+        return (
+          <div className="mt-2 flex flex-col gap-2">
+            <div>
+              <div className="flex items-center justify-between">
+                <label className={I_LABEL}>list variable</label>
+                {onAddVariable && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // Auto-create with an array initial so the variable is
+                      // immediately usable as a List source.
+                      const id = onAddVariable("messages");
+                      setAppend({ varId: id });
+                    }}
+                    className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline"
+                  >+ new</button>
+                )}
+              </div>
+              <select
+                className={I_INPUT}
+                value={action.varId}
+                onChange={(e) => setAppend({ varId: e.target.value })}
+              >
+                {variables.length === 0 && <option value="">(create one with + new)</option>}
+                {variables.filter((v) => v.type === "string").map((v) => (
+                  <option key={v.id} value={v.id}>{v.name}</option>
+                ))}
+              </select>
+              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                A string variable whose value is a JSON array (e.g. set initial to{" "}
+                <span className="font-mono">[]</span>). Bind a List node to the same variable to render every item.
+              </p>
+            </div>
+            <div className="flex items-center justify-between">
+              <label className={I_LABEL}>append</label>
+              <button
+                onClick={() => setAppend({ mode: mode === "literal" ? "expression" : "literal" })}
+                className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:underline"
+                title="Switch between literal value and JS-style expression"
+              >{mode === "literal" ? "use expression →" : "← use literal"}</button>
+            </div>
+            {mode === "expression" ? (
+              <input
+                className={I_INPUT}
+                value={action.value}
+                onChange={(e) => setAppend({ value: e.target.value })}
+                placeholder='payload   (or app.var_x, etc.)'
+              />
+            ) : (
+              <input
+                type="text"
+                className={I_INPUT}
+                value={action.value}
+                onChange={(e) => setAppend({ value: e.target.value })}
+                placeholder="value to append"
+              />
+            )}
+          </div>
+        );
+      })()}
+      {action?.kind === "sendMessage" && (() => {
+        const mode = action.payloadMode ?? "literal";
+        const setSend = (patch: Partial<{ topic: string; payload: string; payloadMode: SetVariableMode }>) =>
+          onChange({
+            kind: "sendMessage",
+            topic: patch.topic ?? action.topic,
+            payload: patch.payload ?? action.payload,
+            payloadMode: patch.payloadMode ?? mode,
+          });
+        return (
+          <div className="mt-2 flex flex-col gap-2">
+            <div>
+              <label className={I_LABEL}>content topic</label>
+              <input
+                className={I_INPUT}
+                value={action.topic}
+                onChange={(e) => setSend({ topic: e.target.value })}
+                placeholder="/myapp/1/messages/json"
+              />
+              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                Format: <span className="font-mono">/&lt;app&gt;/&lt;version&gt;/&lt;subtopic&gt;/&lt;format&gt;</span>. Anyone subscribed to the same topic receives the message.
+              </p>
+            </div>
+            <div>
+              <div className="flex items-center justify-between">
+                <label className={I_LABEL}>message</label>
+                <button
+                  onClick={() => setSend({ payloadMode: mode === "literal" ? "expression" : "literal" })}
+                  className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                  title="Literal text vs. a QML expression (e.g. read from a variable)"
+                >{mode === "literal" ? "use expression →" : "← use literal"}</button>
+              </div>
+              {mode === "expression" ? (
+                <input
+                  className={I_INPUT}
+                  value={action.payload}
+                  onChange={(e) => setSend({ payload: e.target.value })}
+                  placeholder='app.var_input'
+                />
+              ) : (
+                <textarea
+                  className={I_INPUT}
+                  rows={2}
+                  value={action.payload}
+                  onChange={(e) => setSend({ payload: e.target.value })}
+                  placeholder="Hello, world!"
+                />
+              )}
+              {mode === "expression" && (
+                <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                  Splice in any QML expression — usually <span className="font-mono">app.var_*</span> to send the contents of a Text Field.
+                </p>
+              )}
+            </div>
+            <p className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+              Delivery is set up automatically — no need to add the module separately.
+            </p>
+          </div>
+        );
+      })()}
+      {action?.kind === "callModule" && (() => {
+        const mod = enabledModules.find((m) => m.id === action.moduleId);
+        const method = mod?.methods.find((mm) => mm.name === action.method);
+        const setMod = (id: string) => {
+          const m = enabledModules.find((mm) => mm.id === id);
+          const first = m?.methods[0];
+          onChange({
+            kind: "callModule",
+            moduleId: id,
+            method: first?.name ?? "",
+            args: (first?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
+          });
+        };
+        const setMethod = (name: string) => {
+          const m = mod?.methods.find((mm) => mm.name === name);
+          onChange({
+            kind: "callModule",
+            moduleId: action.moduleId,
+            method: name,
+            args: (m?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
+          });
+        };
+        const setArg = (idx: number, patch: Partial<CallModuleArg>) => {
+          const next = action.args.slice();
+          next[idx] = { ...next[idx], ...patch };
+          onChange({ ...action, args: next });
+        };
+        return (
+          <div className="mt-2 flex flex-col gap-2">
+            <div>
+              <label className={I_LABEL}>module</label>
+              <select
+                className={I_INPUT}
+                value={action.moduleId}
+                onChange={(e) => setMod(e.target.value)}
+              >
+                {enabledModules.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className={I_LABEL}>method</label>
+              <select
+                className={I_INPUT}
+                value={action.method}
+                onChange={(e) => setMethod(e.target.value)}
+              >
+                {(mod?.methods ?? []).map((mm) => (
+                  <option key={mm.name} value={mm.name}>{mm.name}</option>
+                ))}
+              </select>
+              {method?.description && (
+                <p className="mt-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">{method.description}</p>
+              )}
+            </div>
+            {method && method.args.length > 0 && (
+              <div className="flex flex-col gap-2 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-2">
+                <div className="text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Arguments</div>
+                {method.args.map((p, idx) => {
+                  const arg = action.args[idx] ?? { value: "", mode: "literal" as SetVariableMode };
+                  const mode = arg.mode ?? "literal";
+                  return (
+                    <div key={p.name}>
+                      <div className="flex items-center justify-between">
+                        <label className={I_LABEL}>
+                          <span className="font-mono">{p.name}</span>{" "}
+                          <span className="text-zinc-400 dark:text-zinc-500">({p.type})</span>
+                        </label>
+                        <button
+                          onClick={() => setArg(idx, { mode: mode === "literal" ? "expression" : "literal" })}
+                          className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                        >{mode === "literal" ? "use expression →" : "← use literal"}</button>
+                      </div>
+                      {mode === "expression" ? (
+                        <input
+                          className={I_INPUT}
+                          value={arg.value}
+                          onChange={(e) => setArg(idx, { value: e.target.value })}
+                          placeholder={p.type === "string" ? '"text" or app.var_x' : "expression"}
+                        />
+                      ) : p.type === "boolean" ? (
+                        <select
+                          className={I_INPUT}
+                          value={arg.value === "true" ? "true" : "false"}
+                          onChange={(e) => setArg(idx, { value: e.target.value })}
+                        >
+                          <option value="false">false</option>
+                          <option value="true">true</option>
+                        </select>
+                      ) : (
+                        <input
+                          type={p.type === "number" ? "number" : "text"}
+                          className={I_INPUT}
+                          value={arg.value}
+                          placeholder={p.type === "number" ? "0" : "value"}
+                          onChange={(e) => setArg(idx, { value: e.target.value })}
+                        />
+                      )}
+                      {p.description && (
+                        <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">{p.description}</p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -2617,10 +3502,20 @@ function Inspector({
   node,
   isRoot,
   onChange,
+  pages,
+  variables,
+  enabledModuleIds,
+  coreModule,
+  onAddVariable,
 }: {
   node: Node;
   isRoot: boolean;
   onChange: (patch: Partial<Node>) => void;
+  pages: PageData[];
+  variables: Variable[];
+  enabledModuleIds: ModuleId[];
+  coreModule: CoreModuleSpec | undefined;
+  onAddVariable?: (preferName?: string) => string;
 }) {
   // Style is nested — patch helper builds {style: {...node.style, ...patch}}
   const updateStyle = (patch: Partial<typeof node.style>) =>
@@ -2628,7 +3523,7 @@ function Inspector({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="text-[11px] text-zinc-500">
+      <div className="text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
         kind: <span className="font-mono">{node.kind}</span>
       </div>
 
@@ -2636,11 +3531,11 @@ function Inspector({
       <details open>
         <summary className={I_SUMMARY}>Position</summary>
         {isRoot ? (
-          <div className="text-[11px] text-zinc-500">
+          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
             <div className="mb-1">
               size <span className="font-mono">{node.width}×{node.height}px</span>
             </div>
-            <div className="text-zinc-400">auto-sized to the live preview</div>
+            <div className="text-zinc-400 dark:text-zinc-500">auto-sized to the live preview</div>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
@@ -2654,18 +3549,12 @@ function Inspector({
 
       {/* Style — universal */}
       <details open>
-        <summary className={I_SUMMARY}>Style</summary>
+        <summary className={I_SUMMARY}>Fill & border</summary>
         <div className="flex flex-col gap-2.5">
           <ColorField
             label="background"
             value={node.style.backgroundColor}
             onChange={(v) => updateStyle({ backgroundColor: v })}
-          />
-          <NumField
-            label="opacity (0–1)"
-            step={0.05}
-            value={node.style.opacity}
-            onChange={(v) => updateStyle({ opacity: Math.max(0, Math.min(1, v)) })}
           />
           <div className="grid grid-cols-2 gap-2">
             <NumField label="border w" value={node.style.borderWidth} onChange={(v) => updateStyle({ borderWidth: Math.max(0, v) })} />
@@ -2676,11 +3565,40 @@ function Inspector({
             value={node.style.borderColor}
             onChange={(v) => updateStyle({ borderColor: v })}
           />
+        </div>
+      </details>
+
+      {/* Advanced — opacity / rotation / conditional visibility. Closed by
+          default so the inspector isn't a wall of fields the moment a node
+          is selected; users who need them open it explicitly. */}
+      <details>
+        <summary className={I_SUMMARY}>Advanced</summary>
+        <div className="flex flex-col gap-2.5">
+          <NumField
+            label="opacity (0–1)"
+            step={0.05}
+            value={node.style.opacity}
+            onChange={(v) => updateStyle({ opacity: Math.max(0, Math.min(1, v)) })}
+          />
           <NumField
             label="rotation (°)"
             value={node.style.rotation}
             onChange={(v) => updateStyle({ rotation: v })}
           />
+          <div>
+            <label className={I_LABEL}>visible when (QML expression)</label>
+            <input
+              className={I_INPUT}
+              value={node.visibleWhen ?? ""}
+              placeholder="(always visible)"
+              onChange={(e) => onChange({ visibleWhen: e.target.value || undefined } as Partial<Node>)}
+            />
+            <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              Empty = always shown. Examples:{" "}
+              <span className="font-mono">app.var_active</span> · {" "}
+              <span className="font-mono">app.var_count &gt; 0</span>
+            </p>
+          </div>
         </div>
       </details>
 
@@ -2689,7 +3607,34 @@ function Inspector({
         <details open>
           <summary className={I_SUMMARY}>Text</summary>
           <div className="flex flex-col gap-2.5">
-            <TextField label="content" value={node.text} onChange={(v) => onChange({ text: v } as Partial<LeafNode>)} />
+            <div>
+              <label className={I_LABEL}>bind to variable</label>
+              <select
+                className={I_INPUT}
+                value={node.binding ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  onChange({ binding: v ? v : undefined } as Partial<TextNode>);
+                }}
+              >
+                <option value="">(no binding — use literal text)</option>
+                {variables.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name} ({v.type})
+                  </option>
+                ))}
+              </select>
+              {node.binding && !variables.find((v) => v.id === node.binding) && (
+                <p className="mt-1 text-[10px] text-amber-600">
+                  Bound variable was deleted — pick a new one or clear the binding.
+                </p>
+              )}
+            </div>
+            <TextField
+              label={node.binding ? "fallback content" : "content"}
+              value={node.text}
+              onChange={(v) => onChange({ text: v } as Partial<LeafNode>)}
+            />
             <div className="grid grid-cols-2 gap-2">
               <NumField label="pixelSize" value={node.pixelSize}
                 onChange={(v) => onChange({ pixelSize: Math.max(1, v) } as Partial<LeafNode>)} />
@@ -2744,6 +3689,15 @@ function Inspector({
               options={["normal", "bold"] as const}
               onChange={(v) => onChange({ fontWeight: v } as Partial<LeafNode>)}
             />
+            <ButtonOnClickEditor
+              action={node.onClick}
+              pages={pages}
+              variables={variables}
+              enabledModuleIds={enabledModuleIds}
+              coreModule={coreModule}
+              onChange={(action) => onChange({ onClick: action } as Partial<ButtonNode>)}
+              onAddVariable={onAddVariable}
+            />
           </div>
         </details>
       )}
@@ -2756,8 +3710,17 @@ function Inspector({
         <details open>
           <summary className={I_SUMMARY}>TextField</summary>
           <div className="flex flex-col gap-2.5">
-            <TextField label="value" value={node.text}
-              onChange={(v) => onChange({ text: v } as Partial<LeafNode>)} />
+            <BindingSelect
+              value={node.binding}
+              variables={variables}
+              acceptType="string"
+              onChange={(id) => onChange({ binding: id } as Partial<LeafNode>)}
+            />
+            <TextField
+              label={node.binding ? "fallback value" : "value"}
+              value={node.text}
+              onChange={(v) => onChange({ text: v } as Partial<LeafNode>)}
+            />
             <TextField label="placeholder" value={node.placeholder}
               onChange={(v) => onChange({ placeholder: v } as Partial<LeafNode>)} />
             <NumField label="pixelSize" value={node.pixelSize}
@@ -2772,11 +3735,17 @@ function Inspector({
         <details open>
           <summary className={I_SUMMARY}>{node.kind}</summary>
           <div className="flex flex-col gap-2.5">
+            <BindingSelect
+              value={node.binding}
+              variables={variables}
+              acceptType="boolean"
+              onChange={(id) => onChange({ binding: id } as Partial<LeafNode>)}
+            />
             <TextField label="label" value={node.text}
               onChange={(v) => onChange({ text: v } as Partial<LeafNode>)} />
             <NumField label="pixelSize" value={node.pixelSize}
               onChange={(v) => onChange({ pixelSize: Math.max(1, v) } as Partial<LeafNode>)} />
-            <CheckboxField label="checked" checked={node.checked}
+            <CheckboxField label={node.binding ? "fallback checked" : "checked"} checked={node.checked}
               onChange={(v) => onChange({ checked: v } as Partial<LeafNode>)} />
           </div>
         </details>
@@ -2786,13 +3755,19 @@ function Inspector({
         <details open>
           <summary className={I_SUMMARY}>Slider</summary>
           <div className="flex flex-col gap-2.5">
+            <BindingSelect
+              value={node.binding}
+              variables={variables}
+              acceptType="number"
+              onChange={(id) => onChange({ binding: id } as Partial<LeafNode>)}
+            />
             <div className="grid grid-cols-2 gap-2">
               <NumField label="from" value={node.from}
                 onChange={(v) => onChange({ from: v } as Partial<LeafNode>)} />
               <NumField label="to" value={node.to}
                 onChange={(v) => onChange({ to: v } as Partial<LeafNode>)} />
             </div>
-            <NumField label="value" value={node.value}
+            <NumField label={node.binding ? "fallback value" : "value"} value={node.value}
               onChange={(v) => onChange({ value: v } as Partial<LeafNode>)} />
             <NumField label="step" step={0.01} value={node.stepSize}
               onChange={(v) => onChange({ stepSize: v } as Partial<LeafNode>)} />
@@ -2822,7 +3797,13 @@ function Inspector({
         <details open>
           <summary className={I_SUMMARY}>TextArea</summary>
           <div className="flex flex-col gap-2.5">
-            <TextField label="value" value={node.text}
+            <BindingSelect
+              value={node.binding}
+              variables={variables}
+              acceptType="string"
+              onChange={(id) => onChange({ binding: id } as Partial<LeafNode>)}
+            />
+            <TextField label={node.binding ? "fallback value" : "value"} value={node.text}
               onChange={(v) => onChange({ text: v } as Partial<LeafNode>)} />
             <TextField label="placeholder" value={node.placeholder}
               onChange={(v) => onChange({ placeholder: v } as Partial<LeafNode>)} />
@@ -2850,7 +3831,7 @@ function Inspector({
               onChange={(v) => onChange({ pixelSize: Math.max(1, v) } as Partial<LeafNode>)} />
             <CheckboxField label="checked" checked={node.checked}
               onChange={(v) => onChange({ checked: v } as Partial<LeafNode>)} />
-            <p className="text-[11px] leading-tight text-zinc-500">
+            <p className="text-[11px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
               Wire multiple radios to a shared ButtonGroup post-export for
               mutual exclusion.
             </p>
@@ -2927,10 +3908,67 @@ function Inspector({
             />
             <CheckboxField label="playing" checked={node.playing}
               onChange={(v) => onChange({ playing: v } as Partial<LeafNode>)} />
-            <p className="text-[11px] leading-tight text-zinc-500">
+            <p className="text-[11px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
               For local files, paste a data: URL or use the Image upload as
               a starting point. GIF / animated WebP recommended.
             </p>
+          </div>
+        </details>
+      )}
+
+      {node.kind === "List" && (
+        <details open>
+          <summary className={I_SUMMARY}>List</summary>
+          <div className="flex flex-col gap-2.5">
+            <div>
+              <label className={I_LABEL}>data variable (JSON array)</label>
+              <select
+                className={I_INPUT}
+                value={node.dataVar ?? ""}
+                onChange={(e) => onChange({ dataVar: e.target.value || undefined } as Partial<LeafNode>)}
+              >
+                <option value="">(none)</option>
+                {variables.filter((v) => v.type === "string").map((v) => (
+                  <option key={v.id} value={v.id}>{v.name}</option>
+                ))}
+              </select>
+              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                String variable whose value is a JSON array — e.g. set its initial to{" "}
+                <span className="font-mono">[&quot;hello&quot;,&quot;world&quot;]</span> for a 2-row preview, then update it at runtime via <span className="font-mono">setVariable</span> or by polling a relay method.
+              </p>
+            </div>
+            <SelectField<ListDirection>
+              label="direction"
+              value={node.direction}
+              options={["vertical", "horizontal"] as const}
+              onChange={(v) => onChange({ direction: v } as Partial<LeafNode>)}
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <NumField label="gap (px)" value={node.gap}
+                onChange={(v) => onChange({ gap: Math.max(0, v) } as Partial<LeafNode>)} />
+              <NumField label="item size" value={node.itemPixelSize}
+                onChange={(v) => onChange({ itemPixelSize: Math.max(1, v) } as Partial<LeafNode>)} />
+            </div>
+            <ColorField label="item color" value={node.itemColor}
+              onChange={(v) => onChange({ itemColor: v } as Partial<LeafNode>)} />
+            <details className="mt-1">
+              <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 select-none">
+                Item bubble (chat-style)
+              </summary>
+              <div className="mt-2 flex flex-col gap-2">
+                <ColorField label="bubble bg" value={node.itemBackgroundColor}
+                  onChange={(v) => onChange({ itemBackgroundColor: v } as Partial<LeafNode>)} />
+                <div className="grid grid-cols-2 gap-2">
+                  <NumField label="bubble radius" value={node.itemBorderRadius}
+                    onChange={(v) => onChange({ itemBorderRadius: Math.max(0, v) } as Partial<LeafNode>)} />
+                  <NumField label="bubble padding" value={node.itemPadding}
+                    onChange={(v) => onChange({ itemPadding: Math.max(0, v) } as Partial<LeafNode>)} />
+                </div>
+                <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                  Set a bg colour, radius, and padding to render each item as a chat bubble. Leave bg transparent and radius/padding 0 for plain text.
+                </p>
+              </div>
+            </details>
           </div>
         </details>
       )}
@@ -2960,24 +3998,24 @@ function ModelListField({
   };
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-[11px] font-medium text-zinc-600">model</label>
+      <label className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">model</label>
       {value.map((v, i) => (
         <div key={i} className="flex items-center gap-1">
           <input
             value={v}
             onChange={(e) => update(i, e.target.value)}
-            className="w-full rounded border border-zinc-300 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none"
+            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none"
           />
           <button
             onClick={() => move(i, -1)}
             disabled={i === 0}
-            className="rounded px-1 text-zinc-500 hover:bg-zinc-100 disabled:opacity-30"
+            className="rounded px-1 text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
             title="move up"
           >▲</button>
           <button
             onClick={() => move(i, 1)}
             disabled={i === value.length - 1}
-            className="rounded px-1 text-zinc-500 hover:bg-zinc-100 disabled:opacity-30"
+            className="rounded px-1 text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
             title="move down"
           >▼</button>
           <button
@@ -2989,7 +4027,7 @@ function ModelListField({
       ))}
       <button
         onClick={add}
-        className="self-start rounded border border-dashed border-zinc-300 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-500"
+        className="self-start rounded border border-dashed border-zinc-300 dark:border-zinc-600 px-2 py-1 text-[11px] text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:border-zinc-500"
       >+ add option</button>
     </div>
   );
@@ -3018,7 +4056,7 @@ function ImageSection({
         <img
           src={node.src}
           alt=""
-          className="h-20 w-full rounded border border-zinc-200 bg-zinc-50 object-contain"
+          className="h-20 w-full rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 object-contain"
         />
         <input
           ref={fileRef}
@@ -3032,7 +4070,7 @@ function ImageSection({
           }}
         />
         <button
-          className="w-full rounded border border-zinc-300 bg-white px-1.5 py-1 text-xs hover:border-zinc-400"
+          className="w-full rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-1 text-xs hover:border-zinc-400 dark:border-zinc-500"
           onClick={() => fileRef.current?.click()}
         >
           Replace image…
@@ -3067,16 +4105,16 @@ function ModulePanel({
   onIconUpload: (f: File) => void;
   sanitizedName: string;
 }) {
-  const labelClass = "block text-[11px] font-medium text-zinc-600 mb-0.5";
+  const labelClass = "block text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 mb-0.5";
   const inputClass =
-    "w-full rounded border border-zinc-300 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none";
+    "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none";
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const update = (patch: Partial<ModuleMeta>) => onChange({ ...meta, ...patch });
 
   return (
     <div>
-      <div className="mb-2 text-xs font-semibold uppercase text-zinc-500">
+      <div className="mb-2 text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
         Module
       </div>
       <div className="flex flex-col gap-2.5">
@@ -3086,7 +4124,7 @@ function ModulePanel({
             <img
               src={iconPreviewUrl}
               alt="icon"
-              className="h-12 w-12 shrink-0 rounded border border-zinc-200 bg-zinc-50 object-contain"
+              className="h-12 w-12 shrink-0 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 object-contain"
             />
           )}
           <div className="flex-1 min-w-0">
@@ -3103,13 +4141,13 @@ function ModulePanel({
               }}
             />
             <button
-              className="w-full truncate rounded border border-zinc-300 bg-white px-1.5 py-1 text-left text-xs hover:border-zinc-400"
+              className="w-full truncate rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-1 text-left text-xs hover:border-zinc-400 dark:border-zinc-500"
               onClick={() => fileInputRef.current?.click()}
               title={iconFilename}
             >
               {iconFilename}
             </button>
-            {iconError && <p className="mt-1 text-[11px] text-red-600">{iconError}</p>}
+            {iconError && <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{iconError}</p>}
           </div>
         </div>
 
@@ -3121,7 +4159,7 @@ function ModulePanel({
             onChange={(e) => update({ name: e.target.value })}
           />
           {sanitizedName !== meta.name.toLowerCase() && (
-            <p className="mt-0.5 text-[11px] text-zinc-500">
+            <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
               ships as <span className="font-mono">{sanitizedName}</span>
             </p>
           )}
@@ -3211,26 +4249,54 @@ const IconLock = ({ locked }: { locked: boolean }) => (
   </svg>
 );
 
-const kindGlyph = (k: NodeKind): string => {
-  switch (k) {
-    case "Frame":          return "▢";
-    case "Rectangle":      return "■";
-    case "Text":           return "T";
-    case "Button":         return "▭";
-    case "Image":          return "◇";
-    case "AnimatedImage":  return "◆";
-    case "TextField":      return "I";
-    case "TextArea":       return "≡";
-    case "ComboBox":       return "▼";
-    case "CheckBox":       return "☑";
-    case "RadioButton":    return "◉";
-    case "Switch":         return "◐";
-    case "Slider":         return "═";
-    case "SpinBox":        return "#";
-    case "ProgressBar":    return "▰";
-    case "BusyIndicator":  return "◌";
+// Per-kind 14×14 SVG glyphs, single-color so they inherit currentColor.
+// Used in both the components palette (top-left) and the Layers tree so the
+// user can scan node kinds at a glance.
+function NodeIcon({ kind, className = "" }: { kind: NodeKind; className?: string }) {
+  const common = {
+    width: 14, height: 14, viewBox: "0 0 14 14",
+    fill: "none", stroke: "currentColor", strokeWidth: 1.5,
+    strokeLinecap: "round" as const, strokeLinejoin: "round" as const,
+    className: `inline-block shrink-0 ${className}`,
+    "aria-hidden": true,
+  };
+  switch (kind) {
+    case "Frame":
+      return <svg {...common}><rect x="1.5" y="1.5" width="11" height="11" rx="1.5" strokeDasharray="2 1.5" /></svg>;
+    case "Rectangle":
+      return <svg {...common}><rect x="1.5" y="1.5" width="11" height="11" rx="1.5" fill="currentColor" stroke="none" opacity="0.85" /></svg>;
+    case "Text":
+      return <svg {...common}><path d="M3 3h8M7 3v8M5 11h4" /></svg>;
+    case "Button":
+      return <svg {...common}><rect x="1.5" y="3.5" width="11" height="7" rx="2" fill="currentColor" stroke="none" opacity="0.85" /></svg>;
+    case "Image":
+      return <svg {...common}><rect x="1.5" y="1.5" width="11" height="11" rx="1.5" /><circle cx="5" cy="5" r="1" fill="currentColor" stroke="none" /><path d="M2 10l3-3 3 3 2-2 2 2" /></svg>;
+    case "AnimatedImage":
+      return <svg {...common}><rect x="1.5" y="1.5" width="11" height="11" rx="1.5" /><path d="M5 4.5v5l4-2.5z" fill="currentColor" stroke="none" /></svg>;
+    case "TextField":
+      return <svg {...common}><rect x="1.5" y="4" width="11" height="6" rx="1.5" /><path d="M4 5.5v3" /></svg>;
+    case "TextArea":
+      return <svg {...common}><rect x="1.5" y="2" width="11" height="10" rx="1.5" /><path d="M3.5 5h7M3.5 7h7M3.5 9h4" /></svg>;
+    case "ComboBox":
+      return <svg {...common}><rect x="1.5" y="3.5" width="11" height="7" rx="1.5" /><path d="M9 6l1.5 1.5L12 6" /></svg>;
+    case "CheckBox":
+      return <svg {...common}><rect x="2.5" y="2.5" width="9" height="9" rx="1.5" /><path d="M5 7l1.5 1.5L9.5 5.5" /></svg>;
+    case "RadioButton":
+      return <svg {...common}><circle cx="7" cy="7" r="4.5" /><circle cx="7" cy="7" r="2" fill="currentColor" stroke="none" /></svg>;
+    case "Switch":
+      return <svg {...common}><rect x="1.5" y="4" width="11" height="6" rx="3" /><circle cx="9.5" cy="7" r="1.75" fill="currentColor" stroke="none" /></svg>;
+    case "Slider":
+      return <svg {...common}><path d="M2 7h10" /><circle cx="9" cy="7" r="2" fill="currentColor" stroke="none" /></svg>;
+    case "SpinBox":
+      return <svg {...common}><rect x="1.5" y="3.5" width="11" height="7" rx="1.5" /><path d="M9 5.5l1 1 1-1M9 8.5l1-1 1 1" /></svg>;
+    case "ProgressBar":
+      return <svg {...common}><rect x="1.5" y="5.5" width="11" height="3" rx="1.5" /><rect x="1.5" y="5.5" width="6" height="3" rx="1.5" fill="currentColor" stroke="none" /></svg>;
+    case "BusyIndicator":
+      return <svg {...common}><circle cx="7" cy="7" r="4.5" strokeDasharray="6 3" /></svg>;
+    case "List":
+      return <svg {...common}><circle cx="3" cy="4" r="0.75" fill="currentColor" stroke="none" /><path d="M5.5 4h6" /><circle cx="3" cy="7" r="0.75" fill="currentColor" stroke="none" /><path d="M5.5 7h6" /><circle cx="3" cy="10" r="0.75" fill="currentColor" stroke="none" /><path d="M5.5 10h6" /></svg>;
   }
-};
+}
 
 const trim = (s: string, n: number) => s.length > n ? s.slice(0, n) + "…" : s;
 const kindLabel = (n: Node): string => {
@@ -3248,6 +4314,731 @@ const kindLabel = (n: Node): string => {
   if (n.kind === "BusyIndicator")         return `Busy · ${n.running ? "running" : "stopped"}`;
   return n.kind;
 };
+
+// ── PagesPanel ─────────────────────────────────────────────────────────────
+
+function PagesPanel({
+  pages,
+  currentPageId,
+  onSwitch,
+  onAdd,
+  onRename,
+  onDelete,
+}: {
+  pages: PageData[];
+  currentPageId: PageId;
+  onSwitch: (id: PageId) => void;
+  onAdd: () => void;
+  onRename: (id: PageId, name: string) => void;
+  onDelete: (id: PageId) => void;
+}) {
+  const promptRename = (p: PageData) => {
+    const next = window.prompt("Rename page", p.name);
+    if (next != null && next.trim()) onRename(p.id, next.trim());
+  };
+  return (
+    <SidebarSection
+      title="Pages"
+      defaultOpen
+      badge={pages.length}
+      headerRight={
+        <button
+          onClick={onAdd}
+          className="flex h-5 w-5 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 text-xs leading-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          title="Add a new page"
+        >+</button>
+      }
+    >
+      <div className="flex flex-col gap-0.5">
+        {pages.map((p) => {
+          const active = p.id === currentPageId;
+          return (
+            <div
+              key={p.id}
+              onClick={() => onSwitch(p.id)}
+              onDoubleClick={() => promptRename(p)}
+              className={`group flex items-center gap-1 rounded px-2 py-1 text-xs cursor-pointer ${
+                active ? "bg-blue-100 dark:bg-blue-900 text-blue-900 dark:text-blue-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              }`}
+            >
+              <span className="flex-1 truncate" title={p.name}>{p.name}</span>
+              {active && (
+                <>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); promptRename(p); }}
+                    className="text-[10px] text-zinc-500 dark:text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-zinc-800 dark:hover:text-zinc-200"
+                    title="Rename"
+                  >edit</button>
+                  {pages.length > 1 && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onDelete(p.id); }}
+                      className="text-[10px] text-red-600 dark:text-red-400 opacity-0 group-hover:opacity-100 hover:underline"
+                      title="Delete"
+                    >del</button>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+        Double-click to rename.
+      </p>
+    </SidebarSection>
+  );
+}
+
+// ── VariablesPanel ─────────────────────────────────────────────────────────
+
+// ── TriggersPanel ──────────────────────────────────────────────────────────
+//
+// Lists every event-driven action handler for the project. Each trigger
+// fires when something happens (widget loads / module emits an event) and
+// runs an ordered list of actions.
+
+function TriggersPanel({
+  triggers,
+  pages,
+  variables,
+  enabledModuleIds,
+  coreModule,
+  onAdd,
+  onUpdate,
+  onDelete,
+  onAddAction,
+  onUpdateAction,
+  onDeleteAction,
+  onAddVariable,
+}: {
+  triggers: Trigger[];
+  pages: PageData[];
+  variables: Variable[];
+  enabledModuleIds: ModuleId[];
+  coreModule: CoreModuleSpec | undefined;
+  onAdd: (kind: TriggerKind) => void;
+  onUpdate: (id: TriggerId, patch: Partial<Trigger>) => void;
+  onDelete: (id: TriggerId) => void;
+  onAddAction: (id: TriggerId) => void;
+  onUpdateAction: (id: TriggerId, idx: number, action: ButtonAction) => void;
+  onDeleteAction: (id: TriggerId, idx: number) => void;
+  onAddVariable?: (preferName?: string) => string;
+}) {
+  const enabledModules = enabledModuleIds
+    .map((id) => findModuleSpec(id))
+    .filter((m): m is ModuleSpec => m !== undefined);
+  return (
+    <SidebarSection
+      title="Triggers"
+      defaultOpen={triggers.length > 0}
+      badge={triggers.length > 0 ? triggers.length : undefined}
+    >
+      {/* Action buttons live below the title on their own row so they always
+          fit the column width and stay aligned even when labels grow. */}
+      <div className="mb-2 flex items-center gap-1">
+        <button
+          onClick={() => onAdd("appStart")}
+          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          title="Run actions when the widget loads"
+        >+ load</button>
+        <button
+          onClick={() => onAdd("onMessageReceived")}
+          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          title="Run actions when a message arrives on a content topic"
+        >+ message</button>
+        <button
+          onClick={() => onAdd("moduleEvent")}
+          disabled={enabledModules.every((m) => (m.events?.length ?? 0) === 0)}
+          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
+          title="Advanced: run actions when a module emits a raw event"
+        >+ event</button>
+      </div>
+      <p className="mb-2 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+        React to widget load, incoming messages, or raw module events.
+      </p>
+      <div className="flex flex-col gap-2">
+        {triggers.length === 0 && (
+          <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+            No triggers yet. Add &quot;on load&quot; for setup, or &quot;on message&quot; to react to incoming messages.
+          </p>
+        )}
+        {triggers.map((t) => (
+          <TriggerEditor
+            key={t.id}
+            trigger={t}
+            enabledModules={enabledModules}
+            pages={pages}
+            variables={variables}
+            coreModule={coreModule}
+            enabledModuleIds={enabledModuleIds}
+            onChange={(patch) => onUpdate(t.id, patch)}
+            onDelete={() => onDelete(t.id)}
+            onAddAction={() => onAddAction(t.id)}
+            onUpdateAction={(idx, action) => onUpdateAction(t.id, idx, action)}
+            onDeleteAction={(idx) => onDeleteAction(t.id, idx)}
+            onAddVariable={onAddVariable}
+          />
+        ))}
+      </div>
+    </SidebarSection>
+  );
+}
+
+function TriggerEditor({
+  trigger,
+  enabledModules,
+  pages,
+  variables,
+  coreModule,
+  enabledModuleIds,
+  onChange,
+  onDelete,
+  onAddAction,
+  onUpdateAction,
+  onDeleteAction,
+  onAddVariable,
+}: {
+  trigger: Trigger;
+  enabledModules: ModuleSpec[];
+  pages: PageData[];
+  variables: Variable[];
+  coreModule: CoreModuleSpec | undefined;
+  enabledModuleIds: ModuleId[];
+  onChange: (patch: Partial<Trigger>) => void;
+  onDelete: () => void;
+  onAddAction: () => void;
+  onUpdateAction: (idx: number, action: ButtonAction) => void;
+  onDeleteAction: (idx: number) => void;
+  onAddVariable?: (preferName?: string) => string;
+}) {
+  const mod = trigger.moduleId
+    ? enabledModules.find((m) => m.id === trigger.moduleId)
+    : undefined;
+  return (
+    <div className="rounded border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-1.5">
+      <div className="mb-1 flex items-center gap-1">
+        <span className="font-mono text-[10px] uppercase text-zinc-400 dark:text-zinc-500">
+          {trigger.kind === "appStart" ? "on load"
+            : trigger.kind === "onMessageReceived" ? "on message"
+            : "on event"}
+        </span>
+        <span className="flex-1" />
+        <button
+          onClick={onDelete}
+          className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+        >del</button>
+      </div>
+      {trigger.kind === "onMessageReceived" && (
+        <div className="mb-1.5 flex flex-col gap-1">
+          <label className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400">topic to listen on</label>
+          <input
+            className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            value={trigger.topic ?? ""}
+            placeholder="/myapp/1/messages/json"
+            onChange={(e) => onChange({ topic: e.target.value })}
+          />
+          {/* Inline cheat-sheet for the two magic identifiers that are in
+              scope inside actions on this trigger. New users won't know
+              these exist without it. */}
+          <div className="mt-1 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 px-1.5 py-1 text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
+            <div className="font-semibold text-zinc-700 dark:text-zinc-300">In actions below, you can use:</div>
+            <div><span className="font-mono text-zinc-800 dark:text-zinc-200">payload</span> &nbsp;— the incoming message text</div>
+            <div><span className="font-mono text-zinc-800 dark:text-zinc-200">topic</span> &nbsp;— the content topic it came on</div>
+            <div className="mt-0.5 text-[9px] text-zinc-500 dark:text-zinc-500">Use them via the &quot;use expression →&quot; toggle on Set variable / Send message.</div>
+          </div>
+        </div>
+      )}
+      {trigger.kind === "moduleEvent" && (
+        <div className="mb-1.5 flex items-center gap-1">
+          <select
+            className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            value={trigger.moduleId ?? ""}
+            onChange={(e) => {
+              const newMod = enabledModules.find((m) => m.id === e.target.value);
+              onChange({
+                moduleId: e.target.value,
+                eventName: newMod?.events?.[0]?.name,
+              });
+            }}
+          >
+            {enabledModules.filter((m) => (m.events?.length ?? 0) > 0).map((m) => (
+              <option key={m.id} value={m.id}>{m.name}</option>
+            ))}
+          </select>
+          <span className="text-[10px] text-zinc-400 dark:text-zinc-500">·</span>
+          <select
+            className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            value={trigger.eventName ?? ""}
+            onChange={(e) => onChange({ eventName: e.target.value })}
+          >
+            {(mod?.events ?? []).map((ev) => (
+              <option key={ev.name} value={ev.name}>{ev.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {trigger.kind === "moduleEvent" && mod && trigger.eventName && (() => {
+        const ev = mod.events?.find((e) => e.name === trigger.eventName);
+        if (!ev) return null;
+        return (
+          <div className="mb-1.5 rounded bg-zinc-50 dark:bg-zinc-800 p-1.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            {ev.description && <div className="mb-0.5">{ev.description}</div>}
+            <div>
+              data: <span className="font-mono">[{ev.data.map((d) => `${d.name}: ${d.type}`).join(", ")}]</span>
+            </div>
+            <div className="text-zinc-400 dark:text-zinc-500">
+              Use <span className="font-mono">data[0]</span>, <span className="font-mono">data[1]</span>, … in expression-mode actions.
+            </div>
+          </div>
+        );
+      })()}
+      <div className="flex flex-col gap-1.5">
+        {trigger.actions.length === 0 && (
+          <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">No actions. Add one below.</p>
+        )}
+        {trigger.actions.map((a, idx) => (
+          <div key={idx} className="rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-1">
+            <div className="mb-0.5 flex items-center justify-between">
+              <span className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500">#{idx + 1}</span>
+              <button
+                onClick={() => onDeleteAction(idx)}
+                className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-red-600 dark:text-red-400"
+              >×</button>
+            </div>
+            <ButtonOnClickEditor
+              action={a}
+              pages={pages}
+              variables={variables}
+              enabledModuleIds={enabledModuleIds}
+              coreModule={coreModule}
+              onChange={(action) => onUpdateAction(idx, action)}
+              onAddVariable={onAddVariable}
+            />
+          </div>
+        ))}
+        <button
+          onClick={onAddAction}
+          className="self-start rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+        >+ action</button>
+      </div>
+    </div>
+  );
+}
+
+// ── ModulesPanel ───────────────────────────────────────────────────────────
+
+function ModulesPanel({
+  app,
+}: {
+  app: AppState;
+}) {
+  const deliveryAuto = usesDelivery(app);
+  return (
+    <SidebarSection
+      title="Networking"
+      defaultOpen={deliveryAuto}
+      badge={deliveryAuto ? "in use" : "idle"}
+    >
+      <div
+        className={`flex items-start gap-2 rounded border p-1.5 ${
+          deliveryAuto ? "border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-950" : "border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
+        }`}
+      >
+        <div className="flex-1 min-w-0">
+          <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-200">Delivery (pub/sub)</div>
+          <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+            Send and receive messages over the Logos network. Pick <span className="font-mono">Send message</span> on a button or add an <span className="font-mono">on message</span> trigger.
+          </div>
+          {deliveryAuto && (
+            <div className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+              Active · UI calls the bundled <span className="font-mono">delivery_relay</span> module.
+              <div className="mt-0.5 text-amber-700 dark:text-amber-300">
+                Export will give you both <span className="font-mono">&lt;name&gt;.lgx</span> and <span className="font-mono">delivery_relay.lgx</span>. Install both on every Basecamp (the relay is the same file across all your projects — install once).
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </SidebarSection>
+  );
+}
+
+// ── CoreModulePanel ────────────────────────────────────────────────────────
+//
+// Author the project's own backend module: id, version, methods table.
+// Empty by default; "Add module" stamps a starter spec the user fills in.
+
+function CoreModulePanel({
+  spec,
+  onEnable,
+  onDisable,
+  onUpdate,
+  onAddMethod,
+  onUpdateMethod,
+  onDeleteMethod,
+  onToggleDep,
+  onAddStateField,
+  onUpdateStateField,
+  onDeleteStateField,
+}: {
+  spec: CoreModuleSpec | undefined;
+  onEnable: () => void;
+  onDisable: () => void;
+  onUpdate: (patch: Partial<CoreModuleSpec>) => void;
+  onAddMethod: () => void;
+  onUpdateMethod: (idx: number, patch: Partial<CoreMethod>) => void;
+  onDeleteMethod: (idx: number) => void;
+  onToggleDep: (depId: string) => void;
+  onAddStateField: () => void;
+  onUpdateStateField: (idx: number, patch: Partial<CoreStateField>) => void;
+  onDeleteStateField: (idx: number) => void;
+}) {
+  if (!spec) {
+    return (
+      <SidebarSection
+        title="Build a module"
+        defaultOpen={false}
+        headerRight={
+          <button
+            onClick={onEnable}
+            className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            title="Author a custom backend module for this project"
+          >+ Add</button>
+        }
+      >
+        <p className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+          Author your own backend module in C++ (optional). Pick this when you need custom server-side logic that wraps the modules above — e.g. a polling module that uses <span className="font-mono">delivery_module</span>. <span className="text-zinc-400 dark:text-zinc-500">Skip for UI-only widgets.</span>
+        </p>
+      </SidebarSection>
+    );
+  }
+  return (
+    <SidebarSection
+      title="Build a module"
+      defaultOpen
+      badge={`${spec.methods.length} method${spec.methods.length === 1 ? "" : "s"}`}
+      headerRight={
+        <button
+          onClick={onDisable}
+          className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+        >remove</button>
+      }
+    >
+      <p className="mb-2 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+        Authoring a custom backend (compiled to <span className="font-mono">.lgx</span>). Export produces a buildable C++ project.
+      </p>
+
+      <div className="flex flex-col gap-2">
+        <div>
+          <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">id (used in callModule + dependencies)</label>
+          <input
+            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px] font-mono"
+            value={spec.id}
+            onChange={(e) => onUpdate({ id: e.target.value })}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-1">
+          <div>
+            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">version</label>
+            <input
+              className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px]"
+              value={spec.version}
+              onChange={(e) => onUpdate({ version: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">category</label>
+            <input
+              className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px]"
+              value={spec.category}
+              onChange={(e) => onUpdate({ category: e.target.value })}
+            />
+          </div>
+        </div>
+        <div>
+          <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">description</label>
+          <input
+            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px]"
+            value={spec.description}
+            onChange={(e) => onUpdate({ description: e.target.value })}
+          />
+        </div>
+
+        {/* Dependencies — pick from the catalog of primitives. */}
+        <div>
+          <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">depends on (Logos primitives)</label>
+          <div className="flex flex-col gap-0.5">
+            {MODULE_CATALOG.map((m) => (
+              <label key={m.id} className="flex items-center gap-1 text-[11px] text-zinc-700 dark:text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={spec.dependencies.includes(m.id)}
+                  onChange={() => onToggleDep(m.id)}
+                  className="h-3.5 w-3.5"
+                />
+                <span className="font-mono">{m.id}</span>
+                <span className="text-[10px] text-zinc-400 dark:text-zinc-500">— {m.name}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* State fields */}
+        <div>
+          <div className="mb-1 flex items-center justify-between">
+            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">state fields (private members)</label>
+            <button
+              onClick={onAddStateField}
+              className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+            >+ field</button>
+          </div>
+          {spec.state.length === 0 && (
+            <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              Add typed C++ members like <span className="font-mono">QHash&lt;QString, MyData&gt;</span> — they&apos;re declared as <span className="font-mono">m_&lt;name&gt;</span> in the generated header.
+            </p>
+          )}
+          <div className="flex flex-col gap-1">
+            {spec.state.map((s, idx) => (
+              <div key={idx} className="flex items-center gap-1">
+                <input
+                  className="w-20 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                  value={s.name}
+                  onChange={(e) => onUpdateStateField(idx, { name: e.target.value })}
+                  placeholder="name"
+                />
+                <input
+                  className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                  value={s.cppType}
+                  onChange={(e) => onUpdateStateField(idx, { cppType: e.target.value })}
+                  placeholder="QString"
+                />
+                <input
+                  className="w-16 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                  value={s.initial ?? ""}
+                  onChange={(e) => onUpdateStateField(idx, { initial: e.target.value })}
+                  placeholder="init"
+                  title="Optional initializer (e.g. 0, &quot;&quot;)"
+                />
+                <button
+                  onClick={() => onDeleteStateField(idx)}
+                  className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-red-600 dark:text-red-400"
+                >×</button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Methods table */}
+        <div>
+          <div className="mb-1 flex items-center justify-between">
+            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">methods</label>
+            <button
+              onClick={onAddMethod}
+              className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+            >+ method</button>
+          </div>
+          {spec.methods.length === 0 && (
+            <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              No methods yet. Each method becomes a Q_INVOKABLE in the generated C++ and shows up in Button → callModule.
+            </p>
+          )}
+          <div className="flex flex-col gap-2">
+            {spec.methods.map((m, idx) => (
+              <CoreMethodEditor
+                key={idx}
+                method={m}
+                onChange={(patch) => onUpdateMethod(idx, patch)}
+                onDelete={() => onDeleteMethod(idx)}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    </SidebarSection>
+  );
+}
+
+function CoreMethodEditor({
+  method, onChange, onDelete,
+}: {
+  method: CoreMethod;
+  onChange: (patch: Partial<CoreMethod>) => void;
+  onDelete: () => void;
+}) {
+  const addArg = () =>
+    onChange({ args: [...method.args, { name: `arg${method.args.length + 1}`, type: "string" }] });
+  const updateArg = (i: number, patch: Partial<ModuleParam>) => {
+    const args = method.args.map((a, idx) => (idx === i ? { ...a, ...patch } : a));
+    onChange({ args });
+  };
+  const deleteArg = (i: number) => {
+    onChange({ args: method.args.filter((_, idx) => idx !== i) });
+  };
+  return (
+    <div className="rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-1.5">
+      <div className="mb-1 flex items-center gap-1">
+        <input
+          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 font-mono text-[11px]"
+          value={method.name}
+          onChange={(e) => onChange({ name: e.target.value })}
+          placeholder="methodName"
+        />
+        <select
+          className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+          value={method.returns}
+          onChange={(e) => onChange({ returns: e.target.value as ParamType | "void" })}
+        >
+          <option value="void">void</option>
+          <option value="boolean">bool</option>
+          <option value="number">number</option>
+          <option value="string">string</option>
+        </select>
+        <button
+          onClick={onDelete}
+          className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+        >del</button>
+      </div>
+      {method.args.length > 0 && (
+        <div className="mb-1 flex flex-col gap-0.5">
+          {method.args.map((a, i) => (
+            <div key={i} className="flex items-center gap-1">
+              <input
+                className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                value={a.name}
+                onChange={(e) => updateArg(i, { name: e.target.value })}
+                placeholder="argName"
+              />
+              <select
+                className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+                value={a.type}
+                onChange={(e) => updateArg(i, { type: e.target.value as ParamType })}
+              >
+                <option value="string">string</option>
+                <option value="number">number</option>
+                <option value="boolean">boolean</option>
+              </select>
+              <button
+                onClick={() => deleteArg(i)}
+                className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-red-600 dark:text-red-400"
+              >×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="flex items-center gap-1">
+        <button
+          onClick={addArg}
+          className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+        >+ arg</button>
+        <input
+          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[10px]"
+          value={method.description ?? ""}
+          onChange={(e) => onChange({ description: e.target.value })}
+          placeholder="(optional description)"
+        />
+      </div>
+      <details className="mt-1.5">
+        <summary className="cursor-pointer select-none text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-zinc-800 dark:text-zinc-200">
+          C++ body {method.body && method.body.trim() ? "✓" : "(TODO stub)"}
+        </summary>
+        <textarea
+          className="mt-1 w-full rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-1 font-mono text-[10px] leading-tight"
+          rows={6}
+          value={method.body ?? ""}
+          onChange={(e) => onChange({ body: e.target.value })}
+          placeholder={
+            "// Spliced verbatim into the generated .cpp.\n" +
+            "// Reference state via m_<field>;\n" +
+            "// call deps via m_<dep>Client->invokeRemoteMethod(\"<dep>\", \"method\", arg1, arg2);"
+          }
+          spellCheck={false}
+        />
+      </details>
+    </div>
+  );
+}
+
+function VariablesPanel({
+  variables,
+  onAdd,
+  onUpdate,
+  onDelete,
+}: {
+  variables: Variable[];
+  onAdd: () => void;
+  onUpdate: (id: VariableId, patch: Partial<Variable>) => void;
+  onDelete: (id: VariableId) => void;
+}) {
+  return (
+    <SidebarSection
+      title="Variables"
+      defaultOpen={variables.length > 0}
+      badge={variables.length > 0 ? variables.length : undefined}
+      headerRight={
+        <button
+          onClick={onAdd}
+          className="flex h-5 w-5 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 text-xs leading-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          title="Add a new variable"
+        >+</button>
+      }
+    >
+      {variables.length === 0 ? (
+        <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+          App-level state. Reference from Text bindings or Button → set-variable
+          actions. Auto-emits as Qt properties.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          {variables.map((v) => (
+            <div key={v.id} className="rounded border border-zinc-200 dark:border-zinc-700 p-1.5">
+              <div className="mb-1 flex items-center gap-1">
+                <input
+                  className="flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] font-mono hover:border-zinc-300 dark:border-zinc-600 focus:border-blue-500 focus:bg-white dark:bg-zinc-900 focus:outline-none"
+                  value={v.name}
+                  onChange={(e) => onUpdate(v.id, { name: e.target.value })}
+                />
+                <button
+                  onClick={() => onDelete(v.id)}
+                  className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+                  title="Delete variable"
+                >del</button>
+              </div>
+              <div className="flex items-center gap-1">
+                <select
+                  className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+                  value={v.type}
+                  onChange={(e) => onUpdate(v.id, { type: e.target.value as VariableType })}
+                >
+                  <option value="string">string</option>
+                  <option value="number">number</option>
+                  <option value="boolean">boolean</option>
+                </select>
+                {v.type === "boolean" ? (
+                  <select
+                    className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+                    value={v.initial === "true" ? "true" : "false"}
+                    onChange={(e) => onUpdate(v.id, { initial: e.target.value })}
+                  >
+                    <option value="false">false</option>
+                    <option value="true">true</option>
+                  </select>
+                ) : (
+                  <input
+                    type={v.type === "number" ? "number" : "text"}
+                    className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px]"
+                    value={v.initial}
+                    placeholder={v.type === "number" ? "0" : "initial value"}
+                    onChange={(e) => onUpdate(v.id, { initial: e.target.value })}
+                  />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </SidebarSection>
+  );
+}
 
 type DropWhere = "before" | "after" | "inside";
 
@@ -3333,7 +5124,7 @@ function LayersPanel({
         style={{ paddingLeft: 4 + depth * 12 }}
         className={[
           "relative flex items-center gap-1 py-1 pr-2 text-[11px] cursor-pointer select-none",
-          isSelected ? "bg-blue-100 text-blue-900" : "text-zinc-700 hover:bg-zinc-50",
+          isSelected ? "bg-blue-100 dark:bg-blue-900 text-blue-900 dark:text-blue-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800",
           node.hidden ? "opacity-50" : "",
         ].join(" ")}
       >
@@ -3351,7 +5142,7 @@ function LayersPanel({
         {isFrame && node.children.length > 0 ? (
           <button
             onClick={(e) => { e.stopPropagation(); onToggleCollapsed(node.id); }}
-            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[8px] text-zinc-500 hover:text-zinc-800"
+            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[8px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-zinc-800 dark:text-zinc-200"
           >
             {isCollapsed ? "▶" : "▼"}
           </button>
@@ -3359,7 +5150,7 @@ function LayersPanel({
           <span className="w-3.5 shrink-0" />
         )}
 
-        <span className="font-mono text-zinc-400 shrink-0">{kindGlyph(node.kind)}</span>
+        <NodeIcon kind={node.kind} className="text-zinc-500 dark:text-zinc-400" />
         <span className="flex-1 truncate">{kindLabel(node)}</span>
 
         {!isRoot && (
@@ -3367,14 +5158,14 @@ function LayersPanel({
             <button
               title={node.locked ? "Unlock" : "Lock"}
               onClick={(e) => { e.stopPropagation(); onToggleLocked(node.id); }}
-              className={`shrink-0 ${node.locked ? "text-amber-600" : "text-zinc-400 hover:text-zinc-700"}`}
+              className={`shrink-0 ${node.locked ? "text-amber-600" : "text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:text-zinc-300"}`}
             >
               <IconLock locked={node.locked} />
             </button>
             <button
               title={node.hidden ? "Show" : "Hide"}
               onClick={(e) => { e.stopPropagation(); onToggleHidden(node.id); }}
-              className={`shrink-0 ${node.hidden ? "text-zinc-400" : "text-zinc-500 hover:text-zinc-700"}`}
+              className={`shrink-0 ${node.hidden ? "text-zinc-400 dark:text-zinc-500" : "text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:text-zinc-300"}`}
             >
               <IconEye off={node.hidden} />
             </button>

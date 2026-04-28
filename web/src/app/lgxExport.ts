@@ -39,6 +39,10 @@ export interface ExportConfig {
   // Extra files to bundle alongside Main.qml inside each variant.
   // `rel` is the variant-relative path (e.g. "assets/photo_0.png").
   extraFiles?: { rel: string; data: Uint8Array }[];
+  // Backend module ids the widget depends on (e.g. ["polling", "delivery"]).
+  // Land in metadata.json's `dependencies` array; Basecamp uses this to
+  // ensure the corresponding modules are installed alongside the widget.
+  dependencies?: string[];
 }
 
 const ARCHES = ["darwin-arm64", "linux-amd64", "linux-arm64"] as const;
@@ -240,7 +244,7 @@ export const exportLgx = async (cfg: ExportConfig): Promise<ExportResult> => {
     description: cfg.description,
     view: "Main.qml",
     icon: `icons/${cfg.iconFilename}`,
-    dependencies: [],
+    dependencies: cfg.dependencies ?? [],
     nix: {
       packages: { build: [], runtime: [] },
       external_libraries: [],
@@ -291,7 +295,11 @@ export const exportLgx = async (cfg: ExportConfig): Promise<ExportResult> => {
   const manifest: Manifest = {
     author: cfg.author ?? "",
     category: cfg.category,
-    dependencies: [],
+    // Root-level dependencies — Basecamp's package manager reads these to
+    // resolve install order, and `lgx verify` checks that the declared deps
+    // match the variant metadata. Carrying them here as well is what shipped
+    // .lgx files (e.g. polling-core) do.
+    dependencies: cfg.dependencies ?? [],
     description: cfg.description,
     hashes: {
       root: rootHash,

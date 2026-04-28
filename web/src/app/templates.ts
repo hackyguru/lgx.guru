@@ -4,8 +4,8 @@
 // their current defaults.
 
 import {
-  ButtonNode, CheckBoxNode, FrameNode, ImageNode, Node, RectangleNode,
-  SliderNode, SwitchNode, TextFieldNode, TextNode,
+  ButtonNode, CheckBoxNode, FrameNode, ImageNode, ListNode, Node, RectangleNode,
+  SliderNode, SwitchNode, TextFieldNode, TextNode, Trigger, Variable,
   defaultNode, defaultStyle, newId, newRoot,
 } from "./types";
 
@@ -13,7 +13,15 @@ export interface Template {
   id: string;
   name: string;
   description: string;
-  build: () => { root: FrameNode; meta: { name: string; description: string } };
+  // Templates that need state or behavior return variables / triggers too.
+  // Omitted = preserve whatever the user already has (existing behavior for
+  // pure-layout templates like Hello / Login / Card).
+  build: () => {
+    root: FrameNode;
+    meta: { name: string; description: string };
+    variables?: Variable[];
+    triggers?: Trigger[];
+  };
 }
 
 // Per-kind makers — wrap defaultNode and override only the props we care
@@ -37,6 +45,8 @@ const img = (overrides: Partial<ImageNode>): ImageNode =>
   ({ ...(defaultNode("Image") as ImageNode), ...overrides });
 const frame = (overrides: Partial<FrameNode> & { children: Node[] }): FrameNode =>
   ({ ...(defaultNode("Frame") as FrameNode), ...overrides });
+const lst = (overrides: Partial<ListNode>): ListNode =>
+  ({ ...(defaultNode("List") as ListNode), ...overrides });
 
 // Build a root populated with the supplied children. ID is fresh so the
 // template doesn't collide with a previously-loaded design.
@@ -162,6 +172,192 @@ export const TEMPLATES: Template[] = [
       ]),
       meta: { name: "toolbar_widget", description: "A simple navigation toolbar." },
     }),
+  },
+
+  {
+    id: "delivery_test",
+    name: "Delivery test (pub/sub)",
+    description: "Send + receive on a shared content topic. Install on two Basecamp instances to verify messages cross between them.",
+    build: () => {
+      // Stable ids for the variables so the trigger / Button / Text can
+      // reference them by id without us having to chase auto-generated values.
+      const inputVarId = newId();
+      const lastMsgVarId = newId();
+      const logVarId = newId();
+      const topic = "/lgxguru/1/delivery-test/text";
+      const variables: Variable[] = [
+        { id: inputVarId,   name: "messageInput", type: "string", initial: "" },
+        { id: lastMsgVarId, name: "lastMessage",  type: "string", initial: "(none yet)" },
+        { id: logVarId,     name: "log",          type: "string", initial: "" },
+      ];
+      // On every received message: stash the latest payload and prepend it
+      // to the running log so users can visually confirm cross-instance flow.
+      const triggers: Trigger[] = [
+        {
+          id: newId(),
+          kind: "onMessageReceived",
+          topic,
+          actions: [
+            { kind: "setVariable", varId: lastMsgVarId, value: "payload",                         mode: "expression" },
+            { kind: "setVariable", varId: logVarId,     value: 'payload + "\\n" + app.var_log',   mode: "expression" },
+          ],
+        },
+      ];
+      return {
+        root: buildRoot([
+          // Header
+          txt({
+            x: 40, y: 32, width: 720, height: 32,
+            text: "Delivery test", pixelSize: 22, color: "#18181b",
+            fontWeight: "bold", textAlign: "left",
+          }),
+          txt({
+            x: 40, y: 64, width: 720, height: 36,
+            text: `Install this widget on two Basecamp instances. Whatever you send from one will appear on the other.\nTopic: ${topic}`,
+            pixelSize: 12, color: "#71717a", lineHeight: 1.4,
+          }),
+
+          // Sender card
+          frame({
+            x: 40, y: 124, width: 720, height: 132,
+            style: { ...defaultStyle(), backgroundColor: "#ffffff", borderColor: "#e4e4e7", borderWidth: 1, borderRadius: 10 },
+            children: [
+              txt({ x: 16, y: 12, width: 360, height: 22,
+                text: "Send a message", pixelSize: 14, color: "#18181b", fontWeight: "bold" }),
+              tf({ x: 16, y: 44, width: 540, height: 40,
+                placeholder: "Type a message and press Send", pixelSize: 14,
+                binding: inputVarId }),
+              btn({ x: 568, y: 44, width: 136, height: 40,
+                text: "Send", textColor: "#ffffff", fontWeight: "bold",
+                style: { ...defaultStyle(), backgroundColor: "#2563eb", borderRadius: 8 },
+                onClick: { kind: "sendMessage", topic, payload: "app.var_messageInput", payloadMode: "expression" } }),
+              txt({ x: 16, y: 92, width: 688, height: 28,
+                text: "Hint: open a second Basecamp window with the same widget — what you send here lands there.",
+                pixelSize: 11, color: "#a1a1aa" }),
+            ],
+          }),
+
+          // Receiver card
+          frame({
+            x: 40, y: 276, width: 720, height: 232,
+            style: { ...defaultStyle(), backgroundColor: "#ffffff", borderColor: "#e4e4e7", borderWidth: 1, borderRadius: 10 },
+            children: [
+              txt({ x: 16, y: 12, width: 360, height: 22,
+                text: "Last received", pixelSize: 14, color: "#18181b", fontWeight: "bold" }),
+              txt({ x: 16, y: 36, width: 688, height: 28,
+                text: "(none yet)", pixelSize: 18, color: "#0f172a",
+                fontWeight: "bold", binding: lastMsgVarId }),
+              rect({ x: 16, y: 76, width: 688, height: 1,
+                style: { ...defaultStyle(), backgroundColor: "#e4e4e7" } }),
+              txt({ x: 16, y: 88, width: 360, height: 22,
+                text: "Log", pixelSize: 12, color: "#71717a" }),
+              txt({ x: 16, y: 108, width: 688, height: 108,
+                text: "", pixelSize: 12, color: "#27272a",
+                lineHeight: 1.4, binding: logVarId }),
+            ],
+          }),
+        ]),
+        meta: {
+          name: "delivery_test",
+          description: "Pub/sub verification widget — sends + receives on a shared content topic.",
+        },
+        variables,
+        triggers,
+      };
+    },
+  },
+
+  {
+    id: "chat",
+    name: "Chat (pub/sub bubbles)",
+    description: "Two TextField + Send + a chat-bubble List that grows with every received message. Install on two Basecamps and chat across instances.",
+    build: () => {
+      // Stable ids for the variables so trigger / button / list reference
+      // them by id without us chasing auto-generated values.
+      const messagesVarId = newId();
+      const inputVarId = newId();
+      const topic = "/lgxguru/1/chat/text";
+
+      const variables: Variable[] = [
+        // The chat history. Held as a string whose value is a JSON array,
+        // pushed onto by the on-message trigger and rendered by the List.
+        // Initial gives the canvas a 2-row preview before any messages.
+        { id: messagesVarId, name: "messages",     type: "string", initial: '["Welcome to chat","Send a message to get started"]' },
+        // What the TextField is currently bound to. Sent on click + cleared
+        // would be ideal, but Button.onClick is a single action — for now
+        // we just send and let the receive-side append it back when Waku
+        // delivers it back to the sender (gossipsub default).
+        { id: inputVarId,    name: "messageInput", type: "string", initial: "" },
+      ];
+
+      const triggers: Trigger[] = [
+        // Every inbound message → push payload onto the JSON-array variable
+        // → List re-renders with one bubble per item.
+        {
+          id: newId(),
+          kind: "onMessageReceived",
+          topic,
+          actions: [
+            { kind: "appendToList", varId: messagesVarId, value: "payload", mode: "expression" },
+          ],
+        },
+      ];
+
+      return {
+        root: buildRoot([
+          // Header bar
+          frame({
+            x: 0, y: 0, width: 1024, height: 56,
+            style: { ...defaultStyle(), backgroundColor: "#0f172a" },
+            children: [
+              txt({ x: 20, y: 18, width: 200, height: 22,
+                text: "Chat", pixelSize: 18, color: "#ffffff", fontWeight: "bold" }),
+              txt({ x: 230, y: 22, width: 600, height: 16,
+                text: `topic: ${topic} — install this widget on two Basecamps to chat across them`,
+                pixelSize: 11, color: "#94a3b8" }),
+            ],
+          }),
+
+          // Bubble list — anchored under the header, takes most of the
+          // canvas. Bubble styling uses a blue accent so messages read as
+          // a typical chat thread.
+          lst({
+            x: 20, y: 76, width: 984, height: 488,
+            style: { ...defaultStyle(), backgroundColor: "#f8fafc", borderColor: "#e2e8f0", borderWidth: 1, borderRadius: 8 },
+            dataVar: messagesVarId,
+            direction: "vertical",
+            gap: 8,
+            itemPixelSize: 14,
+            itemColor: "#ffffff",
+            itemBackgroundColor: "#2563eb",
+            itemBorderRadius: 14,
+            itemPadding: 10,
+          }),
+
+          // Input row — TextField (bound to messageInput) + Send button
+          // that publishes the bound value as a delivery message. The
+          // receive trigger above appends it back as a bubble when Waku
+          // delivers the broadcast (including the sender's own publish).
+          tf({
+            x: 20, y: 580, width: 820, height: 40,
+            placeholder: "Type a message…", pixelSize: 14, binding: inputVarId,
+            style: { ...defaultStyle(), backgroundColor: "#ffffff", borderColor: "#cbd5e1", borderWidth: 1, borderRadius: 8 },
+          }),
+          btn({
+            x: 856, y: 580, width: 148, height: 40,
+            text: "Send", textColor: "#ffffff", fontWeight: "bold",
+            style: { ...defaultStyle(), backgroundColor: "#2563eb", borderRadius: 8 },
+            onClick: { kind: "sendMessage", topic, payload: "app.var_messageInput", payloadMode: "expression" },
+          }),
+        ]),
+        meta: {
+          name: "chat",
+          description: "Pub/sub chat — every received message appears as a bubble.",
+        },
+        variables,
+        triggers,
+      };
+    },
   },
 
   {
