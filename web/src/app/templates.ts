@@ -270,38 +270,53 @@ export const TEMPLATES: Template[] = [
   {
     id: "chat",
     name: "Chat (pub/sub bubbles)",
-    description: "Two TextField + Send + a chat-bubble List that grows with every received message. Install on two Basecamps and chat across instances.",
+    description: "Name + message TextFields + Send + bubble list. Each bubble is prefixed with the sender's name so multiple users on the same topic stay distinguishable.",
     build: () => {
-      // Stable ids for the variables so trigger / button / list reference
-      // them by id without us chasing auto-generated values.
+      // Stable ids so trigger / button / list reference them by id without
+      // us chasing auto-generated values.
       const messagesVarId = newId();
-      const inputVarId = newId();
-      const topic = "/lgxguru/1/chat/text";
+      const inputVarId    = newId();
+      const userNameVarId = newId();
+      const topic = "/lgxguru/1/chat/json";
 
       const variables: Variable[] = [
-        // The chat history. Held as a string whose value is a JSON array,
-        // pushed onto by the on-message trigger and rendered by the List.
-        // Initial gives the canvas a 2-row preview before any messages.
-        { id: messagesVarId, name: "messages",     type: "string", initial: '["Welcome to chat","Send a message to get started"]' },
-        // What the TextField is currently bound to. Sent on click + cleared
-        // would be ideal, but Button.onClick is a single action — for now
-        // we just send and let the receive-side append it back when Waku
-        // delivers it back to the sender (gossipsub default).
+        // Sender identity. Defaults to a random `user-XXXX` so two browser
+        // sessions look distinct even before either user customises it.
+        // Bound to a TextField at the top so users can type their name.
+        { id: userNameVarId, name: "userName",     type: "string", initial: `user-${Math.random().toString(36).slice(2, 6)}` },
+        // What the message TextField is bound to.
         { id: inputVarId,    name: "messageInput", type: "string", initial: "" },
+        // The chat history. Held as a string whose value is a JSON array
+        // of formatted "<name>: <text>" strings, pushed onto by the on-
+        // message trigger and rendered by the List. Initial gives the
+        // canvas a 2-row preview before any real messages arrive.
+        { id: messagesVarId, name: "messages",     type: "string", initial: '["Welcome to chat","Type a message and press Send"]' },
       ];
 
+      // Receive: parse the JSON envelope `{from, text}`, format a single
+      // line for the bubble. Wrapped in an IIFE so non-JSON payloads (e.g.
+      // raw text from older clients) still appear instead of breaking the
+      // expression.
+      const formatExpr =
+        '(function(){ try { var p = JSON.parse(payload); '
+        + 'return (p.from || "?") + ": " + (p.text || ""); } '
+        + 'catch(e) { return payload; } })()';
+
       const triggers: Trigger[] = [
-        // Every inbound message → push payload onto the JSON-array variable
-        // → List re-renders with one bubble per item.
         {
           id: newId(),
           kind: "onMessageReceived",
           topic,
           actions: [
-            { kind: "appendToList", varId: messagesVarId, value: "payload", mode: "expression" },
+            { kind: "appendToList", varId: messagesVarId, value: formatExpr, mode: "expression" },
           ],
         },
       ];
+
+      // Send: wrap user input + name in a JSON envelope so the receiver can
+      // attribute each message. JSON.stringify is in QML's V4 JS engine.
+      const sendPayload =
+        'JSON.stringify({from: app.var_userName, text: app.var_messageInput})';
 
       return {
         root: buildRoot([
@@ -313,16 +328,24 @@ export const TEMPLATES: Template[] = [
               txt({ x: 20, y: 18, width: 200, height: 22,
                 text: "Chat", pixelSize: 18, color: "#ffffff", fontWeight: "bold" }),
               txt({ x: 230, y: 22, width: 600, height: 16,
-                text: `topic: ${topic} — install this widget on two Basecamps to chat across them`,
+                text: `topic: ${topic} — install on two Basecamps and pick a different name on each`,
                 pixelSize: 11, color: "#94a3b8" }),
             ],
           }),
 
-          // Bubble list — anchored under the header, takes most of the
-          // canvas. Bubble styling uses a blue accent so messages read as
-          // a typical chat thread.
+          // Name strip — a single TextField bound to userName. Sits between
+          // the header and the chat list so it's visible but unobtrusive.
+          txt({ x: 20, y: 72, width: 70, height: 28,
+            text: "Your name:", pixelSize: 12, color: "#475569" }),
+          tf({
+            x: 92, y: 70, width: 220, height: 30,
+            placeholder: "you", pixelSize: 13, binding: userNameVarId,
+            style: { ...defaultStyle(), backgroundColor: "#ffffff", borderColor: "#cbd5e1", borderWidth: 1, borderRadius: 6 },
+          }),
+
+          // Bubble list — left edge is the user's view of the conversation.
           lst({
-            x: 20, y: 76, width: 984, height: 488,
+            x: 20, y: 110, width: 984, height: 460,
             style: { ...defaultStyle(), backgroundColor: "#f8fafc", borderColor: "#e2e8f0", borderWidth: 1, borderRadius: 8 },
             dataVar: messagesVarId,
             direction: "vertical",
@@ -334,25 +357,22 @@ export const TEMPLATES: Template[] = [
             itemPadding: 10,
           }),
 
-          // Input row — TextField (bound to messageInput) + Send button
-          // that publishes the bound value as a delivery message. The
-          // receive trigger above appends it back as a bubble when Waku
-          // delivers the broadcast (including the sender's own publish).
+          // Input row.
           tf({
-            x: 20, y: 580, width: 820, height: 40,
+            x: 20, y: 586, width: 820, height: 40,
             placeholder: "Type a message…", pixelSize: 14, binding: inputVarId,
             style: { ...defaultStyle(), backgroundColor: "#ffffff", borderColor: "#cbd5e1", borderWidth: 1, borderRadius: 8 },
           }),
           btn({
-            x: 856, y: 580, width: 148, height: 40,
+            x: 856, y: 586, width: 148, height: 40,
             text: "Send", textColor: "#ffffff", fontWeight: "bold",
             style: { ...defaultStyle(), backgroundColor: "#2563eb", borderRadius: 8 },
-            onClick: { kind: "sendMessage", topic, payload: "app.var_messageInput", payloadMode: "expression" },
+            onClick: { kind: "sendMessage", topic, payload: sendPayload, payloadMode: "expression" },
           }),
         ]),
         meta: {
           name: "chat",
-          description: "Pub/sub chat — every received message appears as a bubble.",
+          description: "Pub/sub chat — every received message appears as a bubble, prefixed with the sender's name.",
         },
         variables,
         triggers,

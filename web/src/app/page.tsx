@@ -483,6 +483,26 @@ export default function Page() {
   // drag); true = Run (overlay hides, iframe takes events, the user can
   // actually interact with their widget — click buttons, type, etc.).
   const [runMode, setRunMode] = useState(false);
+
+  // Sidebar tab — splits the previously-overloaded left column into three
+  // mode-based views so only one panel-set is visible at a time:
+  //   "design"  — Pages + Components (placing widgets)
+  //   "logic"   — Variables + Triggers (state + behavior)
+  //   "backend" — Networking + Build a module (rare, delivery & C++)
+  // Layers stays anchored at the bottom across all tabs.
+  type SidebarTab = "design" | "logic" | "backend";
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("design");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = window.localStorage.getItem("lgx.sidebarTab");
+    if (stored === "design" || stored === "logic" || stored === "backend") {
+      setSidebarTab(stored);
+    }
+  }, []);
+  const switchSidebarTab = (t: SidebarTab) => {
+    setSidebarTab(t);
+    try { window.localStorage.setItem("lgx.sidebarTab", t); } catch {}
+  };
   const canvasRef = useRef<HTMLDivElement>(null);
   const designFileInputRef = useRef<HTMLInputElement>(null);
   const imageFileInputRef = useRef<HTMLInputElement>(null);
@@ -2056,49 +2076,89 @@ export default function Page() {
             - bottom: Layers, capped to 40% of the column height with its own
               scroll so deeply-nested designs stay manageable. */}
         <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 min-h-0">
+          {/* Tab strip — three mode-based views, only one rendered at a
+              time. Badges (count when non-zero) signal that a tab has
+              content even when not currently active. */}
+          <div className="shrink-0 flex border-b border-zinc-200 dark:border-zinc-700">
+            {([
+              { id: "design"  as SidebarTab, label: "Design",  badge: app.pages.length > 1 ? app.pages.length : undefined },
+              { id: "logic"   as SidebarTab, label: "Logic",   badge: (app.variables.length + app.triggers.length) || undefined },
+              { id: "backend" as SidebarTab, label: "Backend", badge: usesDelivery(app) ? "•" : (app.coreModule ? "•" : undefined) },
+            ]).map((t) => {
+              const active = sidebarTab === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => switchSidebarTab(t.id)}
+                  className={`flex-1 px-2 py-2 text-[11px] font-semibold uppercase tracking-wide border-b-2 -mb-px transition-colors ${
+                    active
+                      ? "border-blue-500 text-zinc-800 dark:text-zinc-100"
+                      : "border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  }`}
+                >
+                  {t.label}
+                  {t.badge !== undefined && (
+                    <span className="ml-1 rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 text-[9px] text-zinc-500 dark:text-zinc-400 leading-none">{t.badge}</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
           <div className="flex-1 overflow-y-auto min-h-0">
-            <PagesPanel
-              pages={app.pages}
-              currentPageId={app.currentPageId}
-              onSwitch={switchPage}
-              onAdd={addPage}
-              onRename={renamePage}
-              onDelete={deletePage}
-            />
-            <VariablesPanel
-              variables={app.variables}
-              onAdd={addVariable}
-              onUpdate={updateVariable}
-              onDelete={deleteVariable}
-            />
-            <TriggersPanel
-              triggers={app.triggers}
-              pages={app.pages}
-              variables={app.variables}
-              enabledModuleIds={app.modules}
-              coreModule={app.coreModule}
-              onAdd={addTrigger}
-              onUpdate={updateTrigger}
-              onDelete={deleteTrigger}
-              onAddAction={addTriggerAction}
-              onUpdateAction={updateTriggerAction}
-              onDeleteAction={deleteTriggerAction}
-              onAddVariable={addVariable}
-            />
-            <ModulesPanel app={app} />
-            <CoreModulePanel
-              spec={app.coreModule}
-              onEnable={enableCoreModule}
-              onDisable={disableCoreModule}
-              onUpdate={updateCoreModule}
-              onAddMethod={addCoreMethod}
-              onUpdateMethod={updateCoreMethod}
-              onDeleteMethod={deleteCoreMethod}
-              onToggleDep={toggleCoreDep}
-              onAddStateField={addCoreStateField}
-              onUpdateStateField={updateCoreStateField}
-              onDeleteStateField={deleteCoreStateField}
-            />
+            {sidebarTab === "design" && (
+              <PagesPanel
+                pages={app.pages}
+                currentPageId={app.currentPageId}
+                onSwitch={switchPage}
+                onAdd={addPage}
+                onRename={renamePage}
+                onDelete={deletePage}
+              />
+            )}
+            {sidebarTab === "logic" && (
+              <>
+                <VariablesPanel
+                  variables={app.variables}
+                  onAdd={addVariable}
+                  onUpdate={updateVariable}
+                  onDelete={deleteVariable}
+                />
+                <TriggersPanel
+                  triggers={app.triggers}
+                  pages={app.pages}
+                  variables={app.variables}
+                  enabledModuleIds={app.modules}
+                  coreModule={app.coreModule}
+                  onAdd={addTrigger}
+                  onUpdate={updateTrigger}
+                  onDelete={deleteTrigger}
+                  onAddAction={addTriggerAction}
+                  onUpdateAction={updateTriggerAction}
+                  onDeleteAction={deleteTriggerAction}
+                  onAddVariable={addVariable}
+                />
+              </>
+            )}
+            {sidebarTab === "backend" && (
+              <>
+                <ModulesPanel app={app} />
+                <CoreModulePanel
+                  spec={app.coreModule}
+                  onEnable={enableCoreModule}
+                  onDisable={disableCoreModule}
+                  onUpdate={updateCoreModule}
+                  onAddMethod={addCoreMethod}
+                  onUpdateMethod={updateCoreMethod}
+                  onDeleteMethod={deleteCoreMethod}
+                  onToggleDep={toggleCoreDep}
+                  onAddStateField={addCoreStateField}
+                  onUpdateStateField={updateCoreStateField}
+                  onDeleteStateField={deleteCoreStateField}
+                />
+              </>
+            )}
+            {sidebarTab === "design" && (
             <SidebarSection
               title="Components"
               defaultOpen
@@ -2160,6 +2220,7 @@ export default function Page() {
                 Drag onto the canvas, or drop image files from your OS.
               </p>
             </SidebarSection>
+            )}
           </div>
 
           {/* Layers — anchored at the bottom, capped to 40vh so it shares
