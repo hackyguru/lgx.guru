@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   AppState, ButtonAction, ButtonNode, CallModuleArg, CoreMethod, CoreModuleSpec,
   CoreStateField, FrameNode, ImageFit, ImageNode, LeafNode, ListDirection,
@@ -12,6 +12,7 @@ import {
 } from "./types";
 import { MODULE_CATALOG, findModuleSpec, findModuleMethod } from "./modules/catalog";
 import { emitMainQml, usesDelivery } from "./qmlEmit";
+import { computeUiDeps } from "./lib/uiDeps";
 import { exportLgx, placeholderIcon } from "./lgxExport";
 import { readLgx } from "./lgxImport";
 import { TEMPLATES, Template } from "./templates";
@@ -19,6 +20,7 @@ import { generateCoreModuleFiles } from "./codegen/coreModule";
 import { packTarGz } from "./codegen/sourceBundle";
 import { ModuleDetailModal, ModuleInfo } from "./ModuleDetailModal";
 import { AskAIModal } from "./AskAIModal";
+import { RendererStatus, useRendererStatus } from "./RendererStatus";
 import {
   getProjectMeta, getProjectState, renameProject, saveProjectState,
   type ProjectMeta,
@@ -255,6 +257,12 @@ type Action =
   | { type: "snapshot" }                  // push current app to past, clear future
   | { type: "set"; app: AppState }        // replace app with no history change
   | { type: "commit"; app: AppState }     // snapshot + set in one shot
+  // Resize every page's root to match the iframe's current dimensions.
+  // Reads state.app inside the reducer so it ALWAYS uses the freshest app
+  // — fixes a bug where iframe-sync dispatched with `...appRef.current`
+  // before hydration's dispatch had been observed, overwriting the
+  // hydrated saved state with a default empty app.
+  | { type: "resizeAllRoots"; width: number; height: number }
   | { type: "undo" }
   | { type: "redo" };
 
@@ -274,6 +282,25 @@ function reducer(state: HistoryState, action: Action): HistoryState {
         past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.app],
         future: [],
       };
+    case "resizeAllRoots": {
+      const { width, height } = action;
+      // Bail if every root already matches — avoids a re-render on
+      // ResizeObserver firings that bring no real change.
+      const allMatch = state.app.pages.every(
+        (p) => p.root.width === width && p.root.height === height,
+      );
+      if (allMatch) return state;
+      return {
+        ...state,
+        app: {
+          ...state.app,
+          pages: state.app.pages.map((p) => ({
+            ...p,
+            root: { ...p.root, width, height },
+          })),
+        },
+      };
+    }
     case "undo": {
       if (state.past.length === 0) return state;
       const prev = state.past[state.past.length - 1];
@@ -446,6 +473,9 @@ export default function Page() {
     ),
   });
 
+  // Renderer iframe lifecycle: capability check, load/error, timeout, retry.
+  const renderer = useRendererStatus();
+
   const [selectedIds, setSelectedIds] = useState<Set<NodeId>>(new Set());
   // Smart-guide overlay shown only during drag.
   const [guideLines, setGuideLines] = useState<GuideLine[]>([]);
@@ -522,9 +552,14 @@ export default function Page() {
   useEffect(() => { rootRef.current = root; }, [root]);
   useEffect(() => { appRef.current = app; }, [app]);
 
-  // Auto-save the editor state to localStorage. Debounced so a flurry of
-  // changes (drag, keystrokes) only writes once the dust settles.
-  // Skipped on the very first render — restore already populated state.
+  // Auto-save the editor state to localStorage. We deliberately do NOT
+  // debounce — localStorage writes are sub-millisecond and the previous
+  // 400ms-debounced version had a class of races where edits made within
+  // the debounce window before navigation got lost (we kept finding new
+  // ones: link click, browser back, tab close, focus loss). Sync-on-every-
+  // commit eliminates the race entirely.
+  // firstSaveSkip suppresses the initial post-hydration write of the same
+  // state we just loaded — wasteful, not incorrect.
   const firstSaveSkip = useRef(true);
 
   // Post-mount: hydrate from localStorage. Runs only on the client, so
@@ -584,18 +619,13 @@ export default function Page() {
       const w = iframe.clientWidth;
       const h = iframe.clientHeight;
       if (w <= 0 || h <= 0) return;
-      const cur = rootRef.current;
-      if (cur.width === w && cur.height === h) return;
-      // Update every page's root size so switching pages doesn't desync.
-      dispatch({
-        type: "set",
-        app: {
-          ...appRef.current,
-          pages: appRef.current.pages.map((p) => ({
-            ...p, root: { ...p.root, width: w, height: h },
-          })),
-        },
-      });
+      // CRITICAL: dispatch the dedicated resize action, not "set" with
+      // appRef.current. The latter races with hydration: appRef is updated
+      // by an effect that hasn't run yet during initial mount, so it still
+      // points at the default empty app — and dispatching with that
+      // overwrites hydration's just-loaded saved app. The reducer reads
+      // state.app live, so this is race-free regardless of mount order.
+      dispatch({ type: "resizeAllRoots", width: w, height: h });
     };
     const ro = new ResizeObserver(sync);
     ro.observe(iframe);
@@ -1016,18 +1046,50 @@ export default function Page() {
     });
   };
 
-  // Debounced autosave — fires once 400ms after the latest change. Skips
-  // until activeProject has been resolved on mount, so we don't write
-  // default-state into a project we're about to redirect away from.
+  // Synchronous autosave. Runs after every state change. Idempotent (same
+  // state → same write); cheap (localStorage is sync, sub-ms for our
+  // sizes); race-free (no debounce → no in-flight save to lose on nav).
   useEffect(() => {
     if (!activeProject) return;
     if (firstSaveSkip.current) { firstSaveSkip.current = false; return; }
-    const handle = setTimeout(() => {
-      saveToStorage(activeProject.id, buildSaveState());
-    }, 400);
-    return () => clearTimeout(handle);
+    saveToStorage(activeProject.id, buildSaveState());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [app, moduleMeta, iconPng, iconFilename, collapsedIds, activeProject]);
+
+  // Latest-state ref — populated INLINE during render (a documented React
+  // pattern for "current-value" refs) so non-React code paths can read
+  // the up-to-the-render-commit state without closure capture issues.
+  // No effect timing window means a click handler bound on render N
+  // always sees state N's values, never stale.
+  const latestStateRef = useRef<{
+    activeProject: ProjectMeta | null;
+    state: SaveState;
+  } | null>(null);
+
+  // Synchronous flush — guaranteed to write the latest state. Reads from
+  // the ref above (which we'll populate just before this is callable) so
+  // it's immune to stale closure capture in long-lived event listeners
+  // (beforeunload, pagehide, link onClick handlers).
+  const flushSave = useCallback(() => {
+    const latest = latestStateRef.current;
+    if (!latest || !latest.activeProject) return;
+    saveToStorage(latest.activeProject.id, latest.state);
+  }, []);
+
+  // Tab close / browser-back / cross-page nav — last-chance write.
+  // beforeunload covers explicit closes; pagehide also fires on bfcache
+  // restores (mobile Safari, some browser-back flows). Both are
+  // synchronous-safe for localStorage.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = () => flushSave();
+    window.addEventListener("beforeunload", handler);
+    window.addEventListener("pagehide", handler);
+    return () => {
+      window.removeEventListener("beforeunload", handler);
+      window.removeEventListener("pagehide", handler);
+    };
+  }, [flushSave]);
 
   // ── Save / Open / New ─────────────────────────────────────────────────────
 
@@ -1044,6 +1106,12 @@ export default function Page() {
     iconFilename,
     collapsedIds: [...collapsedIds],
   });
+
+  // Populate the latest-state ref inline — runs every render right after
+  // buildSaveState is in scope. By the time flushSave is callable from
+  // any event handler, this ref is current. (Refs updated during render
+  // are documented-safe in React; we're not setting state, just pointing.)
+  latestStateRef.current = { activeProject, state: buildSaveState() };
 
   const applySaveState = (raw: unknown) => {
     const s = migrateSave(raw);
@@ -1067,7 +1135,25 @@ export default function Page() {
     setSelectedIds(new Set());
   };
 
-  const handleSaveDesign = () => {
+  // "Save" used to download a .json file. That conflated two concerns: the
+  // primary "persist my work" action (which should just go to localStorage
+  // so projects survive across sessions and show up on the dashboard), and
+  // the rarer "give me a portable backup" action (download). Now Save just
+  // flushes to localStorage; the download lives in Export → Download
+  // project (.json). saveState gives the user a transient "Saved" tick so
+  // they know the click registered, since localStorage writes are silent.
+  const [saveFeedback, setSaveFeedback] = useState<"idle" | "saved">("idle");
+  const handleSaveLocal = useCallback(() => {
+    flushSave();
+    setSaveFeedback("saved");
+    window.setTimeout(() => setSaveFeedback("idle"), 1500);
+  }, [flushSave]);
+
+  // Download the current project as a portable .lgx-design.json. Wired
+  // into the export modal so users can grab a backup or share their
+  // project with another browser/colleague. Round-trips through Open
+  // (which still imports JSON / .lgx-with-snapshot files).
+  const handleDownloadDesign = () => {
     const json = JSON.stringify(buildSaveState(), null, 2);
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1276,6 +1362,10 @@ export default function Page() {
       t.actions = [
         { kind: "setVariable", varId: v.id, value: "payload", mode: "expression" } as ButtonAction,
       ];
+    } else if (kind === "interval") {
+      // 1s default cadence — slow enough that an empty trigger isn't a
+      // CPU drain, fast enough that a stopwatch-style display feels alive.
+      t.intervalMs = 1000;
     }
     dispatch({
       type: "commit",
@@ -1836,6 +1926,13 @@ export default function Page() {
       if (tag === "INPUT" || tag === "TEXTAREA" || t?.isContentEditable) return;
 
       const meta = e.metaKey || e.ctrlKey;
+      if (meta && e.key.toLowerCase() === "s") {
+        // Cmd+S persists this project to localStorage. Override the
+        // browser's "save page" default — we never want that here.
+        e.preventDefault();
+        handleSaveLocal();
+        return;
+      }
       if (meta && e.key.toLowerCase() === "z") {
         e.preventDefault();
         dispatch({ type: e.shiftKey ? "redo" : "undo" });
@@ -1902,7 +1999,7 @@ export default function Page() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedIds, root, clipboard]);
+  }, [selectedIds, root, clipboard, handleSaveLocal]);
 
   // ── Export ────────────────────────────────────────────────────────────────
 
@@ -1954,15 +2051,10 @@ export default function Page() {
     const designJsonBytes = new TextEncoder().encode(JSON.stringify(designSnapshot));
     const allExtras = [...assets, { rel: "design.json", data: designJsonBytes }];
 
-    // UI dependencies — primitives the user picked + the user's core
-    // (if any) + the shared delivery_relay (auto-included when any send/
-    // receive action exists). Without declaring delivery_relay here,
-    // Basecamp would silently skip the UI install on dep-resolution.
-    const uiDeps = [
-      ...app.modules,
-      ...(hasCoreModule ? [app.coreModule!.id] : []),
-      ...(usesDelivery(app) ? ["delivery_relay"] : []),
-    ];
+    // UI dependencies — primitives + the user's core + transitive core
+    // deps + delivery_relay (when any send/receive action exists). Single
+    // source of truth in lib/uiDeps so tests cover exactly what we ship.
+    const uiDeps = computeUiDeps(app);
 
     const result = await exportLgx({
       name,
@@ -2120,6 +2212,14 @@ export default function Page() {
         <div className="flex items-center gap-2">
           <a
             href="/dashboard"
+            // Flush any pending debounced autosave before the browser
+            // tears down React on navigation. Without this, an edit made
+            // within the 400ms autosave window before clicking gets lost.
+            onClick={(e) => {
+              e.preventDefault();
+              flushSave();
+              window.location.assign("/dashboard");
+            }}
             className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
             title="Back to all projects"
           >← Projects</a>
@@ -2173,10 +2273,14 @@ export default function Page() {
             title="Open a .lgx-design.json or a .lgx exported from this editor"
           >Open</button>
           <button
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
-            onClick={handleSaveDesign}
-            title="Download a .lgx-design.json snapshot"
-          >Save</button>
+            className={`rounded border px-2 py-1 text-xs transition-colors ${
+              saveFeedback === "saved"
+                ? "border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300"
+                : "border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+            }`}
+            onClick={handleSaveLocal}
+            title="Save this project to your browser (Cmd+S). Opens from the dashboard. For a portable backup, use Export → Download project (.json)."
+          >{saveFeedback === "saved" ? "Saved ✓" : "Save"}</button>
           <input
             ref={designFileInputRef}
             type="file"
@@ -2438,12 +2542,25 @@ export default function Page() {
                   none` so the React overlay captures clicks for selection /
                   drag. In Run mode the React overlay disappears, the iframe
                   takes events, and the user can interact with their widget. */}
-              <iframe
-                ref={canvasIframeRef}
-                src={RENDERER_URL}
-                className="absolute inset-0 h-full w-full bg-zinc-50 dark:bg-zinc-800"
-                style={{ pointerEvents: runMode ? "auto" : "none" }}
-                title="canvas-renderer"
+              {renderer.status.kind !== "unsupported" && (
+                <iframe
+                  ref={canvasIframeRef}
+                  // reloadKey query param forces the browser to refetch the
+                  // renderer when the user clicks "Reload renderer" without
+                  // remounting the iframe element (preserves the ResizeObserver
+                  // binding above).
+                  src={`${RENDERER_URL}${RENDERER_URL.includes("?") ? "&" : "?"}r=${renderer.reloadKey}`}
+                  className="absolute inset-0 h-full w-full bg-zinc-50 dark:bg-zinc-800"
+                  style={{ pointerEvents: runMode ? "auto" : "none" }}
+                  title="canvas-renderer"
+                  onLoad={renderer.handleLoad}
+                  onError={renderer.handleError}
+                />
+              )}
+              <RendererStatus
+                status={renderer.status}
+                url={RENDERER_URL}
+                onRetry={renderer.retry}
               />
               {!runMode && (
                 <CanvasArea
@@ -2665,6 +2782,25 @@ export default function Page() {
                   </div>
                 </div>
               </label>
+
+              {/* Editor backup — separate from the .lgx artifacts above
+                  because it's not installable. It's the round-trippable
+                  JSON snapshot of the editor state, useful for sharing a
+                  project with someone or moving it to another browser. */}
+              <div className="mt-1 flex items-start gap-2 rounded border border-dashed border-zinc-300 dark:border-zinc-600 bg-zinc-50 dark:bg-zinc-800/40 p-2">
+                <div className="flex-1">
+                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                    Project file (<span className="font-mono">.lgx-design.json</span>)
+                  </div>
+                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                    Portable backup of this editor session — pages, variables, triggers, custom backend spec, and assets. Re-import via <span className="font-semibold">Open</span>. Your project is auto-saved to this browser; this is for moving it elsewhere.
+                  </div>
+                </div>
+                <button
+                  onClick={handleDownloadDesign}
+                  className="shrink-0 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-[10px] font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                >Download</button>
+              </div>
             </div>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
@@ -5203,6 +5339,11 @@ function TriggersPanel({
           title="Run actions when the widget loads"
         >+ load</button>
         <button
+          onClick={() => onAdd("interval")}
+          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          title="Run actions every N milliseconds while the widget is open (polling, stopwatch tick, etc.)"
+        >+ tick</button>
+        <button
           onClick={() => onAdd("onMessageReceived")}
           className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
           title="Run actions when a message arrives on a content topic"
@@ -5281,6 +5422,7 @@ function TriggerEditor({
         <span className="font-mono text-[10px] uppercase text-zinc-400 dark:text-zinc-500">
           {trigger.kind === "appStart" ? "on load"
             : trigger.kind === "onMessageReceived" ? "on message"
+            : trigger.kind === "interval" ? "every"
             : "on event"}
         </span>
         <span className="flex-1" />
@@ -5289,6 +5431,23 @@ function TriggerEditor({
           className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
         >del</button>
       </div>
+      {trigger.kind === "interval" && (
+        <div className="mb-1.5 flex items-center gap-1">
+          <label className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400">every</label>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            className="w-20 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            value={trigger.intervalMs ?? 1000}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              onChange({ intervalMs: Number.isFinite(n) && n > 0 ? n : 1 });
+            }}
+          />
+          <span className="text-[10px] text-zinc-500 dark:text-zinc-400">ms — runs the actions below repeatedly while the widget is open. Use 100 for stopwatch-style ticks; 1000+ for polling.</span>
+        </div>
+      )}
       {trigger.kind === "onMessageReceived" && (
         <div className="mb-1.5 flex flex-col gap-1">
           <label className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400">topic to listen on</label>

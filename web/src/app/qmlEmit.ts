@@ -34,6 +34,31 @@ const escapeStr = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
 const indent = (depth: number) => "    ".repeat(depth);
 
+// AI-generated patches sometimes splice expressions with unbalanced parens
+// (or other syntactic damage). Because QML parses the whole Main.qml at
+// load time, ONE bad spliced expression poisons the entire widget — preview
+// errors out and Basecamp silently refuses to open the installed UI module.
+// Try/catch can't help: parse-time errors fire before any handler runs.
+//
+// safeExpr validates the expression by trying to compile it as a JS
+// expression. If it parses, the original is returned; otherwise we emit a
+// fallback (defaulting to `null`) plus a console.log so the user can see
+// what was dropped without the whole UI dying.
+const safeExpr = (raw: string, fallback = "null"): string => {
+  const s = raw.trim();
+  if (!s) return fallback;
+  try {
+    // eslint-disable-next-line no-new-func
+    new Function(`return (${s});`);
+    return s;
+  } catch {
+    // Surface the dropped fragment in the runtime console so a user
+    // inspecting via QML logs can see what we replaced.
+    return `(function(){ console.log("[lgx] dropped malformed expression:", ${JSON.stringify(s)}); return ${fallback}; })()`;
+  }
+};
+
+
 // Stable per-page key used in the QML navigation switch. We use the design-
 // time page id (already a string of the form "n<ts>_<n>") sanitised so it's
 // a safe QML identifier suffix.
@@ -108,7 +133,7 @@ const geomLines = (n: Node, i: string): string[] => {
     `${i}    width: ${n.width}`,
     `${i}    height: ${n.height}`,
   ];
-  if (n.visibleWhen) lines.push(`${i}    visible: ${n.visibleWhen}`);
+  if (n.visibleWhen) lines.push(`${i}    visible: ${safeExpr(n.visibleWhen, "true")}`);
   return lines;
 };
 
@@ -154,9 +179,11 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     const type = ctx.varTypeByVarId.get(action.varId);
     if (!prop || !type) return null;
     // Expression mode splices the user's text as raw QML; literal mode
-    // formats per the variable's type.
+    // formats per the variable's type. Validate expression-mode strings so
+    // an unbalanced paren doesn't break the whole Main.qml at parse time.
+    const fallback = setVariableExpr(type, "");
     const value = action.mode === "expression"
-      ? (action.value || setVariableExpr(type, ""))
+      ? safeExpr(action.value || "", fallback)
       : setVariableExpr(type, action.value);
     return `app.${prop} = ${value}`;
   }
@@ -170,15 +197,20 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // own core-module methods for this project.
     const spec = findModuleMethod(action.moduleId, action.method)
       ?? ctx.extraMethods.get(action.moduleId)?.get(action.method);
-    if (!spec) return null;
+    if (!spec) {
+      // Silent drops here look like "the button does nothing" — exactly
+      // the symptom that bit the stopwatch app. Surface a runtime log so
+      // the user can see in Basecamp logs that the wiring references an
+      // unknown module/method, instead of staring at a dead button.
+      return `console.log("[lgx] button onClick references unknown ${action.moduleId}.${action.method}() — fix the wiring or rebuild the backend module")`;
+    }
     // Render each declared arg using its declared type. Missing trailing
     // args are emitted as empty literals so the JS array shape matches the
     // method signature even if the user hasn't filled everything in.
     const argsExprs = spec.args.map((p, idx) => {
       const a: CallModuleArg = action.args[idx] ?? { value: "", mode: "literal" };
-      if (a.mode === "expression") {
-        return a.value || (p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""');
-      }
+      const fb = p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""';
+      if (a.mode === "expression") return safeExpr(a.value || "", fb);
       if (p.type === "number") {
         const n = parseFloat(a.value);
         return Number.isFinite(n) ? String(n) : "0";
@@ -194,12 +226,13 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     if (!prop) return null;
     const spec = findModuleMethod(action.moduleId, action.method)
       ?? ctx.extraMethods.get(action.moduleId)?.get(action.method);
-    if (!spec) return null;
+    if (!spec) {
+      return `console.log("[lgx] callModuleToVariable references unknown ${action.moduleId}.${action.method}() — variable will not update")`;
+    }
     const argsExprs = spec.args.map((p, idx) => {
       const a: CallModuleArg = action.args[idx] ?? { value: "", mode: "literal" };
-      if (a.mode === "expression") {
-        return a.value || (p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""');
-      }
+      const fb = p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""';
+      if (a.mode === "expression") return safeExpr(a.value || "", fb);
       if (p.type === "number") {
         const n = parseFloat(a.value);
         return Number.isFinite(n) ? String(n) : "0";
@@ -215,9 +248,10 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     const topic = action.topic.trim();
     if (!topic) return null;
     // Payload — literal mode quotes the user's text; expression mode splices
-    // it raw so users can pass `app.var_input` or any QML expression.
+    // it raw so users can pass `app.var_input` or any QML expression. Validate
+    // the expression form so a bad splice doesn't kill the whole handler.
     const payloadExpr = action.payloadMode === "expression"
-      ? (action.payload || `""`)
+      ? safeExpr(action.payload || "", '""')
       : `"${escapeStr(action.payload)}"`;
     // Route through the shared delivery_relay (sendMessage), NOT
     // delivery_module directly — the relay owns lifecycle + status and is
@@ -229,9 +263,10 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     const prop = ctx.varQmlByVarId.get(action.varId);
     if (!prop) return null;
     // Value to push — literal vs expression. Literal text is JSON-quoted so
-    // it round-trips safely through stringify.
+    // it round-trips safely through stringify; expression text is validated
+    // first so a malformed splice can't break Main.qml's parse.
     const valueExpr = action.mode === "expression"
-      ? (action.value || `""`)
+      ? safeExpr(action.value || "", '""')
       : JSON.stringify(action.value);
     // Mutate-via-stringify pattern. Tolerates non-array / unparseable initial
     // values by falling back to []. Bound to a string variable; we re-encode
@@ -241,9 +276,11 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
   if (action.kind === "if") {
     // Composition primitive: branch on a JS condition. Empty condition is
     // treated as `true` so a freshly-added `if` block doesn't silently no-op.
-    // Wrapped in try/catch so a bad expression doesn't kill the whole
-    // surrounding handler — just skips this branch and logs to the console.
-    const cond = action.condition.trim() || "true";
+    // Validate the condition at emit time so a malformed expression can't
+    // break the surrounding QML parse — falls back to `false` (skip branch).
+    // Also wrapped in try/catch so a runtime error in the body or condition
+    // doesn't kill the whole handler.
+    const cond = action.condition.trim() ? safeExpr(action.condition, "false") : "true";
     const body = actionBlockJs(action.actions, ctx);
     if (!body) return null;
     return `try { if (${cond}) { ${body} } } catch(_ifErr) { console.log("if condition error:", _ifErr) }`;
@@ -714,10 +751,14 @@ const triggersQml = (
   const onLoad = triggers.filter((t) => t.kind === "appStart");
   const onEvent = triggers.filter((t) => t.kind === "moduleEvent" && t.moduleId && t.eventName);
   const onMsg = triggers.filter((t) => t.kind === "onMessageReceived");
+  const onInterval = triggers.filter((t) => t.kind === "interval" && (t.intervalMs ?? 0) > 0);
   const needsDelivery = usesDelivery(app);
   const topics = subscribedTopics(app);
 
-  if (onLoad.length === 0 && onEvent.length === 0 && onMsg.length === 0 && !needsDelivery) {
+  if (
+    onLoad.length === 0 && onEvent.length === 0 && onMsg.length === 0
+    && onInterval.length === 0 && !needsDelivery
+  ) {
     return lines;
   }
 
@@ -806,6 +847,26 @@ const triggersQml = (
     lines.push(
       `${indent}        }`,
       `${indent}    }`,
+      `${indent}}`,
+    );
+  }
+
+  // ── Interval triggers — one Timer per trigger.
+  // Each fires its action block every intervalMs while the widget is open.
+  // The body is wrapped in try/catch so a single bad action doesn't stop
+  // the timer; this is the canonical primitive for stopwatches, polling
+  // module getters, periodic UI refreshes, etc.
+  for (const t of onInterval) {
+    const body = actionBlockJs(t.actions, ctx);
+    if (!body) continue;
+    const ms = Math.max(1, Math.floor(t.intervalMs ?? 1000));
+    lines.push(
+      ``,
+      `${indent}Timer {`,
+      `${indent}    interval: ${ms}`,
+      `${indent}    running: true`,
+      `${indent}    repeat: true`,
+      `${indent}    onTriggered: { try { ${body} } catch(_e) { console.log("[lgx] interval trigger error:", _e) } }`,
       `${indent}}`,
     );
   }

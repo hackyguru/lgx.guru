@@ -102,12 +102,17 @@ describe("codegen smoke — universal module", () => {
     expect(cmake).toContain("generated_code/london_weather_qt_glue.h");
     expect(cmake).toContain("generated_code/london_weather_dispatch.cpp");
 
-    // impl.h is pure C++ (no Qt) and declares the public API in std types.
+    // impl.h is pure C++ (no Qt, no LogosAPI hook) — only public methods.
     const h = get("src/london_weather_impl.h");
     expect(h).toContain("class LondonWeatherImpl");
     expect(h).toContain("void refreshWeather()");
     expect(h).toContain("std::string lastWeather()");
     expect(h).not.toMatch(/Q_INVOKABLE|Q_OBJECT|QString|#include\s*<Q/);
+    // onInit / m_api are NOT emitted: the generator parses every public
+    // method into the dispatch table, and a LogosAPI* arg can't be coerced
+    // from QVariant. Inter-module calls need a different hook (TBD).
+    expect(h).not.toContain("void onInit(LogosAPI*");
+    expect(h).not.toContain("LogosAPI* m_api");
 
     // impl.cpp routes Qt-typed state through the Private pimpl + auto-includes.
     const cpp = get("src/london_weather_impl.cpp");
@@ -117,6 +122,16 @@ describe("codegen smoke — universal module", () => {
     expect(cpp).toContain("QString m_last");
     expect(cpp).toContain("#include <QNetworkAccessManager>");
     expect(cpp).toContain("d->m_last");
+
+    // Tests dir is always emitted (logos-module-builder picks it up).
+    const testsCMake = get("tests/CMakeLists.txt");
+    expect(testsCMake).toContain("logos_test(");
+    expect(testsCMake).toContain("test_london_weather.cpp");
+    const testsMain = get("tests/main.cpp");
+    expect(testsMain).toContain("LOGOS_TEST_MAIN()");
+    const testsImpl = get("tests/test_london_weather.cpp");
+    expect(testsImpl).toContain("LOGOS_TEST(london_weather_constructs)");
+    expect(testsImpl).toContain("LondonWeatherImpl impl;");
 
     // Write to disk so we can manually drive `nix build` if we want.
     await rm(OUT, { recursive: true, force: true });

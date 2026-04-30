@@ -19,7 +19,17 @@
 // Qt types freely (we auto-inject the right #includes + cmake links via
 // detectQtNeeds), but the *public method signatures* stay pure C++.
 
-import { CoreMethod, CoreModuleSpec, CoreStateField, ModuleParam, ParamType } from "../types";
+import { CoreMethod, CoreModuleSpec, ModuleParam, ParamType } from "../types";
+
+// Github URLs we know — used when emitting flake.nix inputs for module
+// dependencies. Anything not on this list gets a placeholder URL the
+// user is expected to point at the real source.
+const KNOWN_DEP_URLS: Record<string, string> = {
+  delivery_module: "github:logos-co/logos-delivery-module",
+  storage_module:  "github:logos-co/logos-storage-module",
+  capability_module: "github:logos-co/logos-capability-module",
+  package_manager: "github:logos-co/logos-package-manager",
+};
 
 export interface CodegenFile { path: string; data: Uint8Array }
 
@@ -50,9 +60,24 @@ const stdType = (t: ParamType): string => {
 const stdReturn = (r: ParamType | "void"): string =>
   r === "void" ? "void" : stdType(r);
 
-// Args: const-ref for std::string, value for primitives.
-const stdArg = (p: ModuleParam): string =>
-  p.type === "string" ? `const std::string& ${p.name}` : `${stdType(p.type)} ${p.name}`;
+// Args: const-ref for std::string, value for primitives. cppType
+// overrides the basic mapping when set (lets the AI pick richer C++
+// types like std::vector<std::string>, LogosMap, int64_t, byte arrays).
+const stdArg = (p: ModuleParam): string => {
+  if (p.cppType && p.cppType.trim().length > 0) {
+    const t = p.cppType.trim();
+    // Heuristic: pass non-trivial types by const-ref, primitives by value.
+    const isPrimitive = /^(?:bool|int|short|long|long long|unsigned[\w\s]*|char|signed[\w\s]*|float|double|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|size_t|ssize_t|std::size_t)\b\s*\*?$/.test(t);
+    return isPrimitive ? `${t} ${p.name}` : `const ${t}& ${p.name}`;
+  }
+  return p.type === "string" ? `const std::string& ${p.name}` : `${stdType(p.type)} ${p.name}`;
+};
+
+// Method return form. cppReturn overrides when set.
+const stdReturnFor = (m: CoreMethod): string => {
+  if (m.cppReturn && m.cppReturn.trim().length > 0) return m.cppReturn.trim();
+  return stdReturn(m.returns);
+};
 
 const stubReturn = (r: ParamType | "void"): string => {
   switch (r) {
@@ -100,6 +125,12 @@ const QT_FEATURES: QtFeature[] = [
   { pattern: /\bqDebug\b|\bqWarning\b|\bqInfo\b/, includes: ["QDebug"] },
 ];
 
+// Non-Qt feature detection: nlohmann::json aliases (LogosMap / LogosList).
+// The generator maps these to QVariantMap / QVariantList in the dispatch
+// glue — lets methods return structured payloads natively.
+const detectLogosJson = (corpus: string): boolean =>
+  /\bLogos(?:Map|List)\b/.test(corpus);
+
 interface DetectedQtNeeds {
   includes: string[];
   findPackages: string[];
@@ -112,8 +143,11 @@ interface DetectedQtNeeds {
 const detectQtNeeds = (spec: CoreModuleSpec): DetectedQtNeeds => {
   const corpus = [
     ...spec.methods.map((m) => m.body ?? ""),
+    ...spec.methods.map((m) => m.cppReturn ?? ""),
+    ...spec.methods.flatMap((m) => m.args.map((a) => a.cppType ?? "")),
     ...spec.state.map((s) => s.cppType ?? ""),
     ...spec.state.map((s) => s.initial ?? ""),
+    ...(spec.tests ?? []).map((t) => t.body),
   ].join("\n");
   const includes = new Set<string>();
   const findPackages = new Set<string>();
@@ -134,22 +168,28 @@ const detectQtNeeds = (spec: CoreModuleSpec): DetectedQtNeeds => {
   };
 };
 
-// State fields whose cppType references a Qt token — those must live in the
-// Private pimpl class (in the .cpp), since the public .h is Qt-free.
-const isQtTyped = (cppType: string): boolean =>
-  /\bQ[A-Z]/.test(cppType);
-
-interface PartitionedState {
-  qtState: CoreStateField[];   // → Private pimpl, in .cpp
-  stdState: CoreStateField[];  // → impl.h private members (raw types)
-}
-
-const partitionState = (state: CoreStateField[]): PartitionedState => {
-  const qtState: CoreStateField[] = [];
-  const stdState: CoreStateField[] = [];
-  for (const s of state) (isQtTyped(s.cppType) ? qtState : stdState).push(s);
-  return { qtState, stdState };
+// True when the spec uses LogosMap/LogosList anywhere — used to inject
+// the <logos_json.h> include in the impl.cpp.
+const usesLogosJson = (spec: CoreModuleSpec): boolean => {
+  const corpus = [
+    ...spec.methods.map((m) => m.body ?? ""),
+    ...spec.methods.map((m) => m.cppReturn ?? ""),
+    ...spec.methods.flatMap((m) => m.args.map((a) => a.cppType ?? "")),
+    ...(spec.tests ?? []).map((t) => t.body),
+  ].join("\n");
+  return detectLogosJson(corpus);
 };
+
+// All state lives in the Private pimpl in the .cpp — uniform access via
+// `d->m_<name>` regardless of whether the field is Qt-typed (QString,
+// QNetworkAccessManager) or std-typed (bool, int64_t, std::string).
+//
+// We tried partitioning std-typed state to direct members of the impl
+// class, but the AI consistently writes `d->m_X` for everything, and the
+// resulting compile errors ("no member named 'm_fetching' in Private")
+// kept costing whole multi-minute build cycles. Uniform pimpl is simpler,
+// keeps the public .h pure C++ regardless, and matches the AI's mental
+// model. Tiny pointer-chase cost is irrelevant here.
 
 // ── File generators ───────────────────────────────────────────────────────
 
@@ -187,12 +227,26 @@ const metadataJson = (spec: CoreModuleSpec): string => {
 const flakeNix = (spec: CoreModuleSpec): string => {
   const id = sanitiseId(spec.id);
   const cls = `${pascal(id)}Impl`;
+  // Each metadata.json dependency must also appear as a flake input — the
+  // logos-module-builder framework reads them to assemble the module's
+  // dependency graph at build time. Known modules get canonical github:
+  // URLs; unknown ones get a placeholder commented line the user can fill.
+  const depInputLines: string[] = [];
+  for (const dep of spec.dependencies) {
+    const url = KNOWN_DEP_URLS[dep];
+    if (url) {
+      depInputLines.push(`    ${dep}.url = "${url}";`);
+    } else {
+      depInputLines.push(`    # ${dep}.url = "github:org/logos-${dep.replace(/_/g, "-")}";  # TODO: set the real source URL`);
+    }
+  }
   return [
     `{`,
     `  description = "${spec.description ? spec.description.replace(/[\\"]/g, "\\$&") : spec.name || id}";`,
     ``,
     `  inputs = {`,
     `    logos-module-builder.url = "github:logos-co/logos-module-builder";`,
+    ...depInputLines,
     `  };`,
     ``,
     `  outputs = inputs@{ logos-module-builder, ... }:`,
@@ -252,29 +306,73 @@ const implHeader = (spec: CoreModuleSpec): string => {
   const id = sanitiseId(spec.id);
   const cls = `${pascal(id)}Impl`;
   const guard = `${id.toUpperCase()}_IMPL_H`;
-  const { stdState, qtState } = partitionState(spec.state);
+  const wantsLogosJson = usesLogosJson(spec);
+  const hasEvents = (spec.events ?? []).length > 0;
 
-  // Methods — pure C++ signatures only.
+  // Methods — pure C++ signatures, optionally overridden via cppType/cppReturn.
   const methodLines: string[] = [];
   for (const m of spec.methods) {
     if (m.description) methodLines.push(`    // ${m.description}`);
     const args = m.args.map(stdArg).join(", ");
-    methodLines.push(`    ${stdReturn(m.returns)} ${m.name}(${args});`);
+    methodLines.push(`    ${stdReturnFor(m)} ${m.name}(${args});`);
   }
   if (methodLines.length === 0) {
     methodLines.push(`    // Declare your public methods here. Each becomes callable from QML`);
     methodLines.push(`    // via logos.callModule("${id}", "<methodName>", [args]).`);
   }
 
-  // Header includes — derive from method types only (state-with-Qt-types
-  // lives in the .cpp's Private pimpl, so .h stays pure C++).
+  // Header includes — derive from method types and state cppType. State
+  // lives in the .cpp's Private pimpl, but the .cpp transitively pulls
+  // these via #include "<id>_impl.h", so it's simpler to declare them once
+  // in the header. Standard headers don't break .h's "pure C++" property.
   const stdIncludes = new Set<string>(["string"]);
+  const scanStdTypes = (raw: string) => {
+    const t = (raw ?? "").trim();
+    if (!t) return;
+    if (/\bstd::vector\b|\bstd::array\b/.test(t)) stdIncludes.add("vector");
+    if (/\bstd::map\b|\bstd::unordered_map\b/.test(t)) stdIncludes.add("map");
+    if (/\bstd::set\b|\bstd::unordered_set\b/.test(t)) stdIncludes.add("set");
+    if (/\bstd::deque\b/.test(t)) stdIncludes.add("deque");
+    if (/\bint64_t\b|\buint64_t\b|\bint32_t\b|\buint32_t\b|\bint16_t\b|\buint16_t\b|\bint8_t\b|\buint8_t\b/.test(t)) stdIncludes.add("cstdint");
+    if (/\bstd::function\b/.test(t)) stdIncludes.add("functional");
+    if (/\bstd::optional\b/.test(t)) stdIncludes.add("optional");
+    if (/\bstd::variant\b/.test(t)) stdIncludes.add("variant");
+    if (/\bstd::chrono\b/.test(t)) stdIncludes.add("chrono");
+  };
   for (const m of spec.methods) {
     for (const a of m.args) {
       if (a.type === "number") stdIncludes.add("cstdint");
+      scanStdTypes(a.cppType ?? "");
     }
     if (m.returns === "number") stdIncludes.add("cstdint");
+    scanStdTypes(m.cppReturn ?? "");
   }
+  for (const s of spec.state) scanStdTypes(s.cppType);
+  // emitEvent uses std::function<void(const std::string&, LogosList)>
+  if (hasEvents) {
+    stdIncludes.add("functional");
+  }
+
+  // emitEvent member declaration — when set by the host, the impl can
+  // call `if (emitEvent) emitEvent("name", LogosList{...});` to push an
+  // event back to QML. The generator wires this to LogosProviderBase::emitEvent.
+  const emitEventMember = hasEvents
+    ? [
+        ``,
+        `    // Set by the host (logos-cpp-generator wires this to`,
+        `    // LogosProviderBase::emitEvent in the generated dispatch).`,
+        `    // Call from method bodies to push events back to QML:`,
+        `    //   if (emitEvent) emitEvent("name", LogosList{ value1, value2 });`,
+        `    std::function<void(const std::string&, LogosList)> emitEvent;`,
+      ]
+    : [];
+
+  // NOTE: We do NOT declare an explicit onInit(LogosAPI*) in the public
+  // header. logos-cpp-generator parses every public method into the
+  // dispatch table, and a LogosAPI* arg doesn't convert from QVariant —
+  // build fails. Inter-module calls (the `dependencies` field) require
+  // a hook the generator emits in its own glue layer; wiring that into
+  // our impl class needs more research and is a follow-up.
 
   return [
     `#ifndef ${guard}`,
@@ -286,6 +384,7 @@ const implHeader = (spec: CoreModuleSpec): string => {
     `// header to emit the QML/IPC glue.`,
     ``,
     ...[...stdIncludes].sort().map((h) => `#include <${h}>`),
+    ...(wantsLogosJson ? [``, `#include <logos_json.h>   // LogosMap / LogosList aliases for nlohmann::json`] : []),
     ``,
     `class ${cls} {`,
     `public:`,
@@ -293,14 +392,13 @@ const implHeader = (spec: CoreModuleSpec): string => {
     `    ~${cls}();`,
     ``,
     ...methodLines,
+    ...emitEventMember,
     ``,
     `private:`,
-    // Qt state goes through the pimpl; std state can sit directly here.
-    ...stdState.map((s) => {
-      const init = s.initial ? ` = ${s.initial}` : "";
-      return `    ${s.cppType} m_${s.name}${init};`;
-    }),
-    ...(qtState.length > 0 || spec.methods.some((m) => /\bd->/.test(m.body ?? ""))
+    // All state lives in Private (defined in the .cpp). Keeps the public
+    // header pure C++ so logos-cpp-generator can parse it, and gives the AI
+    // a single uniform access pattern: `d->m_<name>` for every field.
+    ...(spec.state.length > 0 || spec.methods.some((m) => /\bd->/.test(m.body ?? ""))
       ? [`    class Private;`, `    Private* d;`]
       : []),
     `};`,
@@ -314,15 +412,19 @@ const implCpp = (spec: CoreModuleSpec): string => {
   const id = sanitiseId(spec.id);
   const cls = `${pascal(id)}Impl`;
   const detected = detectQtNeeds(spec);
-  const { qtState } = partitionState(spec.state);
-  const usesPimpl = qtState.length > 0 || spec.methods.some((m) => /\bd->/.test(m.body ?? ""));
+  const wantsLogosJson = usesLogosJson(spec);
+  // Always-pimpl: every spec.state field lives inside Private. Pimpl is
+  // emitted whenever there's any state, or whenever a body references `d->`
+  // explicitly (e.g. user-typed access pattern with no declared state yet).
+  const usesPimpl = spec.state.length > 0 || spec.methods.some((m) => /\bd->/.test(m.body ?? ""));
+  const hasEvents = (spec.events ?? []).length > 0;
 
   // Method definitions.
   const methodBodies: string[] = [];
   for (const m of spec.methods) {
     const args = m.args.map(stdArg).join(", ");
     methodBodies.push(``);
-    methodBodies.push(`${stdReturn(m.returns)} ${cls}::${m.name}(${args})`);
+    methodBodies.push(`${stdReturnFor(m)} ${cls}::${m.name}(${args})`);
     methodBodies.push(`{`);
     if (m.description) methodBodies.push(`    // ${m.description}`);
     if (m.body && m.body.trim().length > 0) {
@@ -333,7 +435,6 @@ const implCpp = (spec: CoreModuleSpec): string => {
         .join("\n");
       methodBodies.push(indented);
     } else {
-      // Acknowledge args so the body compiles even when empty.
       if (m.args.length > 0) {
         const usage = m.args.map((a) => `(void)${a.name};`).join(" ");
         methodBodies.push(`    ${usage}`);
@@ -346,35 +447,32 @@ const implCpp = (spec: CoreModuleSpec): string => {
 
   const qtIncludes = detected.includes.map((h) => `#include <${h}>`);
 
-  // Constructor / destructor — manage the pimpl when used.
-  const ctorBody: string[] = usesPimpl ? [`    : d(new Private())`] : [];
-  const dtorBody: string[] = usesPimpl ? [`    delete d;`] : [];
-
   return [
     `#include "${id}_impl.h"`,
     ``,
     ...(detected.any ? [`// Qt headers auto-detected from method bodies / state.`] : []),
     ...qtIncludes,
+    ...(wantsLogosJson ? [`#include <logos_json.h>`] : []),
     ``,
     ...(usesPimpl
       ? [
-          `// Private impl — holds state with Qt types so the public header`,
-          `// stays pure C++. AI-generated method bodies access these via`,
-          `// d->m_<name>.`,
+          `// Private impl — holds ALL state (Qt-typed and std-typed alike)`,
+          `// so the public header stays pure C++. Method bodies access these`,
+          `// uniformly via d->m_<name>.`,
           `class ${cls}::Private {`,
           `public:`,
-          ...qtState.map((s) => {
+          ...spec.state.map((s) => {
             const init = s.initial ? `{ ${s.initial} }` : "";
             return `    ${s.cppType} m_${s.name}${init};`;
           }),
           `};`,
           ``,
           `${cls}::${cls}()`,
-          ...ctorBody,
+          `    : d(new Private())`,
           `{}`,
           ``,
           `${cls}::~${cls}() {`,
-          ...dtorBody,
+          `    delete d;`,
           `}`,
         ]
       : [
@@ -382,6 +480,93 @@ const implCpp = (spec: CoreModuleSpec): string => {
           `${cls}::~${cls}() {}`,
         ]),
     ...methodBodies,
+    ...(hasEvents
+      ? [
+          ``,
+          `// emitEvent is wired by the generated dispatch — no definition`,
+          `// needed here. Method bodies invoke it via:`,
+          `//   if (emitEvent) emitEvent("eventName", LogosList{ args... });`,
+        ]
+      : []),
+    ``,
+  ].join("\n");
+};
+
+// ── Unit tests (logos-test-framework) ──────────────────────────────────────
+//
+// We always lay down a minimal tests/ directory so the build pipeline can
+// run `nix build '.#unit-tests'` after the main build succeeds. If the
+// spec.tests array is empty we emit a smoke test that just instantiates
+// the impl class — proves the constructor doesn't crash. AI-provided tests
+// land as additional LOGOS_TEST() blocks.
+
+const testsMain = (): string => [
+  `// Test runner entry point. logos-module-builder picks this up via the`,
+  `// LOGOS_TEST_MAIN() macro and dispatches all LOGOS_TEST() blocks.`,
+  `#include <logos_test.h>`,
+  ``,
+  `LOGOS_TEST_MAIN()`,
+  ``,
+].join("\n");
+
+const testsCpp = (spec: CoreModuleSpec): string => {
+  const id = sanitiseId(spec.id);
+  const cls = `${pascal(id)}Impl`;
+  const aiTests = spec.tests ?? [];
+
+  const lines: string[] = [
+    `// Generated by lgx.guru. AI-authored tests are appended below the`,
+    `// smoke test. The build pipeline runs these after the main module`,
+    `// build; failures feed back to the AI for retry.`,
+    `#include <logos_test.h>`,
+    `#include "../src/${id}_impl.h"`,
+    ``,
+    `// Smoke test — proves the impl class can be constructed and destroyed`,
+    `// without crashing. Always passes for a well-formed module.`,
+    `LOGOS_TEST(${id}_constructs) {`,
+    `    ${cls} impl;`,
+    `    (void)impl;`,
+    `    LOGOS_ASSERT_TRUE(true);`,
+    `}`,
+  ];
+
+  for (const t of aiTests) {
+    lines.push(``);
+    if (t.description) lines.push(`// ${t.description}`);
+    lines.push(`LOGOS_TEST(${t.name}) {`);
+    // Default: instantiate impl as `impl` so the body can poke at it.
+    lines.push(`    ${cls} impl;`);
+    const indented = t.body
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => (line.length === 0 ? "" : `    ${line}`))
+      .join("\n");
+    lines.push(indented);
+    lines.push(`}`);
+  }
+
+  lines.push(``);
+  return lines.join("\n");
+};
+
+const testsCMake = (spec: CoreModuleSpec): string => {
+  const id = sanitiseId(spec.id);
+  return [
+    `cmake_minimum_required(VERSION 3.14)`,
+    `project(${pascal(id)}Tests LANGUAGES CXX)`,
+    ``,
+    `# logos-module-builder auto-detects this file and creates the`,
+    `# checks.<system>.unit-tests + packages.<system>.unit-tests targets.`,
+    `# Run with \`nix build '.#unit-tests' -L\`.`,
+    `include(LogosTest)`,
+    ``,
+    `logos_test(`,
+    `    NAME ${id}_tests`,
+    `    MODULE_SOURCES ../src/${id}_impl.cpp`,
+    `    TEST_SOURCES`,
+    `        main.cpp`,
+    `        test_${id}.cpp`,
+    `)`,
     ``,
   ].join("\n");
 };
@@ -439,6 +624,12 @@ export function generateCoreModuleFiles(spec: CoreModuleSpec): CodegenFile[] {
     { path: "CMakeLists.txt",         data: text(cmakeLists(spec)) },
     { path: `src/${id}_impl.h`,       data: text(implHeader(spec)) },
     { path: `src/${id}_impl.cpp`,     data: text(implCpp(spec)) },
+    // Always emit a tests/ directory. logos-module-builder auto-detects
+    // it and exposes `nix build '.#unit-tests'`. The build pipeline runs
+    // this after the lib build to catch semantic bugs the compiler can't.
+    { path: "tests/main.cpp",         data: text(testsMain()) },
+    { path: `tests/test_${id}.cpp`,   data: text(testsCpp(spec)) },
+    { path: "tests/CMakeLists.txt",   data: text(testsCMake(spec)) },
     { path: "README.md",              data: text(readme(spec)) },
   ];
 }

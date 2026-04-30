@@ -8,6 +8,7 @@
 import OpenAI from "openai";
 import type { NextRequest } from "next/server";
 import { applyPatch, type Operation } from "fast-json-patch";
+import { renderUnwiredAdvisory, validateModuleRefs } from "../../lib/validateModuleRefs";
 import { MODULE_CATALOG } from "../../modules/catalog";
 import { buildCoreModule, type BuildResult } from "../../lib/buildModule";
 import type { AppState, CoreModuleSpec, ModuleSpec } from "../../types";
@@ -94,7 +95,19 @@ Canonical multi-step pattern when the user wants to build AND wire ("build a lon
 1. Call \`build_backend_module\` first. The tool result will include the new module's methods and events.
 2. Then call \`apply_patch\` to wire the UI to those methods/events: add a variable, add the moduleEvent + appStart triggers, replace the target Text's binding.
 
-Stop calling tools (return no tool_calls) once the request is fully addressed. You can also call apply_patch alone, multiple apply_patches if appropriate, or build_backend_module alone — the loop adapts.
+# Wiring obligation — buttons must DO something
+After \`build_backend_module\` succeeds, every existing Button on the canvas must be wired. The tool result includes a \`next_steps\` advisory that lists every unwired Button (one whose \`onClick\` is missing or \`{ kind: "none" }\`) along with the available backend methods. **You MUST emit a follow-up \`apply_patch\` that wires each listed Button** — typically:
+- \`Start\` button → \`{ kind: "callModule", moduleId: "<core id>", method: "<start method>", args: [] }\`
+- \`Stop\`  button → \`{ kind: "callModule", moduleId: "<core id>", method: "<stop method>",  args: [] }\`
+- "Update / refresh / show" button → \`{ kind: "callModuleToVariable", varId: "<v_id>", moduleId: "<core id>", method: "<getter>", args: [] }\`
+
+For values that **change over time** (a stopwatch ticking, a polled price), also add an \`interval\` trigger that re-pulls the value every N ms — see the "Show LIVE data" pattern below. Without that, the button runs the C++ correctly but the UI display never updates and the widget looks broken.
+
+The same wiring obligation applies after \`apply_patch\` itself: if a patch added new Buttons but left them with no \`onClick\`, the next \`apply_patch\` must wire them. The server's \`next_steps\` advisory will keep telling you they're unwired until you do.
+
+Only set \`onClick: { kind: "none" }\` if a Button is **intentionally decorative** (e.g. a label styled as a button). Never leave a Button looking interactive but doing nothing.
+
+Stop calling tools (return no tool_calls) once the request is fully addressed AND every Button is wired. You can also call apply_patch alone, multiple apply_patches if appropriate, or build_backend_module alone — the loop adapts.
 
 When you stop, the user gets a summary aggregated from each tool's summary line, so make sure each summary is concrete and one sentence.
 
@@ -137,6 +150,7 @@ When you stop, the user gets a summary aggregated from each tool's summary line,
 
 # Trigger kinds
 - "appStart" — fires when widget loads. Use for initial fetch / setup.
+- "interval" — fires every \`intervalMs\` milliseconds while the widget is open. Required field: \`intervalMs\` (positive integer). Use this for **polling** any module getter, stopwatch ticks, periodic UI refreshes — anywhere you need "happen every N ms". Without an interval trigger, callModule getters fire once and never refresh, and the UI looks frozen.
 - "moduleEvent" — fires when a module emits an event. moduleId + eventName required. Inside actions, data[0], data[1], ... reference the event payload fields in declared order.
 - "onMessageReceived" — delivery_module messages. topic required. Inside actions, payload + topic in scope.
 
@@ -159,6 +173,22 @@ Path syntax: JSON Pointer. Use "/-" suffix to append to an array (e.g. "/variabl
 1. Add variable as above
 2. Add appStart trigger with callModuleToVariable action: { id, kind: "appStart", actions: [{ kind: "callModuleToVariable", varId, moduleId, method, args: [] }] }
 3. Set Text binding
+
+## Show LIVE data from a module getter (stopwatch tick, periodic poll, anything that changes over time)
+A single appStart \`callModuleToVariable\` only fires once. For values that **change over time** — stopwatch elapsed ms, fetched price, anything the C++ updates internally — you MUST also add an \`interval\` trigger that re-pulls the value every N ms. Without this, pressing Start runs \`start()\` correctly but the UI looks frozen because nothing re-reads \`getElapsedMs()\`.
+1. Add variable: { op: "add", path: "/variables/-", value: { id: "v_<random>", name: "elapsedMs", type: "number", initial: "0" } }
+2. Add interval trigger: { op: "add", path: "/triggers/-", value: { id: "t_<random>", kind: "interval", intervalMs: 100, actions: [{ kind: "callModuleToVariable", varId: "<v_id>", moduleId: "<core id>", method: "getElapsedMs", args: [] }] } }
+3. Bind a Text node's binding to the variable so it auto-updates as the timer ticks.
+
+## moduleId AND method — both exact-match, no guessing
+Every \`callModule\` / \`callModuleToVariable\` action and every \`moduleEvent\` trigger requires BOTH a \`moduleId\` and a \`method\` (or \`eventName\`) that EXACTLY match what's listed in \`# Available modules\` below. The server validates every patch and rejects any reference whose id or method isn't found — your tool result will come back with \`{ ok: false, error: "method 'start' not found on 'stopwatch_core'. Available methods: 'startStopwatch', 'stopStopwatch', ..." }\`. When that happens, fix the call and resubmit.
+
+Common mistakes to avoid:
+- Inventing module-id variants: "stopwatch" when the core's id is "stopwatch_core"; "logos_stopwatch" when it's just "stopwatch_core".
+- Inventing method-name variants: "start" when the method is "startStopwatch"; "getElapsed" when it's "elapsedValue"; "fetch" when it's "refreshWeather".
+- Inventing methods that don't exist at all. If the user's request needs a method the module doesn't expose, either (a) call \`build_backend_module\` again with the new method added, or (b) compose existing methods at the UI layer.
+
+The id and the methods are the EXACT strings from the module's docs section. Copy them character-for-character.
 
 ## Wire a button click to update a variable
 { op: "replace", path: "/pages/0/root/children/<n>/onClick", value: { kind: "setVariable", varId, value: "<expression>", mode: "expression" } }
@@ -205,9 +235,7 @@ The spec's argument/return types map to standard C++:
 
 ## State
 
-Each \`state\` field becomes a private member of the impl class:
-- If \`cppType\` is a standard C++ type (\`std::string\`, \`int\`, \`std::vector<…>\`): member of \`<Pascal(id)>Impl\` directly. Access in bodies as \`m_<name>\`.
-- If \`cppType\` is a Qt type (anything starting with \`Q\`): codegen places it inside a private \`Private\` pimpl class to keep the .h pure C++. **Access in bodies as \`d->m_<name>\`** instead of \`m_<name>\`.
+Every \`state\` field — Qt-typed (\`QString\`, \`QNetworkAccessManager\`) and std-typed (\`bool\`, \`int64_t\`, \`std::string\`, \`std::vector<…>\`) alike — lives inside the codegen-emitted private \`Private\` pimpl class in the .cpp. Access in bodies is **uniform**: always \`d->m_<name>\`. Never write \`m_<name>\` standalone — that field is in Private, not on the impl class itself, and the build will fail with "no member named 'm_X'".
 
 ## Method bodies (the \`body\` field)
 
@@ -221,9 +249,9 @@ Spliced verbatim into the .cpp. You can use Qt freely (QNetworkAccessManager, QJ
 
 Shipped Basecamp's \`logos.callModule\` is the ONLY reliable C++→QML data path. \`onModuleEvent\` exists in the in-browser editor preview but is a no-op in real Basecamp. So:
 
-1. Cache the latest value in state (\`QString m_last\` in Private, or \`std::string m_last\`).
-2. Update m_last whenever fresh data arrives (sync return, async network reply, etc.).
-3. Expose a synchronous getter, e.g. \`std::string lastX()\` returning the cached value.
+1. Cache the latest value in state (\`QString m_last\` or \`std::string m_last\` — both go in Private regardless).
+2. Update \`d->m_last\` whenever fresh data arrives (sync return, async network reply, etc.).
+3. Expose a synchronous getter, e.g. \`std::string lastX()\` returning \`d->m_last.toStdString()\` (or the cached value directly).
 4. The QML side polls the getter via \`logos.callModule(...)\` and stores the result in a variable.
 
 For network-fetching modules, the canonical shape is:
@@ -239,16 +267,101 @@ The dispatch chain double-encodes UTF-8 somewhere along the std::string round tr
 
 ## Network fetches
 
-Use \`QNetworkAccessManager\` async with a connect-to-finished lambda. Never block. On reply success, parse the body and set m_last. Optionally also \`emit eventResponse(...)\` for editor-preview parity — but the production read path is the getter + QML polling.
+Use \`QNetworkAccessManager\` async with a connect-to-finished lambda. Never block. On reply success, parse the body and assign \`d->m_last\`. Optionally also \`emit eventResponse(...)\` for editor-preview parity — but the production read path is the getter + QML polling.
 
-- For modules whose state needs Qt's event loop (QNetworkAccessManager, QTimer): declare \`Private\` state and let codegen place the Qt-typed members inside the pimpl.
+- All state — Qt-typed (\`QNetworkAccessManager\`, \`QTimer\`, \`QString\`) and std-typed (\`bool\`, \`int64_t\`) — goes in \`Private\` and is accessed as \`d->m_<name>\`.
 - Methods can also instantiate Qt objects locally: \`QNetworkAccessManager mgr; auto* reply = mgr.get(...);\` etc.
+
+## Module composition rules — READ BEFORE BUILDING A MODULE
+
+**Custom C++ modules are SELF-CONTAINED.** They cannot call other modules from inside their bodies. There is NO working LogosAPI / m_api / inter-module-call hook available to AI-built modules right now. Bodies that reference \`m_api\`, \`LogosAPI\`, or \`->callModule(\` will be rejected by the build pipeline before nix even runs.
+
+Composition between modules happens at the **UI layer** (QML), not the C++ layer. The UI's \`logos.callModule(...)\` works fine for any installed module — delivery_module, storage_module, accounts_module, capability_module, your custom module, all of them.
+
+### Decision tree: when the user describes an app that "uses" multiple modules
+
+1. **Can this be done with the UI alone?** (Buttons calling \`callModule\`, triggers reacting to \`moduleEvent\`, variables binding to method results.) → YES for >90% of cases. **Don't build a backend module.** Use \`apply_patch\` to wire the UI directly.
+2. **Does this genuinely need new C++ logic** (parsing custom data formats, complex state machines, network fetches with parse logic)? → Build a **self-contained** module: it accepts inputs as method args, returns results, holds private state. No upstream module calls.
+3. **Does the user want a backend that orchestrates two upstream modules** (e.g. *"a backend that listens for delivery_module messages, processes them, and stores via storage_module"*)? → Compose at the UI: trigger on \`delivery_module.messageReceived\` → call your custom \`process(message) → string\` → call \`storage_module.save(key, processed)\`.
+
+### Concrete examples
+
+| User intent | Path |
+|---|---|
+| *"Show London time in this label"* | \`build_backend_module\` → self-contained \`london_weather\` (network fetch, no deps) + \`apply_patch\` to wire UI |
+| *"Chat app using delivery"* | \`apply_patch\` only — UI calls \`delivery_module.send\` + trigger on \`messageReceived\` |
+| *"Profanity filter on incoming chat"* | \`build_backend_module\` → self-contained \`profanity_filter\` with \`clean(text) → string\`. UI: moduleEvent on \`delivery_module.messageReceived\` → callModule \`profanity_filter.clean(data[0])\` → display result |
+| *"Save my todos to disk"* | \`apply_patch\` only — UI button calls \`storage_module.save\`, list refreshes from \`storage_module.load\` |
+| *"Aggregate weather from 3 APIs and average them"* | \`build_backend_module\` → self-contained \`weather_aggregator\` that fetches all 3 internally and exposes one \`getAverage()\` method |
+
+### Hard ban (will fail the build)
+
+Method bodies that reference any of the following are rejected before nix runs:
+- \`m_api\` (no such field in our codegen)
+- \`LogosAPI\` / \`LogosResult\`
+- \`->callModule(\` / \`callRemoteMethod\`
+
+If the user asks for something that seems to require inter-module C++ calls, restructure as: *backend exposes the standalone primitive; UI does the orchestration*.
+
+The \`dependencies\` field on the spec is still useful — it gets written to metadata.json and the flake — but currently it's just metadata for the package manager. The C++ side cannot call those deps yet.
+
+## Pushing events back to QML (the \`events\` field)
+
+When the spec has events, the codegen declares \`std::function<void(const std::string&, LogosList)> emitEvent;\` on the impl class. The generator wires this to LogosProviderBase::emitEvent at build time — calling it from a method body fires the event to QML for real (no longer preview-only):
+
+\`\`\`cpp
+if (emitEvent) {
+  emitEvent("temperatureUpdated", LogosList{ tempStdString });
+}
+\`\`\`
+
+Still: declare every event you emit in \`events[]\` so the editor's trigger picker shows it, and prefer the cache-and-poll pattern when QML refresh latency isn't critical (events are best-effort, polling is reliable).
+
+## Richer C++ types (cppType / cppReturn)
+
+The spec types map to C++ as: string→\`const std::string&\`/\`std::string\`, number→\`double\`, boolean→\`bool\`. For richer payloads, set \`cppType\` on an arg or \`cppReturn\` on a method:
+
+| Use case | cppType / cppReturn value | Maps to (Qt) |
+|---|---|---|
+| List of strings | \`std::vector<std::string>\` | \`QStringList\` |
+| Byte array / blob | \`std::vector<uint8_t>\` | \`QByteArray\` |
+| Explicit signed int | \`int64_t\` | \`int\` |
+| Explicit unsigned int | \`uint64_t\` | \`int\` |
+| List of ints | \`std::vector<int64_t>\` | \`QVariantList\` |
+| Structured JSON object | \`LogosMap\` | \`QVariantMap\` |
+| Heterogeneous list | \`LogosList\` | \`QVariantList\` |
+
+\`LogosMap\` and \`LogosList\` come from \`<logos_json.h>\` (nlohmann::json aliases) — codegen auto-includes that header when these types appear. Use them to return whole structured payloads natively instead of hand-rolling JSON strings:
+
+\`\`\`cpp
+// Method with cppReturn: "LogosMap"
+LogosMap result;
+result["temperature"] = 14.2;
+result["conditions"] = "rainy";
+result["humidity"] = 65;
+return result;
+\`\`\`
+
+## Tests (highly encouraged)
+
+The codegen emits a \`tests/\` directory wired into \`logos-test-framework\`. Provide test cases via the spec's \`tests[]\` array — each becomes a \`LOGOS_TEST(name) {...}\` block. The build pipeline runs \`nix build '.#unit-tests'\` after the main build; failures feed back to you with phase:"tests" so you know to fix the body or the assertion (not the compile).
+
+Example test body (the codegen pre-instantiates the impl as \`impl\` at the top of the block):
+
+\`\`\`cpp
+LOGOS_ASSERT_FALSE(impl.lastWeather().empty());
+impl.refreshWeather();
+LOGOS_ASSERT_TRUE(impl.lastWeather().find("Loading") == 0);
+\`\`\`
+
+Available macros: \`LOGOS_ASSERT_TRUE\`, \`LOGOS_ASSERT_FALSE\`, \`LOGOS_ASSERT_EQ(a, b)\`. Tests should be hermetic — no network, no sleeps. For network-fetching modules, test the parsing logic by feeding fixture JSON into a helper, not by hitting the live API.
 
 ## Hard rules
 - Always call build_backend_module with a complete spec when the user asks for backend behavior.
 - Public method signatures in your spec are translated to standard C++ types — never assume QString in your body's *return value*; convert before returning.
 - Method body is real C++ spliced into the .cpp; no signature, just the statements.
 - Method descriptions are user-facing; speak to the no-coder, not the C++ reviewer.
+- Add at least one unit test when the module's behaviour is non-trivial. Tests don't have to be exhaustive — even one assertion catches the most common semantic regressions on subsequent rebuilds.
 
 # Available modules
 
@@ -296,7 +409,12 @@ const BUILD_BACKEND_MODULE_TOOL: OpenAI.ChatCompletionTool = {
   function: {
     name: "build_backend_module",
     description:
-      "Generate a complete CoreModuleSpec and compile it. Call this only when the user's request requires custom backend logic that no existing module exposes — e.g. fetching from a URL, custom data transformation, stateful protocol logic. The host runs the nix build and replaces /coreModule on success. Each call replaces any existing module wholesale; preserve previous methods if the user asked to extend.",
+      "Generate a complete CoreModuleSpec for a SELF-CONTAINED universal C++ module and compile it. " +
+      "Modules built here CANNOT call other modules from inside their C++ — there is no LogosAPI / m_api / callModule hook available. " +
+      "Use this only when the request needs new C++ logic that the UI can't compose itself — e.g. network fetches with parsing, custom data transformations, stateful computations, format conversions. " +
+      "If the user wants behaviour that combines multiple modules (delivery + storage, etc.), compose at the UI layer via apply_patch (callModule actions on buttons, moduleEvent triggers) — DO NOT try to do it from inside C++. " +
+      "Method bodies that reference m_api, LogosAPI, or ->callModule will be rejected before nix even runs. " +
+      "The host runs the nix build (lgx-portable + unit-tests) and replaces /coreModule on success.",
     parameters: {
       type: "object",
       properties: {
@@ -338,12 +456,20 @@ const BUILD_BACKEND_MODULE_TOOL: OpenAI.ChatCompletionTool = {
                     name: { type: "string" },
                     type: { type: "string", enum: ["string", "number", "boolean"] },
                     description: { type: "string" },
+                    cppType: {
+                      type: "string",
+                      description: "Optional richer C++ argument type. Default mapping is string→const std::string&, number→double, boolean→bool. Set this for: 'std::vector<std::string>', 'std::vector<uint8_t>' (byte arrays), 'int64_t', 'uint64_t', 'LogosMap', 'LogosList'.",
+                    },
                   },
                   required: ["name", "type"],
                   additionalProperties: false,
                 },
               },
               returns: { type: "string", enum: ["string", "number", "boolean", "void"] },
+              cppReturn: {
+                type: "string",
+                description: "Optional richer C++ return type (overrides `returns`). Use 'std::vector<std::string>' for string arrays, 'LogosMap' for structured JSON objects, 'LogosList' for arrays of mixed values, 'int64_t'/'uint64_t' for explicit integers.",
+              },
               description: { type: "string" },
               body: { type: "string", description: "Real C++ body spliced into the .cpp file. Statements only — no signature, no surrounding braces." },
             },
@@ -353,6 +479,7 @@ const BUILD_BACKEND_MODULE_TOOL: OpenAI.ChatCompletionTool = {
         },
         events: {
           type: "array",
+          description: "Events this module emits. Codegen wires the impl class with `std::function<void(const std::string&, LogosList)> emitEvent;` — call it from method bodies to push values back to QML.",
           items: {
             type: "object",
             properties: {
@@ -372,6 +499,23 @@ const BUILD_BACKEND_MODULE_TOOL: OpenAI.ChatCompletionTool = {
               description: { type: "string" },
             },
             required: ["name", "data"],
+            additionalProperties: false,
+          },
+        },
+        tests: {
+          type: "array",
+          description: "Optional unit tests. Each becomes a LOGOS_TEST(name) {...} block in tests/test_<id>.cpp. The build pipeline runs `nix build '.#unit-tests'` after the main build; assertion failures feed back to you for retry, same as compile errors. Highly encouraged when method behaviour is non-trivial — catches semantic bugs the compiler can't.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "snake_case test name, becomes LOGOS_TEST(name)." },
+              description: { type: "string" },
+              body: {
+                type: "string",
+                description: "Raw C++ statements. The codegen pre-instantiates the impl as `<Pascal(id)>Impl impl;` at the start of the block — your body should call methods on `impl` and use LOGOS_ASSERT_TRUE / LOGOS_ASSERT_FALSE / LOGOS_ASSERT_EQ macros from <logos_test.h>.",
+              },
+            },
+            required: ["name", "body"],
             additionalProperties: false,
           },
         },
@@ -506,19 +650,48 @@ export async function POST(request: NextRequest) {
             continue;
           }
           try {
+            const prevApp = workingApp;
             const result = applyPatch(
-              workingApp,
+              prevApp,
               payload.operations,
               true,
               false,
             );
-            workingApp = result.newDocument as AppState;
+            const candidate = result.newDocument as AppState;
+            // Validate every NEW callModule / callModuleToVariable / moduleEvent
+            // reference against the primitives catalog + the user's coreModule.
+            // Catches the AI inventing method names (the stopwatch failure)
+            // BEFORE the patch is committed, so the AI sees the error in this
+            // loop iteration and self-corrects in-conversation instead of the
+            // user discovering a dead button after Basecamp install.
+            const valid = validateModuleRefs(candidate, prevApp);
+            if (!valid.ok) {
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify({
+                  ok: false,
+                  error: "Patch references unknown module ids or methods. Fix and resubmit:\n" + valid.errors.join("\n"),
+                  operations: payload.operations,
+                }),
+              });
+              continue;
+            }
+            workingApp = candidate;
             allOperations.push(...payload.operations);
             summaries.push(payload.summary);
+            // Advisory: surface unwired buttons + available backend methods
+            // so the AI proactively wires them in the next loop iteration
+            // instead of shipping interactive-looking widgets that do nothing.
+            const advisory = renderUnwiredAdvisory(candidate);
             messages.push({
               role: "tool",
               tool_call_id: tc.id,
-              content: JSON.stringify({ ok: true, summary: payload.summary }),
+              content: JSON.stringify({
+                ok: true,
+                summary: payload.summary,
+                ...(advisory ? { next_steps: advisory } : {}),
+              }),
             });
           } catch (err) {
             const msg = err instanceof Error ? err.message : "patch failed";
@@ -576,7 +749,12 @@ export async function POST(request: NextRequest) {
               buildHappened = true;
               succeeded = true;
               // Tool result includes the new spec so the AI can wire to its
-              // methods/events on the next loop iteration.
+              // methods/events on the next loop iteration. We also surface
+              // every Button on the canvas that has no onClick — the AI is
+              // expected to wire those in a follow-up apply_patch (otherwise
+              // the user gets a stopwatch-style "buttons that do nothing"
+              // experience).
+              const advisory = renderUnwiredAdvisory(workingApp);
               messages.push({
                 role: "tool",
                 tool_call_id: lastToolCallId,
@@ -592,10 +770,18 @@ export async function POST(request: NextRequest) {
                     })),
                     events: spec.events ?? [],
                   },
+                  ...(advisory ? { next_steps: advisory } : {}),
                 }),
               });
               break;
             }
+
+            // lastBuild is a BuildFailure here (we checked !ok above).
+            const failPhase = (lastBuild && !lastBuild.ok) ? lastBuild.phase : "compile";
+            const failureKey = failPhase === "tests" ? "test_failures" : "compile_errors";
+            const failureMsg = failPhase === "tests"
+              ? "Unit tests failed (the module compiled but assertions / test cases didn't pass). Read the failing assertions and adjust either the method bodies or the test expectations, then call build_backend_module again."
+              : "Build failed. Read compiler errors and call build_backend_module again with a corrected spec.";
 
             if (attempt >= MAX_BUILD_RETRIES) {
               messages.push({
@@ -603,24 +789,25 @@ export async function POST(request: NextRequest) {
                 tool_call_id: lastToolCallId,
                 content: JSON.stringify({
                   ok: false,
+                  phase: failPhase,
                   error: `Build failed after ${attempt} attempts.`,
-                  compile_errors: lastBuild.errors,
+                  [failureKey]: lastBuild.errors,
                   stderr_tail: lastBuild.stderrTail,
                 }),
               });
               break;
             }
 
-            // Compile failed but we have retries left. Push the error as a
-            // tool result, then ask the AI for a fresh build_backend_module
-            // call with corrections.
+            // Push the error as a tool result, then ask the AI for a fresh
+            // build_backend_module call with corrections.
             messages.push({
               role: "tool",
               tool_call_id: lastToolCallId,
               content: JSON.stringify({
                 ok: false,
-                message: "Build failed. Read compiler errors and call build_backend_module again with a corrected spec.",
-                compile_errors: lastBuild.errors,
+                phase: failPhase,
+                message: failureMsg,
+                [failureKey]: lastBuild.errors,
                 stderr_tail: lastBuild.stderrTail,
               }),
             });

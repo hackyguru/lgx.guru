@@ -29,10 +29,16 @@ export interface BuildSuccess {
   lgxPath: string;       // server-side cached path
   storePath: string;     // /nix/store/... — for debugging
   durationMs: number;
+  // Set when the unit-test phase ran. ok=true means tests passed.
+  // Skipped (undefined) when the framework didn't expose a `unit-tests`
+  // attribute (older module-builder versions, or a flake variant).
+  tests?: { ok: true; durationMs: number } | { ok: false; errors: string[]; stderrTail: string; durationMs: number };
 }
 export interface BuildFailure {
   ok: false;
-  errors: string[];      // parsed `error: ...` lines
+  // Which phase failed: the main module compile, or the unit-tests build/run.
+  phase: "compile" | "tests";
+  errors: string[];      // parsed `error: ...` lines (or test-failure lines)
   stderrTail: string;    // last few lines of stderr for debugging
   durationMs: number;
 }
@@ -53,47 +59,127 @@ export async function writeModuleSource(spec: CoreModuleSpec): Promise<string> {
   return dir;
 }
 
+// Pre-flight lint: reject specs whose method bodies use the
+// not-yet-supported inter-module-call surface (LogosAPI / m_api /
+// callModule). Catches them in milliseconds instead of letting nix run
+// for minutes only to fail with cryptic compiler errors. The error
+// messages are tuned so the AI can self-correct in one retry.
+function lintBodies(spec: CoreModuleSpec): string[] {
+  const issues: string[] = [];
+  for (const m of spec.methods) {
+    const body = m.body ?? "";
+    if (/\bm_api\b/.test(body)) {
+      issues.push(
+        `Method ${m.name}: references m_api. Custom universal modules don't have a LogosAPI hook — they're SELF-CONTAINED. ` +
+        `Move cross-module orchestration to the UI layer (callModule actions on buttons, moduleEvent triggers) instead.`
+      );
+    }
+    if (/\bLogosAPI\b/.test(body) || /\bLogosResult\b/.test(body)) {
+      issues.push(
+        `Method ${m.name}: references LogosAPI/LogosResult. The LogosAPI surface isn't exposed in lgx.guru-built modules. ` +
+        `Make this method a self-contained pure function (or use std::* / Qt internals like QNetworkAccessManager). ` +
+        `If the user wanted cross-module behavior, that belongs in the UI layer.`
+      );
+    }
+    if (/->\s*callModule\b/.test(body) || /\bcallRemoteMethod\b/.test(body)) {
+      issues.push(
+        `Method ${m.name}: tries to call another module from inside C++ (callModule / callRemoteMethod). ` +
+        `Not supported — restructure so this method does its work standalone, and have the UI do the cross-module orchestration.`
+      );
+    }
+  }
+  return issues;
+}
+
 export async function buildCoreModule(spec: CoreModuleSpec): Promise<BuildResult> {
   const startedAt = Date.now();
+
+  // Cheap pre-flight: bail out with a clear message before invoking nix
+  // if the AI tried to call other modules from C++.
+  const lintIssues = lintBodies(spec);
+  if (lintIssues.length > 0) {
+    return {
+      ok: false,
+      phase: "compile",
+      errors: lintIssues,
+      stderrTail: "lgx.guru pre-flight lint: cross-module C++ calls aren't supported. Module must be self-contained; compose at the UI layer.",
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
   const dir = await writeModuleSource(spec);
-  const { code, stdout, stderr } = await runNixBuild(dir);
-  const durationMs = Date.now() - startedAt;
+  const { code, stdout, stderr } = await runNixBuild(dir, ".#lgx-portable");
+  const compileMs = Date.now() - startedAt;
 
   if (code !== 0) {
-    return { ok: false, errors: parseCompileErrors(stderr), stderrTail: tail(stderr, 40), durationMs };
+    return { ok: false, phase: "compile", errors: parseCompileErrors(stderr), stderrTail: tail(stderr, 40), durationMs: compileMs };
   }
 
   const storePath = stdout.trim().split("\n").filter(Boolean)[0];
   if (!storePath) {
-    return { ok: false, errors: ["nix build returned no output path"], stderrTail: tail(stderr, 40), durationMs };
+    return { ok: false, phase: "compile", errors: ["nix build returned no output path"], stderrTail: tail(stderr, 40), durationMs: compileMs };
   }
 
   let entries: string[];
   try {
     entries = await readdir(storePath);
   } catch (err) {
-    return { ok: false, errors: [`could not read build output ${storePath}: ${(err as Error).message}`], stderrTail: tail(stderr, 40), durationMs };
+    return { ok: false, phase: "compile", errors: [`could not read build output ${storePath}: ${(err as Error).message}`], stderrTail: tail(stderr, 40), durationMs: compileMs };
   }
   const lgx = entries.find((f) => f.endsWith(".lgx"));
   if (!lgx) {
-    return { ok: false, errors: [`no .lgx artifact in build output (saw: ${entries.join(", ") || "empty"})`], stderrTail: tail(stderr, 40), durationMs };
+    return { ok: false, phase: "compile", errors: [`no .lgx artifact in build output (saw: ${entries.join(", ") || "empty"})`], stderrTail: tail(stderr, 40), durationMs: compileMs };
   }
 
   // Copy out so a future nix-store --gc doesn't reclaim the artifact and
-  // so /api/built-module/[id] has a stable path to serve from. Two
-  // gotchas: nix store files are mode 444, and Node's copyFile preserves
-  // the source mode — so without unlinking first, the second build trips
-  // EACCES trying to overwrite the read-only cache file. Unlink + chmod
-  // makes overwrites safe regardless of the source's mode bits.
+  // so /api/built-module/[id] has a stable path to serve from.
   const cachePath = cachePathFor(spec.id);
   try { await unlink(cachePath); } catch { /* ENOENT on first build */ }
   await copyFile(path.join(storePath, lgx), cachePath);
   try { await chmod(cachePath, 0o644); } catch { /* best effort */ }
 
-  return { ok: true, lgxPath: cachePath, storePath, durationMs };
+  // ── Unit tests phase ────────────────────────────────────────────────────
+  // The codegen always emits a tests/ dir, so logos-module-builder exposes
+  // .#unit-tests as a flake output. We run it after the main build to
+  // catch semantic bugs the compiler can't (assertion failures, wrong
+  // return values, broken state transitions). Failures are surfaced with
+  // phase:"tests" so the apply-patch retry loop can show them as test
+  // errors specifically rather than compile errors.
+  const testsStart = Date.now();
+  const testsResult = await runNixBuild(dir, ".#unit-tests");
+  const testsMs = Date.now() - testsStart;
+
+  if (testsResult.code !== 0) {
+    // Distinguish "tests target doesn't exist" (older module-builder, or
+    // edge cases) from real test failures. Skipping is safer than failing
+    // a successful module build over a missing target.
+    if (/(unrecognized argument|attribute .*missing|does not provide|has no attribute).*unit-tests/i.test(testsResult.stderr)) {
+      return {
+        ok: true,
+        lgxPath: cachePath,
+        storePath,
+        durationMs: compileMs + testsMs,
+      };
+    }
+    return {
+      ok: false,
+      phase: "tests",
+      errors: parseTestFailures(testsResult.stderr),
+      stderrTail: tail(testsResult.stderr, 60),
+      durationMs: compileMs + testsMs,
+    };
+  }
+
+  return {
+    ok: true,
+    lgxPath: cachePath,
+    storePath,
+    durationMs: compileMs + testsMs,
+    tests: { ok: true, durationMs: testsMs },
+  };
 }
 
-function runNixBuild(dir: string): Promise<{ code: number; stdout: string; stderr: string }> {
+function runNixBuild(dir: string, target: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     // Pin PATH explicitly so `nix` resolves even when the dev server was
     // launched without the user's full shell PATH (some IDE-launched dev
@@ -112,7 +198,7 @@ function runNixBuild(dir: string): Promise<{ code: number; stdout: string; stder
         // still resolves the .#<output> attribute syntax.
         "--extra-experimental-features", "nix-command flakes",
         "build",
-        ".#lgx-portable",
+        target,
         "--no-link",
         "--print-out-paths",
       ],
@@ -166,6 +252,30 @@ function parseCompileErrors(stderr: string): string[] {
 
 function tail(s: string, n: number): string {
   return s.split("\n").slice(-n).join("\n");
+}
+
+// Pull failed-assertion lines out of logos-test-framework's output. The
+// runner prints lines like "FAIL test_name (LOGOS_ASSERT_*)" or
+// "Assertion failed: ..." which we surface to the AI for retry.
+function parseTestFailures(stderr: string): string[] {
+  const lines = stderr.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/\b(FAIL|Assertion failed|expected|got|LOGOS_ASSERT|test failed|abort)\b/i.test(l)) {
+      // Include neighbouring lines for context.
+      const ctx = (i > 0 ? lines[i - 1] + "\n" : "") + l + (i + 1 < lines.length ? "\n" + lines[i + 1] : "");
+      out.push(ctx);
+    }
+  }
+  // Dedupe + cap.
+  const unique = Array.from(new Set(out));
+  if (unique.length > 0) return unique.slice(-10);
+  // Fallback: also try the regular compile-error parser in case tests
+  // didn't compile (LOGOS_ASSERT used wrong, header missing, etc.).
+  const compileErrs = parseCompileErrors(stderr);
+  if (compileErrs.length > 0) return compileErrs.slice(-10);
+  return [tail(stderr, 30)];
 }
 
 export async function readBuiltLgx(id: string): Promise<Buffer | null> {

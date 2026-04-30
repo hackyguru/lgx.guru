@@ -491,6 +491,14 @@ export interface ModuleParam {
   name: string;
   type: ParamType;
   description?: string;
+  // Optional C++-level type override. The codegen normally maps ParamType
+  // to std::string / double / bool, which the universal-module generator
+  // wraps for QML/IPC. Setting cppType lets a CoreMethod arg use richer
+  // types — std::vector<std::string>, std::vector<uint8_t>, LogosMap,
+  // LogosList, int64_t, uint64_t — so AI-built modules can return/accept
+  // arrays, byte blobs, and structured JSON without round-tripping
+  // through bare strings. Display in the inspector still uses ParamType.
+  cppType?: string;
 }
 export interface ModuleMethod {
   name: string;
@@ -538,6 +546,20 @@ export interface CoreMethod {
   // the .cpp instead of the TODO stub. Lets users iterate on the C++
   // without leaving the editor.
   body?: string;
+  // Optional C++ return-type override. Same role as ModuleParam.cppType:
+  // unlocks std::vector<…>, LogosMap, LogosList, int64_t, etc. Defaults
+  // to the standard ParamType mapping when unset.
+  cppReturn?: string;
+}
+
+// One unit test for a custom module. Spliced into tests/test_<id>.cpp
+// inside a LOGOS_TEST(name) { body } block. The body has access to the
+// impl class as `<Pascal(id)>Impl impl;` (constructed at the start) and
+// can use LOGOS_ASSERT_* macros from <logos_test.h>.
+export interface CoreModuleTest {
+  name: string;            // identifier (snake_case) — becomes LOGOS_TEST(name)
+  body: string;            // raw C++ statements
+  description?: string;
 }
 
 // User-defined private state field on the C++ plugin class. `cppType` is
@@ -562,10 +584,17 @@ export interface CoreModuleSpec {
   dependencies: string[];
   methods: CoreMethod[];
   state: CoreStateField[];
-  // Events this module emits via `emit eventResponse(...)`. Declared by the
-  // AI when it builds the module so the editor's trigger picker (When module
-  // event happens) and the Modules detail modal can surface them.
+  // Events this module emits. Declared by the AI when it builds the module
+  // so the editor's trigger picker (When module event happens) and the
+  // Modules detail modal can surface them. The codegen wires an emitEvent
+  // callback into the impl class — bodies fire events with
+  // `if (emitEvent) emitEvent("name", LogosList{...});`.
   events?: ModuleEvent[];
+  // Optional unit tests. The codegen lays them down under tests/ and the
+  // build pipeline runs `nix build '.#unit-tests'` after the main build
+  // succeeds; assertion failures feed back to the AI for retry, same as
+  // compile errors.
+  tests?: CoreModuleTest[];
 }
 
 export const newCoreModule = (): CoreModuleSpec => ({
@@ -596,12 +625,14 @@ export const newCoreStateField = (): CoreStateField => ({
 //
 // A trigger fires actions in response to something happening:
 //   - "appStart" — when the widget loads (Component.onCompleted)
+//   - "interval" — every N milliseconds while the widget is open
 //   - "moduleEvent" — when a module emits a named event
+//   - "onMessageReceived" — when a delivery_relay message arrives
 //
 // The action sequence is the same shape we use for Button.onClick, so the
 // editor reuses one editor + qmlEmit also has one renderer for both.
 
-export type TriggerKind = "appStart" | "moduleEvent" | "onMessageReceived";
+export type TriggerKind = "appStart" | "moduleEvent" | "onMessageReceived" | "interval";
 export type TriggerId = string;
 export interface Trigger {
   id: TriggerId;
@@ -613,6 +644,11 @@ export interface Trigger {
   // emitter auto-subscribes to this topic and routes incoming messages to
   // this trigger's actions. Empty topic = match every received message.
   topic?: string;
+  // interval only — fires every intervalMs milliseconds. Use this for
+  // polling: stopwatch tick, periodic core-module getters, etc. Without
+  // this primitive the AI has no clean way to express "poll every N ms"
+  // and tends to inline complex QML expressions that break on parse.
+  intervalMs?: number;
   // The action sequence to run when the trigger fires. Reuses ButtonAction;
   // each entry runs in order. For onMessageReceived, the action block runs
   // with `payload` (decoded text) and `topic` in scope.
@@ -622,6 +658,7 @@ export const newTrigger = (kind: TriggerKind = "appStart"): Trigger => ({
   id: newId(),
   kind,
   actions: [],
+  ...(kind === "interval" ? { intervalMs: 1000 } : {}),
 });
 
 export interface AppState {
