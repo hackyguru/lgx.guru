@@ -204,6 +204,103 @@ describe("List node (Repeater backed by JSON-array variable)", () => {
   });
 });
 
+describe("if (condition) action — composition primitive", () => {
+  it("emits an if-block wrapping nested action statements", () => {
+    resetIds();
+    const counter = mkVar("count", "number", "0");
+    const btn = mkButton({
+      onClick: {
+        kind: "if",
+        condition: "app.var_count > 5",
+        actions: [
+          { kind: "setVariable", varId: counter.id, value: "0", mode: "literal" } as ButtonAction,
+        ],
+      },
+    });
+    const app = mkApp({
+      pages: [mkPage(mkFrame([btn]))],
+      variables: [counter],
+    });
+    app.currentPageId = app.pages[0].id;
+    const qml = emitMainQml(app, true);
+    // Wraps in a guarded if-block; bad expressions don't kill surrounding actions.
+    expect(qml).toContain("try { if (app.var_count > 5) { app.var_count = 0;");
+    expect(qml).toContain("catch(_ifErr)");
+  });
+
+  it("nests if inside if (recursive composition)", () => {
+    resetIds();
+    const a = mkVar("a", "number", "0");
+    const b = mkVar("b", "number", "0");
+    const inner: ButtonAction = {
+      kind: "if",
+      condition: "app.var_a > 0",
+      actions: [
+        { kind: "setVariable", varId: b.id, value: "1", mode: "literal" } as ButtonAction,
+      ],
+    };
+    const btn = mkButton({
+      onClick: {
+        kind: "if",
+        condition: "app.var_a !== app.var_b",
+        actions: [inner],
+      },
+    });
+    const app = mkApp({
+      pages: [mkPage(mkFrame([btn]))],
+      variables: [a, b],
+    });
+    app.currentPageId = app.pages[0].id;
+    const qml = emitMainQml(app, true);
+    // Outer condition appears
+    expect(qml).toContain("if (app.var_a !== app.var_b)");
+    // Inner condition appears nested
+    expect(qml).toContain("if (app.var_a > 0)");
+    // Inner action body is reached
+    expect(qml).toContain("app.var_b = 1");
+  });
+
+  it("treats empty condition as `true` so a freshly-added if block isn't a silent no-op", () => {
+    resetIds();
+    const v = mkVar("flag", "boolean", "false");
+    const btn = mkButton({
+      onClick: {
+        kind: "if",
+        condition: "",
+        actions: [
+          { kind: "setVariable", varId: v.id, value: "true", mode: "literal" } as ButtonAction,
+        ],
+      },
+    });
+    const app = mkApp({
+      pages: [mkPage(mkFrame([btn]))],
+      variables: [v],
+    });
+    app.currentPageId = app.pages[0].id;
+    const qml = emitMainQml(app, true);
+    expect(qml).toContain("if (true)");
+  });
+
+  it("returns null when there are no inner actions (no statement to emit)", () => {
+    resetIds();
+    const btn = mkButton({
+      onClick: {
+        kind: "if",
+        condition: "true",
+        actions: [],
+      },
+    });
+    const app = mkApp({
+      pages: [mkPage(mkFrame([btn]))],
+    });
+    app.currentPageId = app.pages[0].id;
+    const qml = emitMainQml(app, true);
+    // No `if` block makes it through — onClick is null which means no
+    // `onClicked: ...` line on the Button at all.
+    expect(qml).not.toContain("if (true)");
+  });
+});
+
 describe("variable initial values escape correctly", () => {
   it("does not break QML when an initial contains double quotes (e.g. JSON array seed)", () => {
     resetIds();
@@ -340,6 +437,77 @@ describe("Button chrome — Qt default vs custom-styled", () => {
     app.currentPageId = app.pages[0].id;
     const qml = emitMainQml(app, true);
     expect(qml).toContain("background: Item {}");
+  });
+});
+
+describe("callModuleToVariable — captures method return into a variable", () => {
+  it("emits `app.<prop> = logos.callModule(...)` resolving against the user's coreModule", () => {
+    resetIds();
+    const result = mkVar("currentTime", "string", "");
+    const btn = mkButton({
+      onClick: {
+        kind: "callModuleToVariable",
+        varId: result.id,
+        moduleId: "time_fetcher",
+        method: "fetchTime",
+        args: [],
+      },
+    });
+    const app = mkApp({
+      variables: [result],
+      pages: [mkPage(mkFrame([btn]))],
+      // The custom module ships its method spec on the project state so the
+      // emitter can resolve `fetchTime` even though it's not in the static catalog.
+      coreModule: {
+        id: "time_fetcher",
+        name: "time_fetcher",
+        version: "0.1.0",
+        description: "Fetches the current time.",
+        category: "custom",
+        dependencies: [],
+        methods: [
+          { name: "fetchTime", args: [], returns: "string", description: "Get the time", body: "return QString::number(QDateTime::currentMSecsSinceEpoch());" },
+        ],
+        state: [],
+      },
+    });
+    app.currentPageId = app.pages[0].id;
+    const qml = emitMainQml(app, true);
+    expect(qml).toContain(`app.var_currentTime = logos.callModule("time_fetcher", "fetchTime", [])`);
+  });
+
+  it("returns null and emits no onClicked when the target variable is missing", () => {
+    resetIds();
+    const btn = mkButton({
+      onClick: {
+        kind: "callModuleToVariable",
+        varId: "nonexistent",
+        moduleId: "time_fetcher",
+        method: "fetchTime",
+        args: [],
+      },
+    });
+    const app = mkApp({
+      pages: [mkPage(mkFrame([btn]))],
+      coreModule: {
+        id: "time_fetcher",
+        name: "time_fetcher",
+        version: "0.1.0",
+        description: "",
+        category: "custom",
+        dependencies: [],
+        methods: [
+          { name: "fetchTime", args: [], returns: "string", body: "return QString();" },
+        ],
+        state: [],
+      },
+    });
+    app.currentPageId = app.pages[0].id;
+    const qml = emitMainQml(app, true);
+    // Missing varId means the action degrades gracefully — no broken
+    // `app.undefined = ...` slips into QML.
+    expect(qml).not.toContain("app.undefined");
+    expect(qml).not.toContain("logos.callModule(\"time_fetcher\"");
   });
 });
 

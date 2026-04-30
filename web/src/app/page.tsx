@@ -17,6 +17,13 @@ import { readLgx } from "./lgxImport";
 import { TEMPLATES, Template } from "./templates";
 import { generateCoreModuleFiles } from "./codegen/coreModule";
 import { packTarGz } from "./codegen/sourceBundle";
+import { ModuleDetailModal, ModuleInfo } from "./ModuleDetailModal";
+import { AskAIModal } from "./AskAIModal";
+import {
+  getProjectMeta, getProjectState, renameProject, saveProjectState,
+  type ProjectMeta,
+} from "./lib/projects";
+import { suggestKickoffMethod, wireLiveData, type LiveDataSpec } from "./lib/wireLiveData";
 
 // Renderer iframe URL — served by renderer/serve.py on port 8765.
 // Run `python3 renderer/serve.py 8765` from the lgx-builder root.
@@ -313,10 +320,12 @@ const isPng = (u8: Uint8Array) =>
 // Versioned so we can migrate later. iconPng is base64-encoded since
 // Uint8Array doesn't survive JSON.stringify.
 
-const SAVE_KEY = "lgx.guru/v1/save";
+// SaveState versioning is for the *contents* of a single project (page tree
+// migration etc.). Multi-project persistence sits one layer above this in
+// lib/projects.ts — each project is its own SaveState entry.
 
-// v2 = multi-page format. v1 = legacy single-root; loadFromStorage migrates
-// it to v2 on read by wrapping the root in a single "Home" page.
+// v2 = multi-page format. v1 = legacy single-root; migrateSave() lifts it
+// to v2 by wrapping the root in a single "Home" page.
 interface SaveStateV2 {
   version: 2;
   pages: PageData[];
@@ -390,25 +399,16 @@ const migrateSave = (parsed: unknown): SaveState | null => {
   return null;
 };
 
-const loadFromStorage = (): SaveState | null => {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(SAVE_KEY);
-    if (!raw) return null;
-    return migrateSave(JSON.parse(raw));
-  } catch {
-    return null;
-  }
+// Per-project read/write — both delegate to the projects.ts storage layer
+// keyed by the active project id. The editor obtains the id from the URL
+// (?project=<id>) on mount and never mutates it during the session.
+const loadFromStorage = (projectId: string): SaveState | null => {
+  const raw = getProjectState(projectId);
+  return raw ? migrateSave(raw) : null;
 };
 
-const saveToStorage = (s: SaveState) => {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(SAVE_KEY, JSON.stringify(s));
-  } catch {
-    // QuotaExceeded etc. — surface to console but don't break the editor.
-    console.warn("lgx.guru: failed to persist to localStorage");
-  }
+const saveToStorage = (projectId: string, s: SaveState) => {
+  saveProjectState(projectId, s);
 };
 
 // ── Page ────────────────────────────────────────────────────────────────────
@@ -423,6 +423,11 @@ export default function Page() {
     future: [],
   }));
   const app = hist.app;
+
+  // Active project — the editor is always scoped to one. Read once from the
+  // ?project=<id> URL param on mount; if absent or stale the user gets sent
+  // to the dashboard.
+  const [activeProject, setActiveProject] = useState<ProjectMeta | null>(null);
   // Active page derivation. If currentPageId points at a removed page we
   // fall back to the first page so the editor keeps working.
   const currentPage: PageData =
@@ -484,20 +489,23 @@ export default function Page() {
   // actually interact with their widget — click buttons, type, etc.).
   const [runMode, setRunMode] = useState(false);
 
-  // Sidebar tab — splits the previously-overloaded left column into three
-  // mode-based views so only one panel-set is visible at a time:
-  //   "design"  — Pages + Components (placing widgets)
-  //   "logic"   — Variables + Triggers (state + behavior)
-  //   "backend" — Networking + Build a module (rare, delivery & C++)
-  // Layers stays anchored at the bottom across all tabs.
-  type SidebarTab = "design" | "logic" | "backend";
+  // Sidebar tab — two mode-based views so only one panel-set is visible:
+  //   "design" — Pages + Components (placing widgets)
+  //   "logic"  — Variables + Triggers (state + behavior, including delivery)
+  // Layers stays anchored at the bottom across both tabs.
+  //
+  // (A "backend" tab existed previously for Networking + Build-a-module, but
+  // it was empty in practice — Networking is informational, Build-a-module
+  // was hidden until the no-code logic composer ships, so the tab added more
+  // chrome than value.)
+  type SidebarTab = "design" | "logic" | "modules";
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("design");
   useEffect(() => {
     if (typeof window === "undefined") return;
     const stored = window.localStorage.getItem("lgx.sidebarTab");
-    if (stored === "design" || stored === "logic" || stored === "backend") {
-      setSidebarTab(stored);
-    }
+    if (stored === "design" || stored === "logic" || stored === "modules") setSidebarTab(stored);
+    // Migrate users who had the now-removed "backend" tab selected.
+    else if (stored === "backend") setSidebarTab("modules");
   }, []);
   const switchSidebarTab = (t: SidebarTab) => {
     setSidebarTab(t);
@@ -524,7 +532,23 @@ export default function Page() {
   // The autosave effect below sees this dispatch as the "first change"
   // and skips its own write so we don't immediately rewrite what we read.
   useEffect(() => {
-    const saved = loadFromStorage();
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get("project");
+    if (!id) {
+      window.location.replace("/dashboard");
+      return;
+    }
+    const meta = getProjectMeta(id);
+    if (!meta) {
+      // Stale URL (e.g. project deleted from another tab). Send the user back
+      // to the dashboard rather than silently spawning an orphan project.
+      window.location.replace("/dashboard");
+      return;
+    }
+    setActiveProject(meta);
+
+    const saved = loadFromStorage(id);
     if (!saved || saved.version !== 2) return;
     if (saved.pages?.length) {
       const cur = saved.pages.find((p) => p.id === saved.currentPageId)?.id ?? saved.pages[0].id;
@@ -992,15 +1016,18 @@ export default function Page() {
     });
   };
 
-  // Debounced autosave — fires once 400ms after the latest change.
+  // Debounced autosave — fires once 400ms after the latest change. Skips
+  // until activeProject has been resolved on mount, so we don't write
+  // default-state into a project we're about to redirect away from.
   useEffect(() => {
+    if (!activeProject) return;
     if (firstSaveSkip.current) { firstSaveSkip.current = false; return; }
     const handle = setTimeout(() => {
-      saveToStorage(buildSaveState());
+      saveToStorage(activeProject.id, buildSaveState());
     }, 400);
     return () => clearTimeout(handle);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [app, moduleMeta, iconPng, iconFilename, collapsedIds]);
+  }, [app, moduleMeta, iconPng, iconFilename, collapsedIds, activeProject]);
 
   // ── Save / Open / New ─────────────────────────────────────────────────────
 
@@ -1289,6 +1316,86 @@ export default function Page() {
     updateTrigger(id, { actions: t.actions.filter((_, i) => i !== idx) });
   };
 
+  // Toggle a primitive module (e.g. "delivery_module") in the project's
+  // enabled-modules list. The inspector's callModule picker reads
+  // app.modules to decide which methods to surface, so this is the single
+  // switch that turns module APIs on/off across the editor.
+  const toggleModule = (id: ModuleId) => {
+    const has = app.modules.includes(id);
+    const next = has ? app.modules.filter((m) => m !== id) : [...app.modules, id];
+    dispatch({ type: "commit", app: { ...app, modules: next } });
+  };
+
+  // One-shot "Show live data" wiring: creates the variable, the necessary
+  // triggers (appStart + moduleEvent for events; just appStart for sync
+  // methods), and updates the Text node's binding — all in one commit so
+  // it's a single undo step.
+  const handleWireLiveData = (spec: LiveDataSpec) => {
+    dispatch({ type: "commit", app: wireLiveData(app, spec) });
+  };
+
+  // Build the read-only ModuleInfo the detail modal renders. The same modal
+  // serves Logos primitives (data sourced from MODULE_CATALOG) and the
+  // user's AI-built custom module (data sourced from app.coreModule).
+  const showModuleDetails = (m: { id: ModuleId; label: string; description: string; available: boolean }) => {
+    const isCustom = !!app.coreModule && app.coreModule.id === m.id;
+    if (isCustom && app.coreModule) {
+      const c = app.coreModule;
+      setModuleDetail({
+        id: c.id,
+        name: c.name || c.id,
+        description: c.description,
+        available: true,
+        variant: "custom",
+        methods: c.methods.map((mm) => ({
+          name: mm.name,
+          args: mm.args.map((a) => ({ name: a.name, type: a.type, description: a.description })),
+          returns: mm.returns,
+          description: mm.description,
+        })),
+        events: (c.events ?? []).map((ev) => ({
+          name: ev.name,
+          data: ev.data.map((d) => ({ name: d.name, type: d.type })),
+          description: ev.description,
+        })),
+      });
+      return;
+    }
+    const spec = findModuleSpec(m.id);
+    if (spec) {
+      setModuleDetail({
+        id: spec.id,
+        name: spec.name,
+        description: spec.description,
+        available: true,
+        variant: "logos",
+        methods: spec.methods.map((mm) => ({
+          name: mm.name,
+          args: mm.args.map((a) => ({ name: a.name, type: a.type, description: a.description })),
+          returns: mm.returns,
+          description: mm.description,
+        })),
+        events: (spec.events ?? []).map((ev) => ({
+          name: ev.name,
+          data: ev.data.map((d) => ({ name: d.name, type: d.type })),
+          description: ev.description,
+        })),
+      });
+      return;
+    }
+    // Coming-soon primitive — show the panel's brief description until the
+    // module ships and lands in MODULE_CATALOG with full method/event lists.
+    setModuleDetail({
+      id: m.id,
+      name: m.label,
+      description: m.description,
+      available: m.available,
+      variant: "logos",
+      methods: [],
+      events: [],
+    });
+  };
+
   // ── Core module authoring ────────────────────────────────────────────────
   //
   // The user's own backend module spec — optional. When present, its
@@ -1389,22 +1496,8 @@ export default function Page() {
     setTemplatesOpen(false);
   };
 
-  const handleNew = () => {
-    if (!window.confirm("Clear the canvas and start over? This wipes the current design.")) return;
-    if (typeof window !== "undefined") window.localStorage.removeItem(SAVE_KEY);
-    dispatch({ type: "set", app: newApp() });
-    setModuleMeta({
-      name: "my_widget",
-      version: "0.1.0",
-      description: "A widget built with lgx.guru",
-      category: "example",
-      author: "",
-    });
-    setIconPng(placeholderIcon());
-    setIconFilename("icon.png");
-    setCollapsedIds(new Set());
-    setSelectedIds(new Set());
-  };
+  // "New" lives on /dashboard now — the editor is always scoped to one
+  // existing project. To start fresh, head to Projects → New project.
 
   // ── Marquee (rubber-band selection on empty canvas) ──────────────────────
   //
@@ -1893,14 +1986,37 @@ export default function Page() {
     URL.revokeObjectURL(url);
   };
 
-  // ── Export: custom core source bundle ────────────────────────────────────
-  // Source archive of the user's *own* backend module — separate from the
-  // shared delivery_relay. This is for users who want custom C++ logic
-  // beyond pub/sub. The archive needs to be `nix build`-ed before install.
-  const handleExportCore = () => {
+  // ── Export: custom core module ────────────────────────────────────────────
+  // Prefers the pre-built .lgx the AI build pipeline cached server-side
+  // (Modules tab → Build a module → nix build). Falls back to packaging the
+  // source for the user to `nix build` themselves if the cache is empty.
+  const handleExportCore = async () => {
     if (!app.coreModule) return;
-    const files = generateCoreModuleFiles(app.coreModule);
     const id = app.coreModule.id || "my_module";
+
+    // Try pre-built first.
+    try {
+      const res = await fetch(`/api/built-module/${encodeURIComponent(id)}`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${id}.lgx`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        return;
+      }
+    } catch {
+      // Network or server error — fall through to source export.
+    }
+
+    // No cached build available — ship the source bundle so the user can
+    // `nix build` it manually. Tells the user via alert so the flow isn't
+    // silent about which artifact they got.
+    const files = generateCoreModuleFiles(app.coreModule);
     const blob = packTarGz(files, `${id}-core`);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1910,6 +2026,11 @@ export default function Page() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    window.alert(
+      `Pre-built artifact wasn't available — exported the source bundle instead. ` +
+      `Run \`nix build '.#lgx-portable'\` inside ${id}-core/ to produce the installable .lgx, ` +
+      `or rebuild from the Modules tab to regenerate the cache.`
+    );
   };
 
   // ── Export: shared delivery_relay (pre-built, ships with the editor) ────
@@ -1932,6 +2053,8 @@ export default function Page() {
   // Modal-driven export. The user picks UI + (optionally) the relay + their
   // custom core. When delivery is in use, the relay download is forced on.
   const [exportOpen, setExportOpen] = useState(false);
+  const [askAIOpen, setAskAIOpen] = useState(false);
+  const [moduleDetail, setModuleDetail] = useState<ModuleInfo | null>(null);
   const [exportUi, setExportUi] = useState(true);
   const [exportCore, setExportCore] = useState(false);
   const [exportRelay, setExportRelay] = useState(false);
@@ -1962,7 +2085,7 @@ export default function Page() {
   return (
     <div className="flex h-screen flex-col bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100">
       <header className="flex h-12 items-center justify-between border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-4">
-        <h1 className="flex items-center gap-2 text-sm font-semibold tracking-tight">
+        <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold tracking-tight">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src="/lgx-logo.svg"
@@ -1974,13 +2097,37 @@ export default function Page() {
             className="h-7 w-7 dark:invert"
           />
           <span className="sr-only">lgx.guru</span>
+          {activeProject && (
+            <>
+              <span className="text-zinc-400 dark:text-zinc-500">/</span>
+              <button
+                onClick={() => {
+                  const next = window.prompt("Rename project", activeProject.name);
+                  if (next === null) return;
+                  const trimmed = next.trim();
+                  if (!trimmed || trimmed === activeProject.name) return;
+                  renameProject(activeProject.id, trimmed);
+                  setActiveProject({ ...activeProject, name: trimmed });
+                }}
+                title="Click to rename"
+                className="min-w-0 truncate rounded px-1 text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                {activeProject.name}
+              </button>
+            </>
+          )}
         </h1>
         <div className="flex items-center gap-2">
-          <button
+          <a
+            href="/dashboard"
             className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
-            onClick={handleNew}
-            title="Clear and start a new design"
-          >New</button>
+            title="Back to all projects"
+          >← Projects</a>
+          <button
+            onClick={() => setAskAIOpen(true)}
+            className="rounded border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-950 dark:text-blue-300 dark:hover:bg-blue-900"
+            title="Describe a change in plain English; AI wires it up (variables, triggers, bindings)."
+          >✦ Ask AI</button>
           <div className="relative">
             <button
               className={`rounded border px-2 py-1 text-xs ${
@@ -2083,7 +2230,7 @@ export default function Page() {
             {([
               { id: "design"  as SidebarTab, label: "Design",  badge: app.pages.length > 1 ? app.pages.length : undefined },
               { id: "logic"   as SidebarTab, label: "Logic",   badge: (app.variables.length + app.triggers.length) || undefined },
-              { id: "backend" as SidebarTab, label: "Backend", badge: usesDelivery(app) ? "•" : (app.coreModule ? "•" : undefined) },
+              { id: "modules" as SidebarTab, label: "Modules", badge: (app.modules.length + (app.coreModule ? 1 : 0)) || undefined },
             ]).map((t) => {
               const active = sidebarTab === t.id;
               return (
@@ -2140,23 +2287,13 @@ export default function Page() {
                 />
               </>
             )}
-            {sidebarTab === "backend" && (
-              <>
-                <ModulesPanel app={app} />
-                <CoreModulePanel
-                  spec={app.coreModule}
-                  onEnable={enableCoreModule}
-                  onDisable={disableCoreModule}
-                  onUpdate={updateCoreModule}
-                  onAddMethod={addCoreMethod}
-                  onUpdateMethod={updateCoreMethod}
-                  onDeleteMethod={deleteCoreMethod}
-                  onToggleDep={toggleCoreDep}
-                  onAddStateField={addCoreStateField}
-                  onUpdateStateField={updateCoreStateField}
-                  onDeleteStateField={deleteCoreStateField}
-                />
-              </>
+            {sidebarTab === "modules" && (
+              <ModulesPanel
+                app={app}
+                onToggle={toggleModule}
+                onOpenBuildModule={() => setAskAIOpen(true)}
+                onShowDetails={showModuleDetails}
+              />
             )}
             {sidebarTab === "design" && (
             <SidebarSection
@@ -2409,6 +2546,7 @@ export default function Page() {
               enabledModuleIds={app.modules}
               coreModule={app.coreModule}
               onAddVariable={addVariable}
+              onWireLiveData={handleWireLiveData}
             />
           ) : null}
           <details className="mt-6">
@@ -2542,6 +2680,18 @@ export default function Page() {
           </div>
         </div>
       )}
+
+      <ModuleDetailModal
+        info={moduleDetail}
+        onClose={() => setModuleDetail(null)}
+      />
+
+      <AskAIModal
+        open={askAIOpen}
+        onClose={() => setAskAIOpen(false)}
+        app={app}
+        dispatch={dispatch}
+      />
     </div>
   );
 }
@@ -3168,21 +3318,40 @@ function ButtonOnClickEditor({
             name: m.name, args: m.args,
             returns: m.returns, description: m.description,
           })),
+          events: coreModule.events ?? [],
         }]
       : []),
   ];
   const kind = action?.kind ?? "none";
-  type ActionKind = "none" | "navigate" | "setVariable" | "openUrl" | "callModule" | "sendMessage" | "appendToList";
+  type ActionKind = "none" | "navigate" | "setVariable" | "openUrl" | "callModule" | "callModuleToVariable" | "sendMessage" | "appendToList" | "if";
+  // Modules whose methods return a value — eligible for callModuleToVariable.
+  const modulesWithReturningMethods = enabledModules.filter((m) =>
+    m.methods.some((mm) => mm.returns !== "void")
+  );
   const setKind = (next: ActionKind) => {
     if (next === "none") onChange({ kind: "none" });
     else if (next === "navigate") onChange({ kind: "navigate", pageId: pages[0]?.id ?? "" });
     else if (next === "setVariable") onChange({ kind: "setVariable", varId: variables[0]?.id ?? "", value: "" });
     else if (next === "appendToList") onChange({ kind: "appendToList", varId: variables[0]?.id ?? "", value: "payload", mode: "expression" });
+    else if (next === "if") onChange({ kind: "if", condition: "", actions: [] });
     else if (next === "callModule") {
       const m = enabledModules[0];
       const method = m?.methods[0];
       onChange({
         kind: "callModule",
+        moduleId: m?.id ?? "",
+        method: method?.name ?? "",
+        args: (method?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
+      });
+    }
+    else if (next === "callModuleToVariable") {
+      // Default to a module + method that actually returns something so the
+      // action does something useful out of the gate.
+      const m = modulesWithReturningMethods[0];
+      const method = m?.methods.find((mm) => mm.returns !== "void");
+      onChange({
+        kind: "callModuleToVariable",
+        varId: variables[0]?.id ?? "",
         moduleId: m?.id ?? "",
         method: method?.name ?? "",
         args: (method?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
@@ -3207,7 +3376,11 @@ function ButtonOnClickEditor({
         <option value="appendToList" disabled={variables.length === 0}>Append to list</option>
         <option value="openUrl">Open URL</option>
         <option value="sendMessage">Send message (delivery)</option>
+        <option value="if">If (condition) … then run actions</option>
         <option value="callModule" disabled={enabledModules.length === 0}>Call module method (advanced)</option>
+        <option value="callModuleToVariable" disabled={modulesWithReturningMethods.length === 0 || variables.length === 0}>
+          Call method and store result in variable
+        </option>
       </select>
       {action?.kind === "navigate" && (
         <div className="mt-2">
@@ -3447,6 +3620,74 @@ function ButtonOnClickEditor({
           </div>
         );
       })()}
+      {action?.kind === "if" && (() => {
+        const inner = action.actions;
+        const setIf = (patch: Partial<{ condition: string; actions: ButtonAction[] }>) =>
+          onChange({
+            kind: "if",
+            condition: patch.condition ?? action.condition,
+            actions: patch.actions ?? inner,
+          });
+        const addInner = () => setIf({ actions: [...inner, { kind: "none" }] });
+        const updateInner = (idx: number, a: ButtonAction) =>
+          setIf({ actions: inner.map((x, i) => (i === idx ? a : x)) });
+        const deleteInner = (idx: number) =>
+          setIf({ actions: inner.filter((_, i) => i !== idx) });
+        return (
+          <div className="mt-2 flex flex-col gap-2">
+            <div>
+              <label className={I_LABEL}>condition (JS expression)</label>
+              <input
+                className={I_INPUT}
+                value={action.condition}
+                onChange={(e) => setIf({ condition: e.target.value })}
+                placeholder='e.g. app.var_count > 5'
+              />
+              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                Inner actions run only when this expression is truthy. Reference variables via <span className="font-mono">app.var_*</span>; use <span className="font-mono">payload</span> / <span className="font-mono">topic</span> inside on-message triggers.
+              </p>
+            </div>
+            <div>
+              <div className="flex items-center justify-between">
+                <label className={I_LABEL}>then run</label>
+                <button
+                  type="button"
+                  onClick={addInner}
+                  className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline"
+                >+ action</button>
+              </div>
+              <div className="mt-1 flex flex-col gap-1.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/40 p-1.5">
+                {inner.length === 0 && (
+                  <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                    No inner actions yet. Click <span className="font-mono">+ action</span> to add one.
+                  </p>
+                )}
+                {inner.map((sub, idx) => (
+                  <div key={idx} className="rounded border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-1">
+                    <div className="mb-0.5 flex items-center justify-between">
+                      <span className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500">#{idx + 1}</span>
+                      <button
+                        onClick={() => deleteInner(idx)}
+                        className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:text-red-600 dark:hover:text-red-400"
+                      >×</button>
+                    </div>
+                    {/* Recursive editor — supports nested `if`s, etc. */}
+                    <ButtonOnClickEditor
+                      action={sub}
+                      pages={pages}
+                      variables={variables}
+                      enabledModuleIds={enabledModuleIds}
+                      coreModule={coreModule}
+                      onChange={(a) => updateInner(idx, a)}
+                      onAddVariable={onAddVariable}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
       {action?.kind === "callModule" && (() => {
         const mod = enabledModules.find((m) => m.id === action.moduleId);
         const method = mod?.methods.find((mm) => mm.name === action.method);
@@ -3555,6 +3796,462 @@ function ButtonOnClickEditor({
           </div>
         );
       })()}
+      {action?.kind === "callModuleToVariable" && (() => {
+        // Same shape as callModule but only methods that return non-void are
+        // useful here. The chosen variable holds the return value at runtime.
+        const mod = modulesWithReturningMethods.find((m) => m.id === action.moduleId);
+        const returningMethods = mod?.methods.filter((mm) => mm.returns !== "void") ?? [];
+        const method = returningMethods.find((mm) => mm.name === action.method);
+        const setMod = (id: string) => {
+          const m = modulesWithReturningMethods.find((mm) => mm.id === id);
+          const first = m?.methods.find((mm) => mm.returns !== "void");
+          onChange({
+            kind: "callModuleToVariable",
+            varId: action.varId,
+            moduleId: id,
+            method: first?.name ?? "",
+            args: (first?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
+          });
+        };
+        const setMethod = (name: string) => {
+          const m = returningMethods.find((mm) => mm.name === name);
+          onChange({
+            kind: "callModuleToVariable",
+            varId: action.varId,
+            moduleId: action.moduleId,
+            method: name,
+            args: (m?.args ?? []).map(() => ({ value: "", mode: "literal" as SetVariableMode })),
+          });
+        };
+        const setArg = (idx: number, patch: Partial<CallModuleArg>) => {
+          const next = action.args.slice();
+          next[idx] = { ...next[idx], ...patch };
+          onChange({ ...action, args: next });
+        };
+        const setVarId = (varId: string) => onChange({ ...action, varId });
+        return (
+          <div className="mt-2 flex flex-col gap-2">
+            <div>
+              <label className={I_LABEL}>store result in</label>
+              <div className="flex items-center gap-1">
+                <select
+                  className={I_INPUT}
+                  value={action.varId}
+                  onChange={(e) => setVarId(e.target.value)}
+                >
+                  {variables.map((v) => (
+                    <option key={v.id} value={v.id}>{v.name} ({v.type})</option>
+                  ))}
+                </select>
+                {onAddVariable && (
+                  <button
+                    onClick={() => {
+                      const id = onAddVariable("result");
+                      setVarId(id);
+                    }}
+                    className="shrink-0 rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    title="Create a new variable to hold the result"
+                  >+ new</button>
+                )}
+              </div>
+              {method && (
+                <p className="mt-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                  Returns <span className="font-mono">{method.returns}</span> — pick a string variable for text, a number variable for numbers, etc.
+                </p>
+              )}
+            </div>
+            <div>
+              <label className={I_LABEL}>module</label>
+              <select
+                className={I_INPUT}
+                value={action.moduleId}
+                onChange={(e) => setMod(e.target.value)}
+              >
+                {modulesWithReturningMethods.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className={I_LABEL}>method</label>
+              <select
+                className={I_INPUT}
+                value={action.method}
+                onChange={(e) => setMethod(e.target.value)}
+              >
+                {returningMethods.map((mm) => (
+                  <option key={mm.name} value={mm.name}>{mm.name}</option>
+                ))}
+              </select>
+              {method?.description && (
+                <p className="mt-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{method.description}</p>
+              )}
+            </div>
+            {method && method.args.length > 0 && (
+              <div className="flex flex-col gap-2 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-2">
+                <div className="text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400">Arguments</div>
+                {method.args.map((p, idx) => {
+                  const arg = action.args[idx] ?? { value: "", mode: "literal" as SetVariableMode };
+                  const mode = arg.mode ?? "literal";
+                  return (
+                    <div key={p.name}>
+                      <div className="flex items-center justify-between">
+                        <label className={I_LABEL}>
+                          <span className="font-mono">{p.name}</span>{" "}
+                          <span className="text-zinc-400 dark:text-zinc-500">({p.type})</span>
+                        </label>
+                        <button
+                          onClick={() => setArg(idx, { mode: mode === "literal" ? "expression" : "literal" })}
+                          className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:underline"
+                        >{mode === "literal" ? "use expression →" : "← use literal"}</button>
+                      </div>
+                      {mode === "expression" ? (
+                        <input
+                          className={I_INPUT}
+                          value={arg.value}
+                          onChange={(e) => setArg(idx, { value: e.target.value })}
+                          placeholder={p.type === "string" ? '"text" or app.var_x' : "expression"}
+                        />
+                      ) : p.type === "boolean" ? (
+                        <select
+                          className={I_INPUT}
+                          value={arg.value === "true" ? "true" : "false"}
+                          onChange={(e) => setArg(idx, { value: e.target.value })}
+                        >
+                          <option value="false">false</option>
+                          <option value="true">true</option>
+                        </select>
+                      ) : (
+                        <input
+                          type={p.type === "number" ? "number" : "text"}
+                          className={I_INPUT}
+                          value={arg.value}
+                          placeholder={p.type === "number" ? "0" : "value"}
+                          onChange={(e) => setArg(idx, { value: e.target.value })}
+                        />
+                      )}
+                      {p.description && (
+                        <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">{p.description}</p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <p className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+              Note: this captures the method&apos;s synchronous return. If the module fetches over the network and emits the result via an event, use a trigger on the event instead.
+            </p>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// "Source" picker for Text components — replaces the bare "bind to variable"
+// dropdown with three modes:
+//   - Static text (default; node.text is the literal)
+//   - Variable (existing manual binding; same dropdown as before)
+//   - Live from a module (new wizard; creates the variable + triggers +
+//     binding atomically via onWireLiveData)
+//
+// Inferred from current state: if node.binding points at a variable that
+// already has triggers feeding it, we render the "wired" summary; otherwise
+// we render the picker.
+function TextSourcePicker({
+  node, variables, enabledModuleIds, coreModule, onChange, onWireLiveData,
+}: {
+  node: TextNode;
+  variables: Variable[];
+  enabledModuleIds: ModuleId[];
+  coreModule: CoreModuleSpec | undefined;
+  onChange: (patch: Partial<TextNode>) => void;
+  onWireLiveData?: (spec: LiveDataSpec) => void;
+}) {
+  type Mode = "static" | "variable" | "live";
+  const inferredMode: Mode = node.binding ? "variable" : "static";
+  const [mode, setMode] = useState<Mode>(inferredMode);
+
+  // Build the merged enabled-modules list — same shape the rest of the
+  // inspector uses, so methods and events from primitives + the user's
+  // custom core module both surface here.
+  const modulesForPicker: ModuleSpec[] = [
+    ...enabledModuleIds
+      .map((id) => findModuleSpec(id))
+      .filter((m): m is ModuleSpec => m !== undefined),
+    ...(coreModule
+      ? [{
+          id: coreModule.id,
+          name: `${coreModule.name || coreModule.id} (this project)`,
+          description: coreModule.description || "",
+          methods: coreModule.methods.map((m) => ({
+            name: m.name, args: m.args, returns: m.returns, description: m.description,
+          })),
+          events: coreModule.events ?? [],
+        }]
+      : []),
+  ];
+
+  // ── Static + variable modes — no wizard, just present existing UI ─────
+  if (mode === "static") {
+    return (
+      <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+        <SourceModeTabs mode={mode} setMode={setMode} hasVariables={variables.length > 0} />
+        <p className="mt-2 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
+          The Text shows whatever you type below.
+        </p>
+      </div>
+    );
+  }
+
+  if (mode === "variable") {
+    return (
+      <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+        <SourceModeTabs mode={mode} setMode={setMode} hasVariables={variables.length > 0} />
+        <div className="mt-2">
+          <label className={I_LABEL}>variable</label>
+          <select
+            className={I_INPUT}
+            value={node.binding ?? ""}
+            onChange={(e) => {
+              const v = e.target.value;
+              onChange({ binding: v ? v : undefined });
+            }}
+          >
+            <option value="">(none — use the static text below)</option>
+            {variables.map((v) => (
+              <option key={v.id} value={v.id}>{v.name} ({v.type})</option>
+            ))}
+          </select>
+          {node.binding && !variables.find((v) => v.id === node.binding) && (
+            <p className="mt-1 text-[10px] text-amber-600">
+              Bound variable was deleted — pick a new one or switch sources.
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Live mode — the wizard ────────────────────────────────────────────
+  return (
+    <LiveSourceWizard
+      modules={modulesForPicker}
+      onChange={(patch) => onChange(patch)}
+      onWireLiveData={onWireLiveData}
+      onCancel={() => setMode(inferredMode)}
+      textNodeId={node.id}
+      tabs={<SourceModeTabs mode={mode} setMode={setMode} hasVariables={variables.length > 0} />}
+    />
+  );
+}
+
+function SourceModeTabs({
+  mode, setMode, hasVariables,
+}: {
+  mode: "static" | "variable" | "live";
+  setMode: (m: "static" | "variable" | "live") => void;
+  hasVariables: boolean;
+}) {
+  const Tab = ({ id, label, disabled, title }: {
+    id: "static" | "variable" | "live"; label: string; disabled?: boolean; title?: string;
+  }) => (
+    <button
+      onClick={() => !disabled && setMode(id)}
+      disabled={disabled}
+      title={title}
+      className={`flex-1 rounded px-2 py-1 text-[10px] font-medium transition-colors ${
+        mode === id
+          ? "bg-blue-600 text-white"
+          : disabled
+          ? "text-zinc-400 dark:text-zinc-600 cursor-not-allowed"
+          : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      }`}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div className="flex gap-0.5 rounded bg-zinc-50 dark:bg-zinc-800 p-0.5">
+      <Tab id="static"   label="Static" />
+      <Tab id="variable" label="Variable" disabled={!hasVariables}
+        title={hasVariables ? undefined : "No variables yet — create one in the Logic tab, or use Live mode."} />
+      <Tab id="live"     label="✦ Live" />
+    </div>
+  );
+}
+
+// The actual wiring wizard. Combines methods + events into one "Source"
+// dropdown, exposes the field picker for events, and surfaces the auto-
+// detected kickoff method as an opt-out checkbox.
+function LiveSourceWizard({
+  modules, onWireLiveData, onCancel, textNodeId, tabs,
+}: {
+  modules: ModuleSpec[];
+  onChange: (patch: Partial<TextNode>) => void;
+  onWireLiveData?: (spec: LiveDataSpec) => void;
+  onCancel: () => void;
+  textNodeId: NodeId;
+  tabs: React.ReactNode;
+}) {
+  const [moduleId, setModuleId] = useState<string>(modules[0]?.id ?? "");
+  const mod = modules.find((m) => m.id === moduleId);
+
+  // Methods (string/number/boolean returns, no args — the picker only wires
+  // the trivial cases; methods that take args still show but auto-wire
+  // assumes empty args, which the user can edit later) + events get
+  // collapsed into one "Source" list, prefixed for clarity.
+  type SourceOption =
+    | { id: string; kind: "method"; methodName: string; returns: VariableType; label: string }
+    | { id: string; kind: "event";  eventName: string; argCount: number; label: string };
+
+  const sourceOptions: SourceOption[] = [];
+  for (const m of mod?.methods ?? []) {
+    if (m.returns === "void") continue;
+    if (m.args.length > 0) continue; // keep wizard's surface tight
+    sourceOptions.push({
+      id: `m:${m.name}`,
+      kind: "method",
+      methodName: m.name,
+      returns: m.returns as VariableType,
+      label: `Method: ${m.name} → ${m.returns}`,
+    });
+  }
+  for (const ev of mod?.events ?? []) {
+    sourceOptions.push({
+      id: `e:${ev.name}`,
+      kind: "event",
+      eventName: ev.name,
+      argCount: ev.data.length,
+      label: `Event: ${ev.name}${ev.data.length ? ` (${ev.data.length} field${ev.data.length === 1 ? "" : "s"})` : ""}`,
+    });
+  }
+
+  const [sourceId, setSourceId] = useState<string>(sourceOptions[0]?.id ?? "");
+  const source = sourceOptions.find((s) => s.id === sourceId);
+
+  // Field picker (only for events with multiple payload fields).
+  const eventDef = source?.kind === "event"
+    ? mod?.events?.find((e) => e.name === source.eventName)
+    : undefined;
+  const [fieldIdx, setFieldIdx] = useState<number>(0);
+  // Reset field index when the source changes so we don't index off the end.
+  useEffect(() => { setFieldIdx(0); }, [sourceId, moduleId]);
+
+  // Auto-detected kickoff method for events (heuristic match).
+  const methodCandidates = (mod?.methods ?? []).map((m) => ({ name: m.name, argCount: m.args.length }));
+  const kickoffSuggestion = source?.kind === "event"
+    ? suggestKickoffMethod(source.eventName, methodCandidates)
+    : undefined;
+  const [includeKickoff, setIncludeKickoff] = useState<boolean>(true);
+  // Default to "on" whenever a kickoff suggestion is available and the
+  // user changes the source — without this, navigating between events
+  // would leave a stale checkbox state.
+  useEffect(() => { setIncludeKickoff(true); }, [sourceId, moduleId]);
+
+  // Suggested variable name — derive from event name or method name.
+  const varNameHint = source
+    ? source.kind === "method"
+      ? source.methodName
+      : eventDef?.data[fieldIdx]?.name ?? source.eventName
+    : "value";
+
+  const canWire = !!source && !!moduleId && !!onWireLiveData;
+
+  const handleWire = () => {
+    if (!canWire || !source || !mod) return;
+    if (source.kind === "method") {
+      onWireLiveData!({
+        textNodeId,
+        moduleId,
+        source: { kind: "method", methodName: source.methodName, returns: source.returns },
+        varNameHint,
+      });
+    } else {
+      const field = eventDef?.data[fieldIdx];
+      if (!field) return;
+      onWireLiveData!({
+        textNodeId,
+        moduleId,
+        source: {
+          kind: "event",
+          eventName: source.eventName,
+          fieldIndex: fieldIdx,
+          fieldType: field.type as VariableType,
+          kickoffMethod: includeKickoff ? kickoffSuggestion : undefined,
+        },
+        varNameHint,
+      });
+    }
+  };
+
+  return (
+    <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+      {tabs}
+      {modules.length === 0 ? (
+        <p className="mt-3 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
+          Enable a module in the Modules tab first, then come back here.
+        </p>
+      ) : sourceOptions.length === 0 && mod ? (
+        <p className="mt-3 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
+          <span className="font-mono">{mod.name}</span> doesn&apos;t expose any methods (with no args) or events that we can auto-wire.
+        </p>
+      ) : (
+        <div className="mt-2 flex flex-col gap-2">
+          <div>
+            <label className={I_LABEL}>module</label>
+            <select className={I_INPUT} value={moduleId} onChange={(e) => setModuleId(e.target.value)}>
+              {modules.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={I_LABEL}>show</label>
+            <select className={I_INPUT} value={sourceId} onChange={(e) => setSourceId(e.target.value)}>
+              {sourceOptions.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+            </select>
+          </div>
+          {eventDef && eventDef.data.length > 1 && (
+            <div>
+              <label className={I_LABEL}>field</label>
+              <select className={I_INPUT} value={fieldIdx} onChange={(e) => setFieldIdx(parseInt(e.target.value, 10) || 0)}>
+                {eventDef.data.map((d, i) => (
+                  <option key={d.name} value={i}>{d.name} ({d.type})</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {source?.kind === "event" && kickoffSuggestion && (
+            <label className="flex items-start gap-2 text-[10px] leading-snug text-zinc-600 dark:text-zinc-300">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={includeKickoff}
+                onChange={(e) => setIncludeKickoff(e.target.checked)}
+              />
+              <span>
+                Call <span className="font-mono">{kickoffSuggestion}()</span> on app load to start the fetch.{" "}
+                <span className="text-zinc-500 dark:text-zinc-400">Without this, the event never fires.</span>
+              </span>
+            </label>
+          )}
+          <div className="mt-1 flex items-center gap-2">
+            <button
+              onClick={handleWire}
+              disabled={!canWire}
+              className="flex-1 rounded bg-blue-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-blue-500 disabled:opacity-40"
+            >
+              ✦ Wire it up
+            </button>
+            <button
+              onClick={onCancel}
+              className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            >
+              Cancel
+            </button>
+          </div>
+          <p className="text-[10px] leading-snug text-zinc-400 dark:text-zinc-500">
+            Wiring creates a variable + the triggers needed to keep it updated, then binds this Text to it. You can edit the result in the Logic tab.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -3568,6 +4265,7 @@ function Inspector({
   enabledModuleIds,
   coreModule,
   onAddVariable,
+  onWireLiveData,
 }: {
   node: Node;
   isRoot: boolean;
@@ -3577,6 +4275,9 @@ function Inspector({
   enabledModuleIds: ModuleId[];
   coreModule: CoreModuleSpec | undefined;
   onAddVariable?: (preferName?: string) => string;
+  // One-shot "Show live data" wiring — creates the variable + triggers +
+  // binding atomically. Inspector calls this from the Text Source picker.
+  onWireLiveData?: (spec: LiveDataSpec) => void;
 }) {
   // Style is nested — patch helper builds {style: {...node.style, ...patch}}
   const updateStyle = (patch: Partial<typeof node.style>) =>
@@ -3668,29 +4369,14 @@ function Inspector({
         <details open>
           <summary className={I_SUMMARY}>Text</summary>
           <div className="flex flex-col gap-2.5">
-            <div>
-              <label className={I_LABEL}>bind to variable</label>
-              <select
-                className={I_INPUT}
-                value={node.binding ?? ""}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  onChange({ binding: v ? v : undefined } as Partial<TextNode>);
-                }}
-              >
-                <option value="">(no binding — use literal text)</option>
-                {variables.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {v.name} ({v.type})
-                  </option>
-                ))}
-              </select>
-              {node.binding && !variables.find((v) => v.id === node.binding) && (
-                <p className="mt-1 text-[10px] text-amber-600">
-                  Bound variable was deleted — pick a new one or clear the binding.
-                </p>
-              )}
-            </div>
+            <TextSourcePicker
+              node={node as TextNode}
+              variables={variables}
+              enabledModuleIds={enabledModuleIds}
+              coreModule={coreModule}
+              onChange={(patch) => onChange(patch as Partial<Node>)}
+              onWireLiveData={onWireLiveData}
+            />
             <TextField
               label={node.binding ? "fallback content" : "content"}
               value={node.text}
@@ -4485,9 +5171,23 @@ function TriggersPanel({
   onDeleteAction: (id: TriggerId, idx: number) => void;
   onAddVariable?: (preferName?: string) => string;
 }) {
-  const enabledModules = enabledModuleIds
-    .map((id) => findModuleSpec(id))
-    .filter((m): m is ModuleSpec => m !== undefined);
+  const enabledModules: ModuleSpec[] = [
+    ...enabledModuleIds
+      .map((id) => findModuleSpec(id))
+      .filter((m): m is ModuleSpec => m !== undefined),
+    ...(coreModule
+      ? [{
+          id: coreModule.id,
+          name: `${coreModule.name || coreModule.id} (this project)`,
+          description: coreModule.description || "Your project's own backend module.",
+          methods: coreModule.methods.map((m) => ({
+            name: m.name, args: m.args,
+            returns: m.returns, description: m.description,
+          })),
+          events: coreModule.events ?? [],
+        }]
+      : []),
+  ];
   return (
     <SidebarSection
       title="Triggers"
@@ -4687,40 +5387,152 @@ function TriggerEditor({
 }
 
 // ── ModulesPanel ───────────────────────────────────────────────────────────
+//
+// Two sections: enable Logos primitives (delivery, storage, blockchain,
+// wallet — only delivery ships today; the rest render as disabled
+// "coming soon" rows for forward visibility), and a "Custom backend
+// module" section that surfaces app.coreModule and the AI Build flow.
+//
+// Toggling a primitive on/off is the single switch that controls whether
+// that module's methods appear in every "Call module" inspector dropdown.
+
+interface PrimitiveModuleDef {
+  id: ModuleId;
+  label: string;
+  description: string;
+  available: boolean;
+}
+
+const PRIMITIVE_MODULES: PrimitiveModuleDef[] = [
+  { id: "delivery_module",   label: "Delivery",   description: "Pub/sub messaging over the Logos network.",     available: true  },
+  { id: "storage_module",    label: "Storage",    description: "Persistent key-value storage on the device.",   available: false },
+  { id: "blockchain_module", label: "Blockchain", description: "On-chain state and transactions.",              available: false },
+  { id: "wallet_module",     label: "Wallet",     description: "Account, signing, and balance.",                available: false },
+];
 
 function ModulesPanel({
   app,
+  onToggle,
+  onOpenBuildModule,
+  onShowDetails,
 }: {
   app: AppState;
+  onToggle: (id: ModuleId) => void;
+  onOpenBuildModule: () => void;
+  onShowDetails: (m: PrimitiveModuleDef) => void;
 }) {
-  const deliveryAuto = usesDelivery(app);
+  const enabled = (id: ModuleId) => app.modules.includes(id);
+  const core = app.coreModule;
+
   return (
-    <SidebarSection
-      title="Networking"
-      defaultOpen={deliveryAuto}
-      badge={deliveryAuto ? "in use" : "idle"}
-    >
-      <div
-        className={`flex items-start gap-2 rounded border p-1.5 ${
-          deliveryAuto ? "border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-950" : "border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900"
-        }`}
-      >
-        <div className="flex-1 min-w-0">
-          <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-200">Delivery (pub/sub)</div>
-          <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
-            Send and receive messages over the Logos network. Pick <span className="font-mono">Send message</span> on a button or add an <span className="font-mono">on message</span> trigger.
-          </div>
-          {deliveryAuto && (
-            <div className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">
-              Active · UI calls the bundled <span className="font-mono">delivery_relay</span> module.
-              <div className="mt-0.5 text-amber-700 dark:text-amber-300">
-                Export will give you both <span className="font-mono">&lt;name&gt;.lgx</span> and <span className="font-mono">delivery_relay.lgx</span>. Install both on every Basecamp (the relay is the same file across all your projects — install once).
+    <>
+      <SidebarSection title="Logos modules" defaultOpen badge={app.modules.length || undefined}>
+        <div className="space-y-1.5">
+          {PRIMITIVE_MODULES.map((m) => {
+            const isOn = enabled(m.id);
+            const interactive = m.available;
+            const baseRow = `flex items-start gap-2 rounded border px-2 py-1.5 ${
+              interactive
+                ? isOn
+                  ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-blue-950"
+                  : "border-zinc-200 dark:border-zinc-700"
+                : "border-zinc-200 bg-zinc-50 opacity-60 dark:border-zinc-700 dark:bg-zinc-900"
+            }`;
+            return (
+              <div key={m.id} className={baseRow}>
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={interactive ? isOn : false}
+                  disabled={!interactive}
+                  onChange={() => interactive && onToggle(m.id)}
+                  aria-label={`Enable ${m.label}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => onShowDetails(m)}
+                  className="flex-1 min-w-0 text-left rounded hover:bg-zinc-50 dark:hover:bg-zinc-800/40"
+                  title={`Show what ${m.label} can do`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-200">
+                      {m.label}
+                    </span>
+                    {!m.available && (
+                      <span className="rounded bg-zinc-200 px-1 py-0.5 text-[9px] font-medium text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
+                        coming soon
+                      </span>
+                    )}
+                    <span className="ml-auto text-[10px] text-zinc-400 dark:text-zinc-500">view ›</span>
+                  </div>
+                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                    {m.description}
+                  </div>
+                </button>
               </div>
-            </div>
-          )}
+            );
+          })}
         </div>
-      </div>
-    </SidebarSection>
+        <p className="mt-2 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+          Click a module to see what it can do. Enabled modules&apos; methods appear in any button&apos;s <span className="font-mono">Call module</span> action and in trigger pickers.
+        </p>
+      </SidebarSection>
+
+      <SidebarSection title="Custom backend module" defaultOpen badge={core ? 1 : undefined}>
+        {core ? (
+          <div className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1.5 dark:border-emerald-700 dark:bg-emerald-950">
+            <button
+              type="button"
+              onClick={() => onShowDetails({
+                id: core.id,
+                label: core.name || core.id,
+                description: core.description || "Custom backend module built by AI for this project.",
+                available: true,
+              })}
+              className="block w-full text-left rounded hover:bg-emerald-100/60 dark:hover:bg-emerald-900/40"
+              title="Show what this module can do"
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                  {core.name || core.id}
+                </span>
+                <span className="ml-auto text-[10px] text-zinc-500 dark:text-zinc-400">view ›</span>
+              </div>
+              {core.description && (
+                <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                  {core.description}
+                </div>
+              )}
+              <div className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+                {core.methods.length} method{core.methods.length === 1 ? "" : "s"}
+                {core.dependencies.length > 0 && ` · uses ${core.dependencies.join(", ")}`}
+              </div>
+            </button>
+            <button
+              onClick={onOpenBuildModule}
+              className="mt-2 w-full rounded bg-zinc-900 px-2 py-1 text-[10px] font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              Modify or extend with AI
+            </button>
+          </div>
+        ) : (
+          <div className="rounded border border-dashed border-zinc-300 bg-zinc-50 px-2 py-2 text-[10px] leading-tight text-zinc-500 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">
+            Need backend logic the visual editor can&apos;t express? Describe it in plain English — AI writes the C++.
+            <div className="mt-1 text-zinc-400 dark:text-zinc-500">
+              Examples: a relay that drops old messages, a fetcher that pulls from a public API, a stateful aggregator across topics.
+            </div>
+          </div>
+        )}
+        {!core && (
+          <button
+            onClick={onOpenBuildModule}
+            className="mt-2 w-full rounded bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+          >
+            ✦ Build a module
+          </button>
+        )}
+      </SidebarSection>
+    </>
   );
 }
 
@@ -4998,23 +5810,10 @@ function CoreMethodEditor({
           placeholder="(optional description)"
         />
       </div>
-      <details className="mt-1.5">
-        <summary className="cursor-pointer select-none text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-zinc-800 dark:text-zinc-200">
-          C++ body {method.body && method.body.trim() ? "✓" : "(TODO stub)"}
-        </summary>
-        <textarea
-          className="mt-1 w-full rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-1 font-mono text-[10px] leading-tight"
-          rows={6}
-          value={method.body ?? ""}
-          onChange={(e) => onChange({ body: e.target.value })}
-          placeholder={
-            "// Spliced verbatim into the generated .cpp.\n" +
-            "// Reference state via m_<field>;\n" +
-            "// call deps via m_<dep>Client->invokeRemoteMethod(\"<dep>\", \"method\", arg1, arg2);"
-          }
-          spellCheck={false}
-        />
-      </details>
+      {/* No C++ body editor here — this is a no-code tool. Method bodies
+          will be generated from the upcoming no-code logic composer (same
+          trigger / action shape as the front-end). For now method bodies
+          are TODO stubs in the generated .cpp. */}
     </div>
   );
 }
@@ -5037,7 +5836,7 @@ function VariablesPanel({
       badge={variables.length > 0 ? variables.length : undefined}
       headerRight={
         <button
-          onClick={onAdd}
+          onClick={() => onAdd()}
           className="flex h-5 w-5 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 text-xs leading-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
           title="Add a new variable"
         >+</button>

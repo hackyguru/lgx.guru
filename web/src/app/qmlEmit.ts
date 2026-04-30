@@ -188,6 +188,29 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     });
     return `logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
   }
+  if (action.kind === "callModuleToVariable") {
+    if (!action.moduleId || !action.method) return null;
+    const prop = ctx.varQmlByVarId.get(action.varId);
+    if (!prop) return null;
+    const spec = findModuleMethod(action.moduleId, action.method)
+      ?? ctx.extraMethods.get(action.moduleId)?.get(action.method);
+    if (!spec) return null;
+    const argsExprs = spec.args.map((p, idx) => {
+      const a: CallModuleArg = action.args[idx] ?? { value: "", mode: "literal" };
+      if (a.mode === "expression") {
+        return a.value || (p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""');
+      }
+      if (p.type === "number") {
+        const n = parseFloat(a.value);
+        return Number.isFinite(n) ? String(n) : "0";
+      }
+      if (p.type === "boolean") return a.value === "true" ? "true" : "false";
+      return `"${escapeStr(a.value)}"`;
+    });
+    // QML lets us assign module call's return into a property directly. The
+    // user picked the variable; the callModule expression supplies the value.
+    return `app.${prop} = logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+  }
   if (action.kind === "sendMessage") {
     const topic = action.topic.trim();
     if (!topic) return null;
@@ -214,6 +237,16 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // values by falling back to []. Bound to a string variable; we re-encode
     // the array so List/Repeater (which JSON.parse(app.var_*)) can read it.
     return `app.${prop} = JSON.stringify((function(){ var _a=[]; try { var _p=JSON.parse(app.${prop}); if (Array.isArray(_p)) _a=_p; } catch(_e){} _a.push(${valueExpr}); return _a; })())`;
+  }
+  if (action.kind === "if") {
+    // Composition primitive: branch on a JS condition. Empty condition is
+    // treated as `true` so a freshly-added `if` block doesn't silently no-op.
+    // Wrapped in try/catch so a bad expression doesn't kill the whole
+    // surrounding handler — just skips this branch and logs to the console.
+    const cond = action.condition.trim() || "true";
+    const body = actionBlockJs(action.actions, ctx);
+    if (!body) return null;
+    return `try { if (${cond}) { ${body} } } catch(_ifErr) { console.log("if condition error:", _ifErr) }`;
   }
   return null;
 };

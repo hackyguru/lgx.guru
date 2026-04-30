@@ -98,6 +98,10 @@ export type ButtonAction =
   | { kind: "setVariable"; varId: string; value: string; mode?: SetVariableMode }
   | { kind: "openUrl"; url: string }
   | { kind: "callModule"; moduleId: string; method: string; args: CallModuleArg[] }
+  // Like callModule, but writes the method's return value into a variable
+  // in one shot. Lets users capture the result of e.g. `fetchTime()` without
+  // having to learn the `logos.callModule(...)` expression syntax.
+  | { kind: "callModuleToVariable"; varId: string; moduleId: string; method: string; args: CallModuleArg[] }
   // High-level "publish a message via the delivery network" action. Hides
   // all the bootstrap (createNode, start) — the QML emitter wires those up
   // automatically the first time any sendMessage or onMessageReceived is
@@ -108,7 +112,14 @@ export type ButtonAction =
   // `string` — its content is a JSON-encoded array. The QML emitter parses,
   // pushes, and re-stringifies on each call. Used to build "log" / "list of
   // messages" patterns without making the user write the JSON expression.
-  | { kind: "appendToList"; varId: string; value: string; mode?: SetVariableMode };
+  | { kind: "appendToList"; varId: string; value: string; mode?: SetVariableMode }
+  // Branch: when `condition` (a JS expression) is truthy, run `actions` in
+  // order. Conditions are free-form expressions — same shape as the rest of
+  // the editor's "expression mode" — so they can reference any variable,
+  // any in-scope identifier (e.g. `payload` in onMessageReceived triggers),
+  // and any JS operator. Empty condition is treated as `true`. Nesting `if`
+  // actions inside other `if`s is fine; the editor recurses.
+  | { kind: "if"; condition: string; actions: ButtonAction[] };
 
 export interface ButtonNode extends BaseProps {
   kind: "Button";
@@ -551,6 +562,10 @@ export interface CoreModuleSpec {
   dependencies: string[];
   methods: CoreMethod[];
   state: CoreStateField[];
+  // Events this module emits via `emit eventResponse(...)`. Declared by the
+  // AI when it builds the module so the editor's trigger picker (When module
+  // event happens) and the Modules detail modal can surface them.
+  events?: ModuleEvent[];
 }
 
 export const newCoreModule = (): CoreModuleSpec => ({
