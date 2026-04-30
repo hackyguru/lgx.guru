@@ -753,13 +753,70 @@ export default function Page() {
   const qmlPreview = useMemo(() => emitMainQml(app, false), [app]);
   const qmlExport = useMemo(() => emitMainQml(app, true), [app]);
 
+  // Track the latest QML in a ref so the iframe's onLoad handler (which
+  // can fire AT ANY TIME — initial load, JS-layer auto-retry, manual
+  // reload) can always post the current source. Without this, after an
+  // auto-retry the iframe boots, shows its built-in "Renderer ready"
+  // placeholder, and the editor never reposts because qmlPreview hasn't
+  // changed — so the user sees the placeholder forever.
+  const qmlPreviewRef = useRef(qmlPreview);
+  useEffect(() => { qmlPreviewRef.current = qmlPreview; }, [qmlPreview]);
+
+  // Live updates: every time qmlPreview changes, push to the iframe.
+  // (No-op on first render if the iframe is still booting — the iframe's
+  // index.html has a pending queue that drains on Qt-WASM onLoaded.)
   useEffect(() => {
     const id = setTimeout(() => {
+      console.log("[parent] posting qmlPreview-changed loadQml, length:", qmlPreview.length);
       const msg = { type: "loadQml", source: qmlPreview };
       canvasIframeRef.current?.contentWindow?.postMessage(msg, "*");
     }, 100);
     return () => clearTimeout(id);
   }, [qmlPreview]);
+
+  // The iframe's index.html posts { type: "renderer-ready" } when Qt-WASM
+  // finishes booting. That's our reliable signal — onLoad fires when HTML
+  // parses, but Qt-WASM takes seconds more to boot, and posting earlier
+  // races against the iframe's own pending-queue drain. Posting here
+  // guarantees the renderer is alive AND the loadQml binding is wired.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = (ev: MessageEvent) => {
+      if (ev.data?.type !== "renderer-ready") return;
+      console.log("[parent] received renderer-ready, posting current qmlPreview, length:", qmlPreviewRef.current.length);
+      // The renderer-ready ping is our ground-truth "renderer is alive"
+      // signal — iframe.onLoad is unreliable in practice (sometimes
+      // doesn't fire even though Qt-WASM finished booting). Flip the
+      // status state machine to "ready" here too so the spinner clears.
+      renderer.handleLoad();
+      const msg = { type: "loadQml", source: qmlPreviewRef.current };
+      canvasIframeRef.current?.contentWindow?.postMessage(msg, "*");
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Iframe-load callback. Primary signal for "iframe is ready" is the
+  // renderer-ready ping above. But we ALSO post on iframe.onLoad as a
+  // fallback for two cases:
+  //   1. The iframe is serving an OLD cached index.html that doesn't
+  //      yet send the ping (post-deploy / browser cache lag).
+  //   2. The iframe successfully boots Qt-WASM but the parent's listener
+  //      isn't yet attached (extremely fast boot, theoretical).
+  // Posts go into the iframe's pending queue if Qt-WASM is still booting,
+  // and drain on Qt-WASM's onLoaded — so this is safe even when the ping
+  // path also fires; the iframe just calls loadQml twice with identical
+  // source, which is idempotent.
+  const handleIframeLoad = useCallback(() => {
+    console.log("[parent] iframe onLoad fired");
+    renderer.handleLoad();
+    setTimeout(() => {
+      console.log("[parent] posting onLoad-fallback loadQml, length:", qmlPreviewRef.current.length);
+      const msg = { type: "loadQml", source: qmlPreviewRef.current };
+      canvasIframeRef.current?.contentWindow?.postMessage(msg, "*");
+    }, 50);
+  }, [renderer]);
 
   // ── Edit ops (each one snapshots history at the right boundary) ──────────
 
@@ -2553,7 +2610,7 @@ export default function Page() {
                   className="absolute inset-0 h-full w-full bg-zinc-50 dark:bg-zinc-800"
                   style={{ pointerEvents: runMode ? "auto" : "none" }}
                   title="canvas-renderer"
-                  onLoad={renderer.handleLoad}
+                  onLoad={handleIframeLoad}
                   onError={renderer.handleError}
                 />
               )}

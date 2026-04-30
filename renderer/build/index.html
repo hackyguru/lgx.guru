@@ -27,16 +27,19 @@
       let qtModule = null;
       const pending = [];
 
+      console.log("[renderer] script loaded, attaching message listener");
+
       (async () => {
         try {
+          console.log("[renderer] calling qtLoad...");
           qtModule = await qtLoad({
             qt: {
               onLoaded: () => {
+                console.log("[renderer] onLoaded fired (qtModule still null at this point)");
                 document.getElementById("spinner").style.display = "none";
-                // Drain any queued QML that arrived before the engine was ready.
-                while (pending.length) qtModule.loadQml(pending.shift());
               },
               onExit: (e) => {
+                console.log("[renderer] onExit:", e);
                 document.getElementById("spinner").textContent =
                   "Renderer exited: " + (e.text || e.code || "(unknown)");
                 document.getElementById("spinner").style.display = "flex";
@@ -45,8 +48,21 @@
               containerElements: [document.getElementById("screen")],
             },
           });
+          console.log("[renderer] qtLoad resolved. qtModule:", qtModule, "has loadQml:", typeof qtModule?.loadQml);
+          console.log("[renderer] draining pending queue, length:", pending.length);
+          while (pending.length) {
+            const src = pending.shift();
+            try {
+              qtModule.loadQml(src);
+              console.log("[renderer] drained loadQml ok, length:", src.length);
+            } catch (e) { console.error("[renderer] drain loadQml threw:", e); }
+          }
+          console.log("[renderer] posting renderer-ready to parent");
+          try {
+            window.parent.postMessage({ type: "renderer-ready" }, "*");
+          } catch (e) { console.error("[renderer] parent postMessage threw:", e); }
         } catch (e) {
-          console.error(e);
+          console.error("[renderer] qtLoad failed:", e);
           document.getElementById("spinner").textContent = "Renderer failed: " + e;
         }
       })();
@@ -54,12 +70,16 @@
       window.addEventListener("message", (ev) => {
         const data = ev.data;
         if (!data || data.type !== "loadQml" || typeof data.source !== "string") return;
+        console.log("[renderer] received loadQml message, qtModule ready:", !!qtModule, "source length:", data.source.length);
         if (!qtModule) {
           pending.push(data.source);
+          console.log("[renderer] queued (pending length now:", pending.length, ")");
           return;
         }
-        try { qtModule.loadQml(data.source); }
-        catch (e) { console.error("loadQml threw:", e); }
+        try {
+          qtModule.loadQml(data.source);
+          console.log("[renderer] loadQml ok");
+        } catch (e) { console.error("[renderer] loadQml threw:", e); }
       });
     </script>
   </body>

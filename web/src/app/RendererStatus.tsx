@@ -15,7 +15,17 @@ type Status =
   | { kind: "timeout" }
   | { kind: "error"; message: string };
 
+// Bumped to 60s now that Qt-WASM boot timing varies + auto-retry is off.
+// The renderer-ready handshake (iframe → parent) is the canonical signal
+// that booting succeeded; iframe.onLoad has been unreliable in practice
+// (sometimes never fires on first cold-cache load even though Qt-WASM
+// finished). We still surface a manual retry button if we time out.
 const LOAD_TIMEOUT_MS = 60_000;
+// Auto-retry was masking real bugs by remounting the iframe every 15s,
+// which discarded any QML the editor had successfully loaded. The proper
+// handshake makes auto-retry unnecessary; user can hit the manual retry
+// button if the renderer genuinely fails.
+const MAX_AUTO_RETRIES = 0;
 
 function checkCapabilities(): { ok: true } | { ok: false; reasons: string[] } {
   // Only check what we can reliably check from the parent. The renderer runs
@@ -35,6 +45,9 @@ export function useRendererStatus() {
   const [status, setStatus] = useState<Status>({ kind: "checking" });
   const [reloadKey, setReloadKey] = useState(0);
   const timeoutRef = useRef<number | null>(null);
+  // Tracks how many silent reloads we've done since the last successful
+  // load. Resets to 0 on `ready` and on a manual user retry click.
+  const autoRetryCountRef = useRef(0);
 
   // Capability check runs once after mount so SSR output stays stable.
   useEffect(() => {
@@ -46,12 +59,28 @@ export function useRendererStatus() {
     setStatus({ kind: "loading" });
   }, []);
 
-  // Watchdog: if the iframe never fires `load`, surface a timeout so the user
-  // sees a retry button instead of an indefinite spinner.
+  // Watchdog: if the iframe never fires `load` within LOAD_TIMEOUT_MS, do
+  // a silent reload (up to MAX_AUTO_RETRIES). After that, surface the
+  // timeout state so the user gets an explicit retry button.
   useEffect(() => {
     if (status.kind !== "loading") return;
     timeoutRef.current = window.setTimeout(() => {
-      setStatus({ kind: "timeout" });
+      if (autoRetryCountRef.current < MAX_AUTO_RETRIES) {
+        autoRetryCountRef.current += 1;
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[lgx] renderer didn't load in ${LOAD_TIMEOUT_MS}ms — silent retry ${autoRetryCountRef.current}/${MAX_AUTO_RETRIES}.`,
+        );
+        // Bumping the reloadKey forces the iframe's src to change, which
+        // remounts it from scratch — clears any half-booted Qt-WASM state.
+        setReloadKey((k) => k + 1);
+        // Stay in "loading" state and re-arm the watchdog by toggling
+        // status briefly so the effect re-runs. Easiest way: dispatch a
+        // status with a new identity.
+        setStatus({ kind: "loading" });
+      } else {
+        setStatus({ kind: "timeout" });
+      }
     }, LOAD_TIMEOUT_MS);
     return () => {
       if (timeoutRef.current !== null) {
@@ -62,6 +91,7 @@ export function useRendererStatus() {
   }, [status.kind, reloadKey]);
 
   const handleLoad = useCallback(() => {
+    autoRetryCountRef.current = 0;
     setStatus((p) => (p.kind === "loading" ? { kind: "ready" } : p));
   }, []);
 
@@ -74,6 +104,7 @@ export function useRendererStatus() {
   }, []);
 
   const retry = useCallback(() => {
+    autoRetryCountRef.current = 0;
     setStatus({ kind: "loading" });
     setReloadKey((k) => k + 1);
   }, []);

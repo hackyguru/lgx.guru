@@ -20,7 +20,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header("Cache-Control", "no-store")
+        # `no-cache` (NOT `no-store`) lets the browser cache the 31MB .wasm
+        # but always revalidate before reuse. Python's SimpleHTTPRequestHandler
+        # honors If-Modified-Since and returns 304 for unchanged files —
+        # browser keeps the cached body, so no megabytes go over the wire on
+        # every refresh. After a renderer rebuild, mtime changes and the
+        # browser fetches the new body. Old setting was `no-store` which
+        # forced a full re-download on every page load — felt like the
+        # renderer was downloading "every time" because it literally was.
+        self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
 
