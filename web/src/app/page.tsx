@@ -1935,11 +1935,24 @@ export default function Page() {
   const dragHasFiles = (e: React.DragEvent) =>
     Array.from(e.dataTransfer.types).includes("Files");
 
+  // Drops are gated on renderer readiness — without the live preview it's
+  // confusing for users to drop a node and see nothing happen (the canvas
+  // wouldn't render until the wasm finishes booting). We refuse the drop
+  // event entirely so the browser shows the "no-drop" cursor.
+  const rendererReady = renderer.status.kind === "ready";
+
   const handleCanvasDragOver = (e: React.DragEvent) => {
+    if (!rendererReady) return;  // cursor falls back to "no-drop"
     if (draggingKind || dragHasFiles(e)) e.preventDefault();
   };
 
   const handleCanvasDrop = (e: React.DragEvent, targetFrameId: NodeId) => {
+    if (!rendererReady) {
+      // Defensive: shouldn't reach here if dragOver returned early, but
+      // some browsers fire drop without a matching dragover.
+      e.preventDefault();
+      return;
+    }
     // Compute drop coords once (relative to the frame's content origin).
     const target = e.currentTarget as HTMLDivElement;
     const rect = target.getBoundingClientRect();
@@ -2516,12 +2529,26 @@ export default function Page() {
                       {cat.items.map((p) => (
                         <button
                           key={p.kind}
-                          draggable
-                          onDragStart={() => setDraggingKind(p.kind)}
+                          // Gate drag + click on renderer readiness so users
+                          // don't drop nodes into a half-booted canvas where
+                          // nothing visibly happens.
+                          draggable={rendererReady}
+                          disabled={!rendererReady}
+                          onDragStart={() => rendererReady && setDraggingKind(p.kind)}
                           onDragEnd={() => setDraggingKind(null)}
-                          onClick={p.kind === "Image" ? () => imageFileInputRef.current?.click() : undefined}
-                          className="flex cursor-grab items-center gap-1.5 truncate rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 px-1.5 py-1 text-left text-[11px] hover:border-zinc-400 dark:hover:border-zinc-500 active:cursor-grabbing"
-                          title={p.kind === "Image" ? "Click to upload, or drag for a placeholder" : p.label}
+                          onClick={p.kind === "Image" && rendererReady ? () => imageFileInputRef.current?.click() : undefined}
+                          className={`flex items-center gap-1.5 truncate rounded border px-1.5 py-1 text-left text-[11px] transition-colors ${
+                            rendererReady
+                              ? "border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 cursor-grab active:cursor-grabbing hover:border-zinc-400 dark:hover:border-zinc-500"
+                              : "border-zinc-100 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/40 opacity-50 cursor-not-allowed"
+                          }`}
+                          title={
+                            !rendererReady
+                              ? "Waiting for the live preview to finish loading…"
+                              : p.kind === "Image"
+                                ? "Click to upload, or drag for a placeholder"
+                                : p.label
+                          }
                         >
                           <NodeIcon kind={p.kind} className="text-zinc-500 dark:text-zinc-400" />
                           <span className="truncate">{p.label}</span>
