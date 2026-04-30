@@ -50,6 +50,51 @@ describe("pre-flight body lint", () => {
     if (!r.ok) expect(r.errors.join("\n")).toMatch(/callModule/);
   });
 
+  it("rejects bare connect(...) — impl class isn't a QObject", async () => {
+    const r = await buildCoreModule(baseSpec(
+      `QNetworkReply* reply = nullptr;\n` +
+      `connect(reply, &QNetworkReply::finished, [](){});`
+    ));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.errors.join("\n")).toMatch(/QObject::connect/);
+      expect(r.durationMs).toBeLessThan(500);
+    }
+  });
+
+  it("allows QObject::connect (the explicit static form)", async () => {
+    // Should NOT trip the lint — the negative-lookbehind exempts QObject::connect.
+    const r = await buildCoreModule(baseSpec(
+      `QNetworkReply* reply = nullptr;\n` +
+      `QObject::connect(reply, &QNetworkReply::finished, reply, [](){});`
+    ));
+    if (!r.ok) {
+      // If it failed, must be for a non-lint reason (e.g. nix actually compiled).
+      expect(r.stderrTail).not.toMatch(/lgx\.guru pre-flight lint/);
+    }
+  }, 600_000);
+
+  it("rejects QNetworkAccessManager(this) — passing impl as QObject*", async () => {
+    const r = await buildCoreModule(baseSpec(
+      `QNetworkAccessManager* mgr = new QNetworkAccessManager(this);\n` +
+      `(void)mgr;`
+    ));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.errors.join("\n")).toMatch(/QNetworkAccessManager/);
+      expect(r.durationMs).toBeLessThan(500);
+    }
+  });
+
+  it("rejects emit signal() — impl class has no Q_OBJECT", async () => {
+    const r = await buildCoreModule(baseSpec(`emit somethingChanged(42);`));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.errors.join("\n")).toMatch(/emit/i);
+      expect(r.durationMs).toBeLessThan(500);
+    }
+  });
+
   it("allows clean self-contained bodies", async () => {
     // We don't want this test to actually invoke nix, but the lint should
     // pass cleanly. We verify by checking the result either succeeds OR

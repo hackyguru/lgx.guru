@@ -73,6 +73,26 @@ function lintBodies(spec: CoreModuleSpec): string[] {
     if (/->\s*callModule\b/.test(body) || /\bcallRemoteMethod\b/.test(body)) {
       issues.push(`Method ${m.name}: tries to call another module from inside C++. Not supported.`);
     }
+    // QObject-style C++ patterns the impl class can't support — catch
+    // before nix wastes 5 min on a guaranteed compile failure.
+    if (/(?<!QObject::)\bconnect\s*\(/.test(body)) {
+      issues.push(
+        `Method ${m.name}: bare \`connect(...)\` won't work — impl class isn't a QObject. ` +
+        `Use \`QObject::connect(reply, &QNetworkReply::finished, reply, lambda)\`.`
+      );
+    }
+    if (/\bQNetworkAccessManager\s*\(\s*this\b/.test(body)) {
+      issues.push(
+        `Method ${m.name}: \`QNetworkAccessManager(this)\` fails — impl class isn't QObject*. ` +
+        `Use a Private state field, or instantiate locally with no parent.`
+      );
+    }
+    if (/\bemit\s+\w+\s*\(/.test(body)) {
+      issues.push(
+        `Method ${m.name}: \`emit signalName(...)\` — impl class is plain C++, no signals. ` +
+        `Cross-module events go through the UI layer (QML polling Timer + callModule).`
+      );
+    }
   }
   return issues;
 }

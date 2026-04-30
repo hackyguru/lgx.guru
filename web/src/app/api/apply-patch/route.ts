@@ -274,6 +274,45 @@ Use \`QNetworkAccessManager\` async with a connect-to-finished lambda. Never blo
 - All state — Qt-typed (\`QNetworkAccessManager\`, \`QTimer\`, \`QString\`) and std-typed (\`bool\`, \`int64_t\`) — goes in \`Private\` and is accessed as \`d->m_<name>\`.
 - Methods can also instantiate Qt objects locally: \`QNetworkAccessManager mgr; auto* reply = mgr.get(...);\` etc.
 
+## CRITICAL — the impl class is NOT a QObject
+
+The codegen emits \`<Pascal(id)>Impl\` as a **plain C++ class with pimpl**, NOT a \`QObject\` subclass. There is no \`Q_OBJECT\` macro, no \`moc\` integration, no \`connect()\` syntax sugar, no \`emit\`. The AI keeps generating QObject-style C++ that fails to compile. Don't.
+
+**Forbidden patterns (compile errors guaranteed):**
+
+- \`QNetworkAccessManager(this)\` — passing \`this\` as parent. \`LondonTimeFetcherImpl*\` isn't a \`QObject*\`. Compile error: *no matching function for call to 'QNetworkAccessManager::QNetworkAccessManager(LondonTimeFetcherImpl*)'.*
+- \`connect(reply, &QNetworkReply::finished, ...)\` — bare \`connect\` is a member of QObject; the impl class doesn't have it. Compile error: *'connect' was not declared in this scope*.
+- \`emit somethingChanged(...)\` — same reason; no signals on a plain class.
+- Lambda capturing \`this\` and using it inside a Qt callback to access \`d->m_*\` — works only when the lambda **doesn't outlive the impl**. Prefer capturing what you need by value.
+
+**Correct patterns (use these verbatim):**
+
+\`\`\`cpp
+// State (declared as a CoreStateField with cppType QNetworkAccessManager):
+//   d->m_manager  — already constructed by codegen.
+
+// Kick off a request:
+QNetworkRequest req(QUrl(QStringLiteral("https://example.com/api")));
+QNetworkReply* reply = d->m_manager.get(req);
+
+// Connect with the EXPLICIT QObject:: namespace and use the reply as the
+// receiver context (so the connection auto-disconnects when reply is
+// deleted — no dangling capture).
+QObject::connect(reply, &QNetworkReply::finished, reply, [this, reply]() {
+    if (reply->error() == QNetworkReply::NoError) {
+        const QByteArray bytes = reply->readAll();
+        // ... parse, assign to d->m_last ...
+    }
+    reply->deleteLater();
+});
+\`\`\`
+
+Notes:
+- \`QObject::connect\` (with the namespace prefix) IS a free static — works from non-QObject classes.
+- The 4-arg form \`QObject::connect(sender, signal, context, lambda)\` ties the lifetime of the connection to \`context\`. Use \`reply\` as context — when the reply is deleted, the lambda goes too.
+- \`reply->deleteLater()\` cleans up the QNetworkReply. Always include it.
+- Capture \`this\` to write to \`d->m_*\` — fine because the impl class outlives the network request in our usage.
+
 ## Module composition rules — READ BEFORE BUILDING A MODULE
 
 **Custom C++ modules are SELF-CONTAINED.** They cannot call other modules from inside their bodies. There is NO working LogosAPI / m_api / inter-module-call hook available to AI-built modules right now. Bodies that reference \`m_api\`, \`LogosAPI\`, or \`->callModule(\` will be rejected by the build pipeline before nix even runs.

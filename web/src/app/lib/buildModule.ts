@@ -97,6 +97,31 @@ function lintBodies(spec: CoreModuleSpec): string[] {
         `Not supported — restructure so this method does its work standalone, and have the UI do the cross-module orchestration.`
       );
     }
+    // QObject-style C++ patterns the impl class can't support (it's a plain
+    // C++ class, not a QObject). Catch these BEFORE nix runs so the error
+    // message tells the AI exactly what to do — otherwise it sees a wall of
+    // template gibberish and retries with the same broken pattern.
+    if (/(?<!QObject::)\bconnect\s*\(/.test(body)) {
+      issues.push(
+        `Method ${m.name}: uses bare \`connect(...)\`, but the impl class is NOT a QObject. ` +
+        `Use the explicit static form: \`QObject::connect(reply, &QNetworkReply::finished, reply, [this, reply]() { … })\`. ` +
+        `The \`reply\` arg as the receiver context auto-disconnects when reply is deleted.`
+      );
+    }
+    if (/\bQNetworkAccessManager\s*\(\s*this\b/.test(body)) {
+      issues.push(
+        `Method ${m.name}: \`QNetworkAccessManager(this)\` — passing \`this\` as parent. ` +
+        `The impl class isn't a QObject*, so this fails to compile. ` +
+        `Either: (a) declare a state field with cppType=QNetworkAccessManager and use d->m_<name>, or ` +
+        `(b) instantiate it locally with no parent: \`QNetworkAccessManager mgr; auto* reply = mgr.get(req);\`.`
+      );
+    }
+    if (/\bemit\s+\w+\s*\(/.test(body)) {
+      issues.push(
+        `Method ${m.name}: uses \`emit signalName(...)\`, but the impl class is NOT a QObject and has no signals. ` +
+        `Cross-module events go through the UI layer (logos.callModule from QML on a polling Timer), not C++ signals.`
+      );
+    }
   }
   return issues;
 }
