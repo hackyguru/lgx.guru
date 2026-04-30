@@ -1977,19 +1977,22 @@ export default function Page() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // Ignore when typing into form inputs.
-      const t = e.target as HTMLElement | null;
-      const tag = t?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || t?.isContentEditable) return;
-
       const meta = e.metaKey || e.ctrlKey;
+
+      // Cmd+S works EVERYWHERE — including from inside text inputs. Users
+      // expect "save my work" to be available while typing in a property
+      // panel, label field, etc. We override the browser's "save page"
+      // default so Cmd+S routes to the project autosave instead.
       if (meta && e.key.toLowerCase() === "s") {
-        // Cmd+S persists this project to localStorage. Override the
-        // browser's "save page" default — we never want that here.
         e.preventDefault();
         handleSaveLocal();
         return;
       }
+
+      // Ignore the rest when typing into form inputs.
+      const t = e.target as HTMLElement | null;
+      const tag = t?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || t?.isContentEditable) return;
       if (meta && e.key.toLowerCase() === "z") {
         e.preventDefault();
         dispatch({ type: e.shiftKey ? "redo" : "undo" });
