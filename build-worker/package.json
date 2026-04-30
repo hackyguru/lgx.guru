@@ -1,0 +1,22 @@
+{
+  "name": "@lgx/build-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "HTTP wrapper around `nix build` for the lgx.guru editor's `build_backend_module` flow. Same interface as the editor's local builder; selected by setting LGX_BUILD_BACKEND=remote on the editor side.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.19.0",
+    "typescript": "^5"
+  }
+}

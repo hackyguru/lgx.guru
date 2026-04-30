@@ -19,7 +19,9 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_OPENAI_MODEL = "gpt-5.5";
+// Default OpenAI model — pick one that's widely available on most accounts.
+// Override per-deploy with OPENAI_MODEL env var (e.g. `gpt-5`, `o3-mini`).
+const DEFAULT_OPENAI_MODEL = "gpt-4o";
 const DEFAULT_NVIDIA_MODEL = "z-ai/glm-5.1";
 
 interface LLM { client: OpenAI; model: string; providerName: "OpenAI" | "NVIDIA" }

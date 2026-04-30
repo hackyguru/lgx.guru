@@ -27,9 +27,16 @@ import {
 } from "./lib/projects";
 import { suggestKickoffMethod, wireLiveData, type LiveDataSpec } from "./lib/wireLiveData";
 
-// Renderer iframe URL — served by renderer/serve.py on port 8765.
-// Run `python3 renderer/serve.py 8765` from the lgx-builder root.
-const RENDERER_URL = "http://127.0.0.1:8765/index.html";
+// Renderer iframe URL — same-origin static files. Next.js serves them
+// from `web/public/renderer/` with the COOP/COEP headers configured in
+// next.config.ts (required for Qt-WASM's SharedArrayBuffer use).
+//
+// Override via env for local renderer-source iteration:
+//   NEXT_PUBLIC_RENDERER_URL=http://127.0.0.1:8765/index.html  pnpm dev
+// (pair with `python3 renderer/serve.py 8765` to serve the build dir
+// directly without copying via `pnpm sync-renderer`.)
+const RENDERER_URL =
+  process.env.NEXT_PUBLIC_RENDERER_URL ?? "/renderer/index.html";
 
 interface PaletteItem { kind: NodeKind; label: string }
 interface PaletteCategory { name: string; items: PaletteItem[] }
@@ -2235,8 +2242,8 @@ export default function Page() {
   const canRedo = hist.future.length > 0;
 
   return (
-    <div className="flex h-screen flex-col bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100">
-      <header className="flex h-12 items-center justify-between border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-4">
+    <div className="flex h-screen flex-col bg-zinc-50 dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100">
+      <header className="flex h-12 items-center justify-between border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-4">
         <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold tracking-tight">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
@@ -2244,14 +2251,24 @@ export default function Page() {
             alt="lgx.guru"
             width={28}
             height={28}
-            // The logo's main strokes are near-black so they vanish on dark
-            // backgrounds; invert in dark mode for legibility.
             className="h-7 w-7 dark:invert"
           />
           <span className="sr-only">lgx.guru</span>
           {activeProject && (
             <>
-              <span className="text-zinc-400 dark:text-zinc-500">/</span>
+              <a
+                href="/dashboard"
+                onClick={(e) => {
+                  e.preventDefault();
+                  flushSave();
+                  window.location.assign("/dashboard");
+                }}
+                title="Back to all projects"
+                className="ml-1 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-normal text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+              >
+                Projects
+              </a>
+              <span className="text-zinc-300 dark:text-zinc-600">/</span>
               <button
                 onClick={() => {
                   const next = window.prompt("Rename project", activeProject.name);
@@ -2262,38 +2279,28 @@ export default function Page() {
                   setActiveProject({ ...activeProject, name: trimmed });
                 }}
                 title="Click to rename"
-                className="min-w-0 truncate rounded px-1 text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                className="min-w-0 truncate rounded px-1.5 py-0.5 text-zinc-800 transition-colors hover:bg-zinc-100 dark:text-zinc-100 dark:hover:bg-zinc-800"
               >
                 {activeProject.name}
               </button>
             </>
           )}
         </h1>
-        <div className="flex items-center gap-2">
-          <a
-            href="/dashboard"
-            // Flush any pending debounced autosave before the browser
-            // tears down React on navigation. Without this, an edit made
-            // within the 400ms autosave window before clicking gets lost.
-            onClick={(e) => {
-              e.preventDefault();
-              flushSave();
-              window.location.assign("/dashboard");
-            }}
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
-            title="Back to all projects"
-          >← Projects</a>
+        <div className="flex items-center gap-1.5">
+          {/* Primary AI action — distinct accent so it stands out */}
           <button
             onClick={() => setAskAIOpen(true)}
-            className="rounded border border-blue-300 bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-950 dark:text-blue-300 dark:hover:bg-blue-900"
+            className="rounded-md border border-indigo-300/70 bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700 transition-colors hover:bg-indigo-100 hover:border-indigo-400 dark:border-indigo-700/50 dark:bg-indigo-950/60 dark:text-indigo-300 dark:hover:bg-indigo-950 dark:hover:border-indigo-700"
             title="Describe a change in plain English; AI wires it up (variables, triggers, bindings)."
           >✦ Ask AI</button>
+
+          {/* Templates dropdown */}
           <div className="relative">
             <button
-              className={`rounded border px-2 py-1 text-xs ${
+              className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
                 templatesOpen
-                  ? "border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300"
-                  : "border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+                  ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
+                  : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
               }`}
               onClick={() => setTemplatesOpen((v) => !v)}
               title="Replace canvas with a starter template"
@@ -2305,21 +2312,21 @@ export default function Page() {
                   onClick={() => setTemplatesOpen(false)}
                 />
                 <div
-                  className="absolute right-0 top-full z-20 mt-1 w-64 rounded border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-lg"
+                  className="absolute right-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-950"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="border-b border-zinc-200 dark:border-zinc-700 px-3 py-2 text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                  <div className="border-b border-zinc-100 px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
                     Pick a template
                   </div>
                   <div className="max-h-80 overflow-y-auto py-1">
                     {TEMPLATES.map((t) => (
                       <button
                         key={t.id}
-                        className="block w-full px-3 py-1.5 text-left hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+                        className="block w-full px-3 py-2 text-left transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-900"
                         onClick={() => applyTemplate(t)}
                       >
-                        <div className="text-[12px] font-medium text-zinc-800 dark:text-zinc-200">{t.name}</div>
-                        <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">{t.description}</div>
+                        <div className="text-xs font-medium text-zinc-800 dark:text-zinc-100">{t.name}</div>
+                        <div className="mt-0.5 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">{t.description}</div>
                       </button>
                     ))}
                   </div>
@@ -2327,19 +2334,24 @@ export default function Page() {
               </>
             )}
           </div>
+
+          {/* Subtle divider between primary tools and file ops */}
+          <span className="mx-0.5 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
+
+          {/* File ops */}
           <button
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+            className="rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-xs text-zinc-700 transition-colors hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
             onClick={() => designFileInputRef.current?.click()}
             title="Open a .lgx-design.json or a .lgx exported from this editor"
           >Open</button>
           <button
-            className={`rounded border px-2 py-1 text-xs transition-colors ${
+            className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
               saveFeedback === "saved"
-                ? "border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300"
-                : "border-zinc-300 dark:border-zinc-600 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+                ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
             }`}
             onClick={handleSaveLocal}
-            title="Save this project to your browser (Cmd+S). Opens from the dashboard. For a portable backup, use Export → Download project (.json)."
+            title="Save this project to your browser (⌘S). Opens from the dashboard. For a portable backup, use Export → Download project (.json)."
           >{saveFeedback === "saved" ? "Saved ✓" : "Save"}</button>
           <input
             ref={designFileInputRef}
@@ -2352,29 +2364,38 @@ export default function Page() {
               e.target.value = "";
             }}
           />
-          <span className="mx-1 h-5 w-px bg-zinc-200" />
+
+          <span className="mx-0.5 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
+
+          {/* History */}
           <button
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
+            className="rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-xs text-zinc-700 transition-colors hover:bg-zinc-50 hover:border-zinc-300 disabled:opacity-30 disabled:cursor-not-allowed dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
             disabled={!canUndo}
             onClick={() => dispatch({ type: "undo" })}
-            title="Undo (Cmd+Z)"
+            title="Undo (⌘Z)"
           >Undo</button>
           <button
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
+            className="rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-xs text-zinc-700 transition-colors hover:bg-zinc-50 hover:border-zinc-300 disabled:opacity-30 disabled:cursor-not-allowed dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
             disabled={!canRedo}
             onClick={() => dispatch({ type: "redo" })}
-            title="Redo (Cmd+Shift+Z)"
+            title="Redo (⌘⇧Z)"
           >Redo</button>
+
+          <span className="mx-0.5 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
+
+          {/* Theme toggle — icon-only */}
           <button
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-600 transition-colors hover:bg-zinc-50 hover:border-zinc-300 hover:text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:border-zinc-600 dark:hover:text-zinc-200"
             onClick={cycleTheme}
             title={`Theme: ${themePref} (click to cycle light → dark → system)`}
             aria-label="Cycle theme"
           >
-            {themePref === "light" ? "☀" : themePref === "dark" ? "☾" : "◐"}
+            <span className="text-[13px] leading-none">{themePref === "light" ? "☀" : themePref === "dark" ? "☾" : "◐"}</span>
           </button>
+
+          {/* Primary export action — pulled visually distinct */}
           <button
-            className="ml-2 rounded bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700 dark:hover:bg-zinc-200 dark:bg-zinc-100 dark:bg-zinc-800 dark:text-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-300 dark:hover:bg-zinc-700"
+            className="ml-1.5 rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400"
             onClick={() => setExportOpen(true)}
           >Export…</button>
         </div>
@@ -2386,11 +2407,11 @@ export default function Page() {
               module, Components). Scrolls so any combination of panels fits.
             - bottom: Layers, capped to 40% of the column height with its own
               scroll so deeply-nested designs stay manageable. */}
-        <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 min-h-0">
+        <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 min-h-0">
           {/* Tab strip — three mode-based views, only one rendered at a
               time. Badges (count when non-zero) signal that a tab has
               content even when not currently active. */}
-          <div className="shrink-0 flex border-b border-zinc-200 dark:border-zinc-700">
+          <div className="shrink-0 flex border-b border-zinc-200 dark:border-zinc-800">
             {([
               { id: "design"  as SidebarTab, label: "Design",  badge: app.pages.length > 1 ? app.pages.length : undefined },
               { id: "logic"   as SidebarTab, label: "Logic",   badge: (app.variables.length + app.triggers.length) || undefined },
@@ -2401,15 +2422,19 @@ export default function Page() {
                 <button
                   key={t.id}
                   onClick={() => switchSidebarTab(t.id)}
-                  className={`flex-1 px-2 py-2 text-[11px] font-semibold uppercase tracking-wide border-b-2 -mb-px transition-colors ${
+                  className={`flex-1 px-2 py-2.5 text-[10px] font-semibold uppercase tracking-wider border-b-2 -mb-px transition-colors ${
                     active
-                      ? "border-blue-500 text-zinc-800 dark:text-zinc-100"
-                      : "border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                      ? "border-indigo-500 text-zinc-900 dark:text-zinc-50"
+                      : "border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 hover:text-zinc-700 dark:hover:bg-zinc-900 dark:hover:text-zinc-200"
                   }`}
                 >
                   {t.label}
                   {t.badge !== undefined && (
-                    <span className="ml-1 rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 text-[9px] text-zinc-500 dark:text-zinc-400 leading-none">{t.badge}</span>
+                    <span className={`ml-1 rounded-full px-1.5 py-0.5 text-[9px] font-medium leading-none ${
+                      active
+                        ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
+                        : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                    }`}>{t.badge}</span>
                   )}
                 </button>
               );
@@ -2527,7 +2552,7 @@ export default function Page() {
           {/* Layers — anchored at the bottom, capped to 40vh so it shares
               column height fairly with the panels above. Internal scroll for
               deep trees. */}
-          <div className="shrink-0 flex flex-col border-t border-zinc-200 dark:border-zinc-700 max-h-[40vh] min-h-[120px]">
+          <div className="shrink-0 flex flex-col border-t border-zinc-200 dark:border-zinc-800 max-h-[40vh] min-h-[120px]">
             <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 dark:border-zinc-700 px-2.5 py-1.5">
               <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Layers</span>
               <span className="text-[10px] text-zinc-400 dark:text-zinc-500">drag to reorder</span>
@@ -2554,8 +2579,8 @@ export default function Page() {
             clicks fall through to Qt and the user can interact with their
             widget (test buttons, type into fields, send messages). */}
         <main className="flex flex-1 flex-col min-w-0">
-          <section className="flex flex-1 flex-col bg-zinc-100 dark:bg-zinc-800 min-h-0">
-            <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-1.5">
+          <section className="flex flex-1 flex-col bg-zinc-100 dark:bg-zinc-900 min-h-0">
+            <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-3 py-1.5">
               <div className="flex items-center gap-2">
                 <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400">
                   {runMode ? "Run" : "Canvas"}
@@ -2566,10 +2591,10 @@ export default function Page() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                  className={`rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors ${
                     runMode
-                      ? "border-emerald-400 dark:border-emerald-600 bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300"
-                      : "border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                      ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
+                      : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
                   }`}
                   onClick={() => setRunMode((v) => !v)}
                   title="Toggle Edit ↔ Run. Edit lets you select & drag widgets; Run forwards clicks to Qt so you can test the live widget."
@@ -2577,10 +2602,10 @@ export default function Page() {
                   {runMode ? "▶ Run" : "✎ Edit"}
                 </button>
                 <button
-                  className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                  className={`rounded-md border px-2 py-0.5 text-[11px] transition-colors ${
                     gridSize > 0
-                      ? "border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300"
-                      : "border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                      ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"
+                      : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
                   }`}
                   onClick={() => setGridSize((g) => (g === 0 ? 8 : g === 8 ? 16 : g === 16 ? 24 : 0))}
                   title="Toggle snap-to-grid (cycles off / 8 / 16 / 24 px)"
@@ -2622,6 +2647,32 @@ export default function Page() {
                 url={RENDERER_URL}
                 onRetry={renderer.retry}
               />
+              {/* Empty-canvas onboarding hint. Only shown in Edit mode when
+                  the active page has zero children AND the renderer is
+                  ready. Pointer-events:none so it doesn't intercept drops. */}
+              {!runMode
+                && renderer.status.kind === "ready"
+                && root.children.length === 0
+                && (
+                  <div className="pointer-events-none absolute inset-0 z-[1] flex items-center justify-center">
+                    <div className="rounded-lg border border-dashed border-zinc-300 bg-white/70 px-6 py-5 text-center backdrop-blur-sm dark:border-zinc-700 dark:bg-zinc-900/60">
+                      <div className="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-full bg-indigo-100 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <rect x="3" y="3" width="7" height="7" rx="1" />
+                          <rect x="14" y="3" width="7" height="7" rx="1" />
+                          <rect x="3" y="14" width="7" height="7" rx="1" />
+                          <rect x="14" y="14" width="7" height="7" rx="1" />
+                        </svg>
+                      </div>
+                      <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-100">
+                        Empty canvas
+                      </div>
+                      <p className="mx-auto mt-1 max-w-xs text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
+                        Drag a component from the left palette, pick a <span className="text-zinc-700 dark:text-zinc-300">Template</span>, or hit <span className="font-medium text-indigo-600 dark:text-indigo-400">✦ Ask AI</span> to describe what you want.
+                      </p>
+                    </div>
+                  </div>
+              )}
               {!runMode && (
                 <CanvasArea
                   root={root}
@@ -2655,7 +2706,7 @@ export default function Page() {
         </main>
 
         {/* Inspector */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-3">
+        <aside className="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-3">
           <ModulePanel
             meta={moduleMeta}
             onChange={setModuleMeta}
@@ -2666,7 +2717,7 @@ export default function Page() {
             sanitizedName={sanitizeName(moduleMeta.name) || "my_widget"}
           />
 
-          <div className="my-4 border-t border-zinc-200 dark:border-zinc-700" />
+          <div className="my-4 border-t border-zinc-200 dark:border-zinc-800" />
 
           <div className="mb-2 flex items-center justify-between">
             <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
@@ -3159,8 +3210,8 @@ function NodeView({
   // Selection outline lives on a separate transparent overlay so it doesn't
   // get clipped by overflow:hidden on the styled wrapper.
   const selectionOutline = isSelected
-    ? "outline outline-2 outline-offset-[-2px] outline-blue-500"
-    : "hover:outline hover:outline-1 hover:outline-offset-[-1px] hover:outline-blue-300";
+    ? "outline outline-2 outline-offset-[-2px] outline-indigo-500"
+    : "hover:outline hover:outline-1 hover:outline-offset-[-1px] hover:outline-indigo-300";
 
   // Locked nodes are still selectable (so the user can unlock them) but
   // can't be moved or resized. Either way we stop propagation here so the
@@ -3262,7 +3313,7 @@ function ResizeOverlay({
       {ANCHORS.map((a) => (
         <div
           key={a.anchor}
-          className="pointer-events-auto absolute rounded-sm border border-blue-500 bg-white dark:bg-zinc-900"
+          className="pointer-events-auto absolute rounded-sm border border-indigo-500 bg-white dark:bg-zinc-900"
           style={{
             width: HANDLE,
             height: HANDLE,
@@ -3281,7 +3332,7 @@ function ResizeOverlay({
 
 const I_LABEL = "block text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 mb-0.5";
 const I_INPUT =
-  "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none";
+  "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-indigo-500 focus:outline-none";
 const I_SUMMARY =
   "cursor-pointer text-[11px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 select-none mb-2";
 
@@ -3300,16 +3351,16 @@ function SidebarSection({
   children: React.ReactNode;
 }) {
   return (
-    <details open={defaultOpen} className="shrink-0 border-b border-zinc-200 dark:border-zinc-700 [&[open]>summary>span.chev]:rotate-90">
+    <details open={defaultOpen} className="shrink-0 border-b border-zinc-100 dark:border-zinc-800 [&[open]>summary>span.chev]:rotate-90">
       <summary
         // Reset the native disclosure triangle (`list-none` / Webkit) so we
         // own the visual; the rotating ▸ glyph below is the open indicator.
-        className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-2 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 list-none [&::-webkit-details-marker]:hidden"
+        className="flex cursor-pointer select-none items-center gap-1.5 px-3 py-2.5 transition-colors hover:bg-zinc-50/60 dark:hover:bg-zinc-800/40 list-none [&::-webkit-details-marker]:hidden"
       >
         <span className="chev inline-block text-[10px] text-zinc-400 dark:text-zinc-500 transition-transform">▸</span>
-        <span className="flex-1 text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400">{title}</span>
+        <span className="flex-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">{title}</span>
         {badge !== undefined && badge !== "" && (
-          <span className="rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 text-[9px] font-medium text-zinc-500 dark:text-zinc-400 leading-none">{badge}</span>
+          <span className="rounded-full bg-zinc-100 px-1.5 py-0.5 text-[9px] font-medium leading-none text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">{badge}</span>
         )}
         {/* Right-side button area (e.g. "+") — stop propagation so clicking
             it doesn't toggle the section. */}
@@ -3319,7 +3370,7 @@ function SidebarSection({
           </span>
         )}
       </summary>
-      <div className="px-2.5 pb-2.5">
+      <div className="px-3 pb-3">
         {children}
       </div>
     </details>
@@ -3425,7 +3476,7 @@ function ColorField({
           onClick={() => onChange(isTransparent ? "#ffffff" : "transparent")}
           className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${
             isTransparent
-              ? "border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300"
+              ? "border-indigo-400 dark:border-indigo-600 bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300"
               : "border-zinc-300 dark:border-zinc-600 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
           }`}
           title={isTransparent ? "Currently transparent — click to switch to a color" : "Make this transparent (no fill)"}
@@ -3615,7 +3666,7 @@ function ButtonOnClickEditor({
                       // re-flow back down.
                       setAction({ varId: id });
                     }}
-                    className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline"
+                    className="text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline"
                   >+ new</button>
                 )}
               </div>
@@ -3710,7 +3761,7 @@ function ButtonOnClickEditor({
                       const id = onAddVariable("messages");
                       setAppend({ varId: id });
                     }}
-                    className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline"
+                    className="text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline"
                   >+ new</button>
                 )}
               </div>
@@ -3849,7 +3900,7 @@ function ButtonOnClickEditor({
                 <button
                   type="button"
                   onClick={addInner}
-                  className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline"
+                  className="text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline"
                 >+ action</button>
               </div>
               <div className="mt-1 flex flex-col gap-1.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/40 p-1.5">
@@ -4256,7 +4307,7 @@ function SourceModeTabs({
       title={title}
       className={`flex-1 rounded px-2 py-1 text-[10px] font-medium transition-colors ${
         mode === id
-          ? "bg-blue-600 text-white"
+          ? "bg-indigo-600 text-white"
           : disabled
           ? "text-zinc-400 dark:text-zinc-600 cursor-not-allowed"
           : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -4432,7 +4483,7 @@ function LiveSourceWizard({
             <button
               onClick={handleWire}
               disabled={!canWire}
-              className="flex-1 rounded bg-blue-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-blue-500 disabled:opacity-40"
+              className="flex-1 rounded bg-indigo-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
             >
               ✦ Wire it up
             </button>
@@ -4947,7 +4998,7 @@ function ModelListField({
           <input
             value={v}
             onChange={(e) => update(i, e.target.value)}
-            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none"
+            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-indigo-500 focus:outline-none"
           />
           <button
             onClick={() => move(i, -1)}
@@ -5050,7 +5101,7 @@ function ModulePanel({
 }) {
   const labelClass = "block text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 mb-0.5";
   const inputClass =
-    "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-blue-500 focus:outline-none";
+    "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-indigo-500 focus:outline-none";
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const update = (patch: Partial<ModuleMeta>) => onChange({ ...meta, ...patch });
@@ -5301,7 +5352,7 @@ function PagesPanel({
               onClick={() => onSwitch(p.id)}
               onDoubleClick={() => promptRename(p)}
               className={`group flex items-center gap-1 rounded px-2 py-1 text-xs cursor-pointer ${
-                active ? "bg-blue-100 dark:bg-blue-900 text-blue-900 dark:text-blue-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                active ? "bg-indigo-100 dark:bg-indigo-900 text-indigo-900 dark:text-indigo-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
               }`}
             >
               <span className="flex-1 truncate" title={p.name}>{p.name}</span>
@@ -5653,7 +5704,7 @@ function ModulesPanel({
             const baseRow = `flex items-start gap-2 rounded border px-2 py-1.5 ${
               interactive
                 ? isOn
-                  ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-blue-950"
+                  ? "border-indigo-300 bg-indigo-50 dark:border-indigo-700 dark:bg-indigo-950"
                   : "border-zinc-200 dark:border-zinc-700"
                 : "border-zinc-200 bg-zinc-50 opacity-60 dark:border-zinc-700 dark:bg-zinc-900"
             }`;
@@ -6072,7 +6123,7 @@ function VariablesPanel({
             <div key={v.id} className="rounded border border-zinc-200 dark:border-zinc-700 p-1.5">
               <div className="mb-1 flex items-center gap-1">
                 <input
-                  className="flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] font-mono hover:border-zinc-300 dark:border-zinc-600 focus:border-blue-500 focus:bg-white dark:bg-zinc-900 focus:outline-none"
+                  className="flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] font-mono hover:border-zinc-300 dark:border-zinc-600 focus:border-indigo-500 focus:bg-white dark:bg-zinc-900 focus:outline-none"
                   value={v.name}
                   onChange={(e) => onUpdate(v.id, { name: e.target.value })}
                 />
@@ -6203,18 +6254,18 @@ function LayersPanel({
         style={{ paddingLeft: 4 + depth * 12 }}
         className={[
           "relative flex items-center gap-1 py-1 pr-2 text-[11px] cursor-pointer select-none",
-          isSelected ? "bg-blue-100 dark:bg-blue-900 text-blue-900 dark:text-blue-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800",
+          isSelected ? "bg-indigo-100 dark:bg-indigo-900 text-indigo-900 dark:text-indigo-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800",
           node.hidden ? "opacity-50" : "",
         ].join(" ")}
       >
         {dropMark === "before" && (
-          <div className="pointer-events-none absolute inset-x-0 -top-px h-0.5 bg-blue-500" />
+          <div className="pointer-events-none absolute inset-x-0 -top-px h-0.5 bg-indigo-500" />
         )}
         {dropMark === "after" && (
-          <div className="pointer-events-none absolute inset-x-0 -bottom-px h-0.5 bg-blue-500" />
+          <div className="pointer-events-none absolute inset-x-0 -bottom-px h-0.5 bg-indigo-500" />
         )}
         {dropMark === "inside" && (
-          <div className="pointer-events-none absolute inset-0 ring-1 ring-blue-500" />
+          <div className="pointer-events-none absolute inset-0 ring-1 ring-indigo-500" />
         )}
 
         {/* Chevron — only for Frames with children */}

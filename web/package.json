@@ -1,7 +1,19 @@
 {
-  "name": "web",
+  "name": "lgx-builder",
   "version": "0.1.0",
+  "description": "Visual builder for Logos Basecamp UI modules. Drag-and-drop editor + AI wiring + Qt-WASM live preview, exports installable .lgx packages.",
   "private": true,
+  "bin": {
+    "lgx-builder": "bin/lgx-builder.mjs"
+  },
+  "files": [
+    ".next/standalone",
+    ".next/static",
+    "public",
+    "bin",
+    "next.config.ts",
+    "package.json"
+  ],
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,7 +22,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "diagnose": "node scripts/diagnose-basecamp.mjs",
-    "test:ai": "node scripts/test-ask-ai.mjs"
+    "test:ai": "node scripts/test-ask-ai.mjs",
+    "sync-renderer": "node scripts/sync-renderer.mjs"
   },
   "dependencies": {
     "fast-json-patch": "^3.1.1",
