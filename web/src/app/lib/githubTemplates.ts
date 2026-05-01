@@ -25,8 +25,6 @@ export const BUILD_LGX_YML = `# Multi-arch lgx.guru build for a custom backend m
 name: Build .lgx
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

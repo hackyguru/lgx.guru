@@ -4,11 +4,11 @@
 // rebuilds reuse the flake.lock + the nix store cache.
 //
 // Two backends:
-//   - "local"  — run nix in-process (default; works for `pnpm dev` and for
-//                the npx CLI distribution where users have nix installed).
-//   - "remote" — POST the spec to a build worker (Hetzner-hosted Docker
-//                image, see build-worker/) over HTTP. Used when the editor
-//                is deployed to Vercel, which can't run nix itself.
+//   - "local"    — run nix in-process. Works for `pnpm dev` and for the npx
+//                  CLI distribution where the user has nix installed.
+//   - "disabled" — bail with a friendly message pointing users at either the
+//                  npx CLI or the in-editor "Build via GitHub" path. Used by
+//                  the lgx.guru Vercel deployment, which can't run nix.
 // Selected via LGX_BUILD_BACKEND env var. Default = local.
 
 import { spawn } from "child_process";
@@ -19,8 +19,6 @@ import { generateCoreModuleFiles } from "../codegen/coreModule";
 import type { CoreModuleSpec } from "../types";
 
 const BUILD_BACKEND = (process.env.LGX_BUILD_BACKEND ?? "local").toLowerCase();
-const BUILD_WORKER_URL = process.env.LGX_BUILD_WORKER_URL ?? "";
-const BUILD_WORKER_TOKEN = process.env.LGX_BUILD_WORKER_TOKEN ?? "";
 
 // First build of a fresh module downloads all the Logos SDK deps —
 // 5–10 minutes on a slow link. Cap generously.
@@ -129,16 +127,16 @@ function lintBodies(spec: CoreModuleSpec): string[] {
 // ── Public API: dispatch to the configured backend ─────────────────────────
 
 export async function buildCoreModule(spec: CoreModuleSpec): Promise<BuildResult> {
-  if (BUILD_BACKEND === "remote") return buildCoreModuleRemote(spec);
   if (BUILD_BACKEND === "disabled") {
     return {
       ok: false,
       phase: "compile",
       errors: [
-        "Custom backend module builds are disabled in this deployment. " +
-        "To use AI-built C++ modules, run lgx-builder locally:\n" +
-        "    npx lgx-builder@latest\n" +
-        "(requires nix; see https://lgx.guru/docs for setup).",
+        "Custom backend module builds aren't available on this deployment. " +
+        "Two options:\n" +
+        "  1. Run lgx-builder locally: `npx lgx-builder@latest` (requires nix).\n" +
+        "  2. Use the in-editor 'Build via GitHub' option in the export modal — " +
+        "Actions builds the .lgx for both macOS and Linux on your repo.",
       ],
       stderrTail: "build_backend_module unavailable on this deployment",
       durationMs: 0,
@@ -148,74 +146,8 @@ export async function buildCoreModule(spec: CoreModuleSpec): Promise<BuildResult
 }
 
 export async function readBuiltLgx(id: string): Promise<Buffer | null> {
-  if (BUILD_BACKEND === "remote") return readBuiltLgxRemote(id);
   if (BUILD_BACKEND === "disabled") return null;
   return readBuiltLgxLocal(id);
-}
-
-// ── Remote backend (HTTP → Hetzner build worker) ───────────────────────────
-
-async function buildCoreModuleRemote(spec: CoreModuleSpec): Promise<BuildResult> {
-  if (!BUILD_WORKER_URL) {
-    return {
-      ok: false,
-      phase: "compile",
-      errors: ["LGX_BUILD_BACKEND=remote but LGX_BUILD_WORKER_URL is unset (server misconfiguration)."],
-      stderrTail: "config error",
-      durationMs: 0,
-    };
-  }
-  // Render the codegen here so the worker doesn't need its own copy of the
-  // codegen module — keeps the source of truth single. The worker just
-  // writes whatever files we send it, then runs nix.
-  const rendered = generateCoreModuleFiles(spec).map((f) => ({
-    path: f.path,
-    base64: Buffer.from(f.data).toString("base64"),
-  }));
-  const started = Date.now();
-  try {
-    const res = await fetch(`${BUILD_WORKER_URL}/build`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(BUILD_WORKER_TOKEN ? { authorization: `Bearer ${BUILD_WORKER_TOKEN}` } : {}),
-      },
-      body: JSON.stringify({ ...spec, __files: rendered }),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      return {
-        ok: false,
-        phase: "compile",
-        errors: [`build worker returned ${res.status}: ${text.slice(0, 500)}`],
-        stderrTail: text.slice(-500),
-        durationMs: Date.now() - started,
-      };
-    }
-    return (await res.json()) as BuildResult;
-  } catch (err) {
-    return {
-      ok: false,
-      phase: "compile",
-      errors: [`could not reach build worker at ${BUILD_WORKER_URL}: ${(err as Error).message}`],
-      stderrTail: "network error",
-      durationMs: Date.now() - started,
-    };
-  }
-}
-
-async function readBuiltLgxRemote(id: string): Promise<Buffer | null> {
-  if (!BUILD_WORKER_URL) return null;
-  try {
-    const res = await fetch(`${BUILD_WORKER_URL}/built/${encodeURIComponent(id)}`, {
-      headers: BUILD_WORKER_TOKEN ? { authorization: `Bearer ${BUILD_WORKER_TOKEN}` } : {},
-    });
-    if (!res.ok) return null;
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
-  } catch {
-    return null;
-  }
 }
 
 // ── Local backend (spawn `nix build` in-process) ───────────────────────────

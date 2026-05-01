@@ -63,6 +63,5 @@ The workflow auto-detects this and pushes substituted derivations on every succe
 
 - ✅ `build-lgx.yml` — written, untested in CI yet.
 - ✅ `merge-lgx.mjs` — written, smoke-tested locally with both round-trip (single variant in/out, identical hashes) and multi-variant assembly (linux + darwin → multi-arch `.lgx`, valid manifest).
-- ☐ Editor integration — `web/src/app/lib/buildModule.ts` will gain a `buildCoreModuleGithub` backend that pushes spec via the GitHub API, polls Actions, downloads release.
-- ☐ GitHub App + OAuth — for the user-facing "sign in with GitHub" install flow.
-- ☐ Hetzner worker decommission — the build-worker becomes redundant once the GitHub flow is shipped.
+- ✅ Editor integration — `web/src/app/BuilderClient.tsx` exposes "Build via GitHub" in the export modal; client-side push + poll lives in `web/src/app/lib/githubBuilder.ts`.
+- ☐ GitHub App + OAuth — for the user-facing "sign in with GitHub" install flow (Phase 3).

@@ -124,12 +124,12 @@ export function RendererStatus({
   if (status.kind === "ready") return null;
 
   const wrap =
-    "absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-zinc-50/95 dark:bg-zinc-900/95 px-6 text-center";
+    "absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-surface-warm/95/95 px-6 text-center";
 
   if (status.kind === "checking") {
     return (
       <div className={wrap}>
-        <div className="text-xs text-zinc-500 dark:text-zinc-400">Checking browser support…</div>
+        <div className="text-xs text-ink-muted">Checking browser support…</div>
       </div>
     );
   }
@@ -137,15 +137,15 @@ export function RendererStatus({
   if (status.kind === "unsupported") {
     return (
       <div className={wrap}>
-        <div className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">
+        <div className="text-sm font-semibold text-ink-muted">
           Live preview unavailable
         </div>
-        <ul className="max-w-md list-disc pl-4 text-left text-xs text-zinc-500 dark:text-zinc-400 marker:text-zinc-400">
+        <ul className="max-w-md list-disc pl-4 text-left text-xs text-ink-muted marker:text-ink-muted">
           {status.reasons.map((r, i) => (
             <li key={i}>{r}</li>
           ))}
         </ul>
-        <div className="text-[11px] text-zinc-400 dark:text-zinc-500">
+        <div className="text-[11px] text-ink-muted">
           Try the latest Chrome, Firefox, or Safari.
         </div>
       </div>
@@ -155,14 +155,14 @@ export function RendererStatus({
   if (status.kind === "loading") {
     return (
       <div className={wrap}>
-        <Spinner />
-        <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
-          Loading renderer…
-        </div>
-        <div className="max-w-sm text-[11px] text-zinc-500 dark:text-zinc-400">
-          Downloading the Qt-WASM runtime. The first visit pulls ~20 MB; later
-          visits load from cache.
-        </div>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src="/lgx-logo.svg"
+          alt=""
+          width={48}
+          height={48}
+          className="h-12 w-12 animate-pulse dark:invert"
+        />
       </div>
     );
   }
@@ -170,16 +170,16 @@ export function RendererStatus({
   if (status.kind === "timeout") {
     return (
       <div className={wrap}>
-        <div className="text-sm font-semibold text-amber-700 dark:text-amber-300">
+        <div className="text-sm font-semibold text-warning dark:text-warning">
           Renderer is taking longer than expected
         </div>
-        <div className="max-w-sm text-[11px] text-zinc-500 dark:text-zinc-400">
+        <div className="max-w-sm text-[11px] text-ink-muted">
           The renderer didn&apos;t finish loading in 60 seconds. This can happen on
           slow connections or if the Qt-WASM build is unreachable.
         </div>
         <button
           onClick={onRetry}
-          className="mt-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+          className="mt-1 rounded border border-border-soft bg-canvas px-2 py-1 text-xs text-ink-muted hover:bg-surface-warm"
         >
           Reload renderer
         </button>
@@ -190,18 +190,18 @@ export function RendererStatus({
   // error
   return (
     <div className={wrap}>
-      <div className="text-sm font-semibold text-red-700 dark:text-red-300">
+      <div className="text-sm font-semibold text-danger dark:text-danger">
         Renderer failed to load
       </div>
-      <div className="max-w-sm text-[11px] text-zinc-500 dark:text-zinc-400">
+      <div className="max-w-sm text-[11px] text-ink-muted">
         {status.message}
       </div>
-      <div className="max-w-sm break-all text-[10px] text-zinc-400 dark:text-zinc-500">
+      <div className="max-w-sm break-all text-[10px] text-ink-muted">
         {url}
       </div>
       <button
         onClick={onRetry}
-        className="mt-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+        className="mt-1 rounded border border-border-soft bg-canvas px-2 py-1 text-xs text-ink-muted hover:bg-surface-warm"
       >
         Reload renderer
       </button>
@@ -209,8 +209,3 @@ export function RendererStatus({
   );
 }
 
-function Spinner() {
-  return (
-    <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-300 dark:border-zinc-600 border-t-blue-500 dark:border-t-blue-400" />
-  );
-}

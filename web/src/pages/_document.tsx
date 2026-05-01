@@ -17,10 +17,12 @@ const themeBootstrap = `
 const Document = () => {
   return (
     <Html lang="en" className="h-full" suppressHydrationWarning>
-      <Head>
-        <script dangerouslySetInnerHTML={{ __html: themeBootstrap }} />
-      </Head>
+      <Head />
       <body className="min-h-full flex flex-col antialiased">
+        {/* Synchronous theme bootstrap — body-level so React 19 doesn't
+            warn about scripts in component trees. Still runs before any
+            UI paints because <Main /> follows. */}
+        <script dangerouslySetInnerHTML={{ __html: themeBootstrap }} />
         <Main />
         <NextScript />
       </body>

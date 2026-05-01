@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx --no-install tsc *)",
+      "Bash(npx eslint *)"
+    ]
+  }
+}

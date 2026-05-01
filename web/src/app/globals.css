@@ -1,44 +1,202 @@
 @import "tailwindcss";
 
 /* Class-based dark mode (Tailwind v4). The <html> element gets a `dark`
-   class toggled by the theme switcher in the header; that class flips
-   every `dark:` variant in the markup. Defaults to system preference on
-   first load — see the inline bootstrap script in layout.tsx. */
+   class toggled by the theme switcher in the header; that class overrides
+   the --color-* CSS variables registered in @theme so theme-aware tokens
+   flip without needing a `dark:` prefix in markup. */
 @custom-variant dark (&:where(.dark, .dark *));
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* ── Titan design tokens ──────────────────────────────────────────────────
+   Source: design/DESIGN.md ("monochrome financial ledger"). Light values
+   live in @theme so Tailwind generates utilities (.bg-canvas, .text-ink,
+   etc.). Dark mode overrides the same custom properties at runtime via
+   the .dark class — no extra `dark:` utility needed. */
+@theme {
+  /* Canvas / surfaces */
+  --color-canvas:        #ffffff;
+  --color-surface-warm:  #f3efeb;
+  --color-surface-cool:  #e9eaeb;
+
+  /* Borders */
+  --color-border-subtle: #e9eaeb;
+  --color-border-soft:   #d8d3cc;
+
+  /* Text */
+  --color-ink:           #111111;
+  --color-ink-muted:     #615e5b;
+
+  /* Action / accent */
+  --color-action:        #000000;
+  --color-action-on:     #ffffff;
+  --color-accent:        #ff9900;
+
+  /* Semantic state — kept neutral-ish to harmonize with Titan's
+     monochrome palette rather than feel like candy interruptions. */
+  --color-success:       #1f5f3f;
+  --color-success-bg:    #e8f1ec;
+  --color-danger:        #8a1d2a;
+  --color-danger-bg:     #f5e8ea;
+  --color-warning:       #8a5a00;
+  --color-warning-bg:    #fbf0d6;
+
+  /* Backwards-compat aliases — a few files still read foreground/background
+     from the prior token set. */
+  --color-foreground:    #111111;
+  --color-background:    #ffffff;
+
+  /* Typography — Geist + Geist Mono variables come from layout.tsx and
+     _app.tsx (next/font/google). Substitute Inter / JetBrains Mono per
+     the Titan spec when the primary face is unavailable. */
+  --font-sans: var(--font-geist-sans), Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: var(--font-geist-mono), "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* Titan radii — small for editor controls, larger for cards, full pill
+     for primary CTAs. */
+  --radius-control: 10px;
+  --radius-card:    20px;
+  --radius-card-lg: 32px;
+  --radius-pill:    140px;
+  --radius-pill-lg: 160px;
 }
 
+/* Dark mode overrides. Same custom-property names so every utility
+   generated from @theme stays valid; only the resolved color changes. */
 .dark {
-  --background: #18181b;   /* zinc-900 */
-  --foreground: #f4f4f5;   /* zinc-100 */
+  --color-canvas:        #0d0d0e;
+  --color-surface-warm:  #1a1715;
+  --color-surface-cool:  #1f1f21;
+
+  --color-border-subtle: #25232a;
+  --color-border-soft:   #353030;
+
+  --color-ink:           #fafaf8;
+  --color-ink-muted:     #9a948e;
+
+  --color-action:        #fafaf8;
+  --color-action-on:     #0d0d0e;
+  --color-accent:        #ff9900;
+
+  --color-success:       #6dbb8e;
+  --color-success-bg:    #133324;
+  --color-danger:        #d77b87;
+  --color-danger-bg:     #311518;
+  --color-warning:       #d8a85a;
+  --color-warning-bg:    #2c2310;
+
+  --color-foreground:    #fafaf8;
+  --color-background:    #0d0d0e;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
+/* ── Base body styles ────────────────────────────────────────────────── */
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-geist-sans), Inter, ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "ss02", "ss03";
 }
 
-/* Landing page — scoped motion + display typography */
+.font-mono,
+code, kbd, samp, pre {
+  font-family: var(--font-geist-mono), "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-feature-settings: "ss08";
+}
+
+/* ── Component primitives ──────────────────────────────────────────────
+   Pill-shaped CTAs, sage feature cards — patterns that read more cleanly
+   as small CSS classes than as inline arbitrary-value Tailwind. */
+@layer components {
+  /* Primary filled CTA — black-on-white in light, white-on-dark in dark. */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    height: 2.75rem;
+    padding-inline: 1.5rem;
+    border-radius: var(--radius-pill-lg);
+    background: var(--color-action);
+    color: var(--color-action-on);
+    font-weight: 500;
+    font-size: 0.875rem;
+    line-height: 1;
+    transition: opacity 150ms ease, transform 100ms ease;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-primary:hover { opacity: 0.92; }
+  .btn-primary:active { transform: scale(0.98); }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  .btn-primary:focus-visible {
+    outline: 2px solid var(--color-ink-muted);
+    outline-offset: 2px;
+  }
+
+  /* Ghost CTA — transparent with concrete border. */
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    height: 2.75rem;
+    padding-inline: 1.5rem;
+    border-radius: var(--radius-pill-lg);
+    background: transparent;
+    color: var(--color-ink);
+    border: 1px solid var(--color-border-soft);
+    font-weight: 500;
+    font-size: 0.875rem;
+    line-height: 1;
+    transition: background-color 150ms ease;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-ghost:hover { background: var(--color-surface-warm); }
+  .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-ghost:focus-visible {
+    outline: 2px solid var(--color-ink-muted);
+    outline-offset: 2px;
+  }
+
+  /* Inline link — Titan: no underline, ink color. */
+  .link-inline {
+    color: var(--color-ink);
+    text-decoration: none;
+    transition: color 120ms ease;
+  }
+  .link-inline:hover { color: var(--color-ink-muted); }
+
+  /* Brand gradient — amber warm ramp matching the hero WebGL effect. */
+  .gradient-accent {
+    background: linear-gradient(135deg, #cc5500, #ff9900, #ffcc44);
+  }
+  /* Cards */
+  .card-feature {
+    background: var(--color-surface-warm);
+    border-radius: var(--radius-card);
+    padding: 1.75rem;
+  }
+  .card-feature-lg {
+    background: var(--color-surface-warm);
+    border-radius: var(--radius-card-lg);
+    padding: 3.5rem 1.75rem;
+  }
+
+  /* Eyebrow — Mono uppercase tracked label, used above headings. */
+  .eyebrow {
+    font-family: var(--font-geist-mono), "JetBrains Mono", ui-monospace, monospace;
+    font-feature-settings: "ss08";
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-ink-muted);
+  }
+}
+
+/* ── Landing page motion — scoped to .landing-rise ───────────────────── */
 @keyframes landing-rise {
-  from {
-    opacity: 0;
-    transform: translateY(0.6rem);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(0.6rem); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -46,26 +204,11 @@ body {
     opacity: 0;
     animation: landing-rise 0.72s cubic-bezier(0.22, 1, 0.36, 1) forwards;
   }
-
-  .landing-rise-delay-1 {
-    animation-delay: 80ms;
-  }
-
-  .landing-rise-delay-2 {
-    animation-delay: 160ms;
-  }
-
-  .landing-rise-delay-3 {
-    animation-delay: 240ms;
-  }
-
-  .landing-rise-delay-4 {
-    animation-delay: 320ms;
-  }
-
-  .landing-rise-delay-5 {
-    animation-delay: 400ms;
-  }
+  .landing-rise-delay-1 { animation-delay:  80ms; }
+  .landing-rise-delay-2 { animation-delay: 160ms; }
+  .landing-rise-delay-3 { animation-delay: 240ms; }
+  .landing-rise-delay-4 { animation-delay: 320ms; }
+  .landing-rise-delay-5 { animation-delay: 400ms; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -76,6 +219,11 @@ body {
   }
 }
 
+/* Display face for the landing hero. Was Instrument Serif previously,
+   but the Titan spec uses Geist for everything. Keep the class name to
+   minimize churn; resolve to Geist with tighter tracking. */
 .font-display {
-  font-family: var(--font-instrument-serif), ui-serif, Georgia, serif;
+  font-family: var(--font-geist-sans), Inter, ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.03em;
+  font-weight: 500;
 }

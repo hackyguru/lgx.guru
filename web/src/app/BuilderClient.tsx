@@ -35,6 +35,7 @@ import {
   type ProjectMeta,
 } from "./lib/projects";
 import { suggestKickoffMethod, wireLiveData, type LiveDataSpec } from "./lib/wireLiveData";
+import { Sun, Moon, CircleHalf } from "@phosphor-icons/react";
 
 // Renderer iframe URL — same-origin static files. Next.js serves them
 // from `web/public/renderer/` with the COOP/COEP headers configured in
@@ -710,6 +711,32 @@ export default function BuilderClient() {
     setIconPng(u8);
     const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
     setIconFilename(safe.toLowerCase().endsWith(".png") ? safe : safe + ".png");
+  };
+
+  const [iconGenerating, setIconGenerating] = useState(false);
+
+  const handleGenerateIcon = async () => {
+    setIconError(null);
+    setIconGenerating(true);
+    try {
+      const res = await fetch("/api/generate-icon", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: moduleMeta.name, description: moduleMeta.description }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to generate icon");
+      // data.image is base64 PNG
+      const raw = atob(data.image);
+      const u8 = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+      setIconPng(u8);
+      setIconFilename("ai-icon.png");
+    } catch (e: unknown) {
+      setIconError(e instanceof Error ? e.message : "Icon generation failed");
+    } finally {
+      setIconGenerating(false);
+    }
   };
 
   // Read a File as a base64 data URL.
@@ -2170,15 +2197,10 @@ export default function BuilderClient() {
   // ── Export: custom core module ────────────────────────────────────────────
   // Always exports the SOURCE archive — caller has chosen "Build locally" in
   // the Export modal, which means they want to run `nix build` on their own
-  // machine and get a binary that matches their host OS. We deliberately do
-  // NOT fall back on the pre-built .lgx from /api/built-module: when running
-  // on lgx.guru's managed (Hetzner-Linux) backend, the pre-built is Linux-
-  // only and would silently install a wrong-arch artifact for users on Mac
-  // or Windows. Better to be predictable than convenient.
-  //
-  // The "Build via GitHub Actions" path (Phase 2) bypasses this function
-  // entirely — it'll push the spec to a user repo and download the multi-
-  // arch artifact from a release.
+  // machine and get a binary that matches their host OS. The "Build via
+  // GitHub Actions" path bypasses this function entirely: it pushes the
+  // spec to the user's repo and downloads the multi-arch .lgx from the
+  // resulting release.
   const handleExportCore = async () => {
     if (!app.coreModule) return;
     const id = app.coreModule.id || "my_module";
@@ -2299,7 +2321,11 @@ export default function BuilderClient() {
           // hard failure — keep that message visible. Otherwise dump the
           // exception text to the progress slot.
           if (!buildProgress || buildProgress.kind !== "error") {
-            setBuildProgress({ kind: "error", message: (e as Error).message });
+            const raw = (e as Error).message;
+            const msg = raw === "Failed to fetch"
+              ? "Network error — couldn't reach api.github.com. Check your internet connection and that the GitHub token + repo are configured correctly."
+              : raw;
+            setBuildProgress({ kind: "error", message: msg });
           }
           setBuilding(false);
           return;   // keep modal open so the user sees the error
@@ -2319,8 +2345,8 @@ export default function BuilderClient() {
   const canRedo = hist.future.length > 0;
 
   return (
-    <div className="flex h-screen flex-col bg-zinc-50 dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100">
-      <header className="flex h-12 items-center justify-between border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-4">
+    <div className="flex h-screen flex-col bg-surface-warm text-ink">
+      <header className="flex h-12 items-center justify-between border-b border-border-subtle bg-canvas px-4">
         <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold tracking-tight">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
@@ -2341,11 +2367,11 @@ export default function BuilderClient() {
                   window.location.assign("/dashboard");
                 }}
                 title="Back to all projects"
-                className="ml-1 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-normal text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                className="ml-1 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-normal text-ink-muted transition-colors hover:bg-surface-cool hover:text-ink dark:text-ink-muted"
               >
                 Projects
               </a>
-              <span className="text-zinc-300 dark:text-zinc-600">/</span>
+              <span className="text-ink-muted dark:text-ink-muted">/</span>
               <button
                 onClick={() => {
                   const next = window.prompt("Rename project", activeProject.name);
@@ -2356,7 +2382,7 @@ export default function BuilderClient() {
                   setActiveProject({ ...activeProject, name: trimmed });
                 }}
                 title="Click to rename"
-                className="min-w-0 truncate rounded px-1.5 py-0.5 text-zinc-800 transition-colors hover:bg-zinc-100 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                className="min-w-0 truncate rounded px-1.5 py-0.5 text-ink transition-colors hover:bg-surface-cool"
               >
                 {activeProject.name}
               </button>
@@ -2367,17 +2393,17 @@ export default function BuilderClient() {
           {/* Primary AI action — distinct accent so it stands out */}
           <button
             onClick={() => setAskAIOpen(true)}
-            className="rounded-md border border-indigo-300/70 bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700 transition-colors hover:bg-indigo-100 hover:border-indigo-400 dark:border-indigo-700/50 dark:bg-indigo-950/60 dark:text-indigo-300 dark:hover:bg-indigo-950 dark:hover:border-indigo-700"
+            className="rounded-md gradient-accent px-2.5 py-1 text-xs font-medium text-white transition-opacity hover:opacity-90"
             title="Describe a change in plain English; AI wires it up (variables, triggers, bindings)."
-          >✦ Ask AI</button>
+          >Ask AI</button>
 
           {/* Templates dropdown */}
           <div className="relative">
             <button
               className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
                 templatesOpen
-                  ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
-                  : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+                  ? "border-accent bg-surface-warm text-accent dark:border-accent dark:bg-surface-warm dark:text-accent"
+                  : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft"
               }`}
               onClick={() => setTemplatesOpen((v) => !v)}
               title="Replace canvas with a starter template"
@@ -2389,21 +2415,21 @@ export default function BuilderClient() {
                   onClick={() => setTemplatesOpen(false)}
                 />
                 <div
-                  className="absolute right-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-950"
+                  className="absolute right-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-lg border border-border-subtle bg-canvas shadow-lg"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="border-b border-zinc-100 px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+                  <div className="border-b border-border-subtle px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-ink-muted dark:text-ink-muted">
                     Pick a template
                   </div>
                   <div className="max-h-80 overflow-y-auto py-1">
                     {TEMPLATES.map((t) => (
                       <button
                         key={t.id}
-                        className="block w-full px-3 py-2 text-left transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-900"
+                        className="block w-full px-3 py-2 text-left transition-colors hover:bg-surface-warm"
                         onClick={() => applyTemplate(t)}
                       >
-                        <div className="text-xs font-medium text-zinc-800 dark:text-zinc-100">{t.name}</div>
-                        <div className="mt-0.5 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">{t.description}</div>
+                        <div className="text-xs font-medium text-ink">{t.name}</div>
+                        <div className="mt-0.5 text-[10px] leading-snug text-ink-muted">{t.description}</div>
                       </button>
                     ))}
                   </div>
@@ -2413,19 +2439,19 @@ export default function BuilderClient() {
           </div>
 
           {/* Subtle divider between primary tools and file ops */}
-          <span className="mx-0.5 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
+          <span className="mx-0.5 h-5 w-px bg-surface-cool" />
 
           {/* File ops */}
           <button
-            className="rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-xs text-zinc-700 transition-colors hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+            className="rounded-md border border-border-subtle bg-canvas px-2.5 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft"
             onClick={() => designFileInputRef.current?.click()}
             title="Open a .lgx-design.json or a .lgx exported from this editor"
           >Open</button>
           <button
             className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
               saveFeedback === "saved"
-                ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
-                : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+                ? "border-success bg-success-bg text-success dark:border-success dark:bg-success-bg/60 dark:text-success"
+                : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft"
             }`}
             onClick={handleSaveLocal}
             title="Save this project to your browser (⌘S). Opens from the dashboard. For a portable backup, use Export → Download project (.json)."
@@ -2442,37 +2468,37 @@ export default function BuilderClient() {
             }}
           />
 
-          <span className="mx-0.5 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
+          <span className="mx-0.5 h-5 w-px bg-surface-cool" />
 
           {/* History */}
           <button
-            className="rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-xs text-zinc-700 transition-colors hover:bg-zinc-50 hover:border-zinc-300 disabled:opacity-30 disabled:cursor-not-allowed dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+            className="rounded-md border border-border-subtle bg-canvas px-2.5 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft disabled:opacity-30 disabled:cursor-not-allowed"
             disabled={!canUndo}
             onClick={() => dispatch({ type: "undo" })}
             title="Undo (⌘Z)"
           >Undo</button>
           <button
-            className="rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-xs text-zinc-700 transition-colors hover:bg-zinc-50 hover:border-zinc-300 disabled:opacity-30 disabled:cursor-not-allowed dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+            className="rounded-md border border-border-subtle bg-canvas px-2.5 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft disabled:opacity-30 disabled:cursor-not-allowed"
             disabled={!canRedo}
             onClick={() => dispatch({ type: "redo" })}
             title="Redo (⌘⇧Z)"
           >Redo</button>
 
-          <span className="mx-0.5 h-5 w-px bg-zinc-200 dark:bg-zinc-700" />
+          <span className="mx-0.5 h-5 w-px bg-surface-cool" />
 
           {/* Theme toggle — icon-only */}
           <button
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-600 transition-colors hover:bg-zinc-50 hover:border-zinc-300 hover:text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:border-zinc-600 dark:hover:text-zinc-200"
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-border-subtle bg-canvas text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft hover:text-ink dark:text-ink-muted"
             onClick={cycleTheme}
             title={`Theme: ${themePref} (click to cycle light → dark → system)`}
             aria-label="Cycle theme"
           >
-            <span className="text-[13px] leading-none">{themePref === "light" ? "☀" : themePref === "dark" ? "☾" : "◐"}</span>
+            {themePref === "light" ? <Sun size={14} weight="duotone" /> : themePref === "dark" ? <Moon size={14} weight="duotone" /> : <CircleHalf size={14} weight="duotone" />}
           </button>
 
           {/* Primary export action — pulled visually distinct */}
           <button
-            className="ml-1.5 rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+            className="ml-1.5 rounded-md gradient-accent px-3 py-1 text-xs font-medium text-white shadow-sm transition-opacity hover:opacity-90"
             onClick={() => setExportOpen(true)}
           >Export…</button>
         </div>
@@ -2484,11 +2510,11 @@ export default function BuilderClient() {
               module, Components). Scrolls so any combination of panels fits.
             - bottom: Layers, capped to 40% of the column height with its own
               scroll so deeply-nested designs stay manageable. */}
-        <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 min-h-0">
+        <aside className="flex w-60 shrink-0 flex-col border-r border-border-subtle bg-canvas min-h-0">
           {/* Tab strip — three mode-based views, only one rendered at a
               time. Badges (count when non-zero) signal that a tab has
               content even when not currently active. */}
-          <div className="shrink-0 flex border-b border-zinc-200 dark:border-zinc-800">
+          <div className="shrink-0 flex border-b border-border-subtle">
             {([
               { id: "design"  as SidebarTab, label: "Design",  badge: app.pages.length > 1 ? app.pages.length : undefined },
               { id: "logic"   as SidebarTab, label: "Logic",   badge: (app.variables.length + app.triggers.length) || undefined },
@@ -2501,16 +2527,16 @@ export default function BuilderClient() {
                   onClick={() => switchSidebarTab(t.id)}
                   className={`flex-1 px-2 py-2.5 text-[10px] font-semibold uppercase tracking-wider border-b-2 -mb-px transition-colors ${
                     active
-                      ? "border-indigo-500 text-zinc-900 dark:text-zinc-50"
-                      : "border-transparent text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 hover:text-zinc-700 dark:hover:bg-zinc-900 dark:hover:text-zinc-200"
+                      ? "border-ink text-ink dark:text-ink"
+                      : "border-transparent text-ink-muted hover:bg-surface-warm hover:text-ink-muted"
                   }`}
                 >
                   {t.label}
                   {t.badge !== undefined && (
                     <span className={`ml-1 rounded-full px-1.5 py-0.5 text-[9px] font-medium leading-none ${
                       active
-                        ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
-                        : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                        ? "bg-surface-warm text-accent dark:bg-surface-warm dark:text-accent"
+                        : "bg-surface-cool text-ink-muted dark:bg-surface-warm dark:text-ink-muted"
                     }`}>{t.badge}</span>
                   )}
                 </button>
@@ -2568,7 +2594,7 @@ export default function BuilderClient() {
               headerRight={
                 <button
                   type="button"
-                  className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  className="rounded border border-border-soft px-1.5 text-[10px] leading-tight text-ink-muted hover:bg-surface-cool"
                   title={[
                     "Shortcuts",
                     "Shift-click multi-select",
@@ -2584,7 +2610,7 @@ export default function BuilderClient() {
               <div className="flex flex-col gap-2">
                 {PALETTE.map((cat) => (
                   <div key={cat.name}>
-                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
                       {cat.name}
                     </div>
                     {/* Two-column grid — packs ~2x denser than the previous
@@ -2603,8 +2629,8 @@ export default function BuilderClient() {
                           onClick={p.kind === "Image" && rendererReady ? () => imageFileInputRef.current?.click() : undefined}
                           className={`flex items-center gap-1.5 truncate rounded border px-1.5 py-1 text-left text-[11px] transition-colors ${
                             rendererReady
-                              ? "border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 cursor-grab active:cursor-grabbing hover:border-zinc-400 dark:hover:border-zinc-500"
-                              : "border-zinc-100 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/40 opacity-50 cursor-not-allowed"
+                              ? "border-border-subtle bg-surface-warm cursor-grab active:cursor-grabbing hover:border-border-soft dark:hover:border-border-soft"
+                              : "border-border-subtle bg-surface-warm/50 dark:bg-surface-warm/40 opacity-50 cursor-not-allowed"
                           }`}
                           title={
                             !rendererReady
@@ -2614,7 +2640,7 @@ export default function BuilderClient() {
                                 : p.label
                           }
                         >
-                          <NodeIcon kind={p.kind} className="text-zinc-500 dark:text-zinc-400" />
+                          <NodeIcon kind={p.kind} className="text-ink-muted" />
                           <span className="truncate">{p.label}</span>
                         </button>
                       ))}
@@ -2633,7 +2659,7 @@ export default function BuilderClient() {
                   e.target.value = "";
                 }}
               />
-              <p className="mt-2 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              <p className="mt-2 text-[10px] leading-tight text-ink-muted">
                 Drag onto the canvas, or drop image files from your OS.
               </p>
             </SidebarSection>
@@ -2643,10 +2669,10 @@ export default function BuilderClient() {
           {/* Layers — anchored at the bottom, capped to 40vh so it shares
               column height fairly with the panels above. Internal scroll for
               deep trees. */}
-          <div className="shrink-0 flex flex-col border-t border-zinc-200 dark:border-zinc-800 max-h-[40vh] min-h-[120px]">
-            <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 dark:border-zinc-700 px-2.5 py-1.5">
-              <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Layers</span>
-              <span className="text-[10px] text-zinc-400 dark:text-zinc-500">drag to reorder</span>
+          <div className="shrink-0 flex flex-col border-t border-border-subtle max-h-[40vh] min-h-[120px]">
+            <div className="flex shrink-0 items-center justify-between border-b border-border-subtle px-2.5 py-1.5">
+              <span className="text-xs font-semibold uppercase text-ink-muted dark:text-ink-muted">Layers</span>
+              <span className="text-[10px] text-ink-muted">drag to reorder</span>
             </div>
             <div className="flex-1 overflow-y-auto py-1">
               <LayersPanel
@@ -2670,13 +2696,13 @@ export default function BuilderClient() {
             clicks fall through to Qt and the user can interact with their
             widget (test buttons, type into fields, send messages). */}
         <main className="flex flex-1 flex-col min-w-0">
-          <section className="flex flex-1 flex-col bg-zinc-100 dark:bg-zinc-900 min-h-0">
-            <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-3 py-1.5">
+          <section className="flex flex-1 flex-col bg-surface-cool min-h-0">
+            <div className="flex items-center justify-between border-b border-border-subtle bg-canvas px-3 py-1.5">
               <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400">
+                <span className="text-xs font-semibold uppercase text-ink-muted">
                   {runMode ? "Run" : "Canvas"}
                 </span>
-                <span className="text-[11px] text-zinc-400 dark:text-zinc-500">
+                <span className="text-[11px] text-ink-muted">
                   Qt-WASM @ {RENDERER_URL}
                 </span>
               </div>
@@ -2684,8 +2710,8 @@ export default function BuilderClient() {
                 <button
                   className={`rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors ${
                     runMode
-                      ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
-                      : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+                      ? "border-success bg-success-bg text-success dark:border-success dark:bg-success-bg/60 dark:text-success"
+                      : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft dark:text-ink-muted"
                   }`}
                   onClick={() => setRunMode((v) => !v)}
                   title="Toggle Edit ↔ Run. Edit lets you select & drag widgets; Run forwards clicks to Qt so you can test the live widget."
@@ -2695,8 +2721,8 @@ export default function BuilderClient() {
                 <button
                   className={`rounded-md border px-2 py-0.5 text-[11px] transition-colors ${
                     gridSize > 0
-                      ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"
-                      : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 hover:border-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:border-zinc-600"
+                      ? "border-accent bg-surface-warm text-accent dark:border-accent dark:bg-surface-warm/60 dark:text-accent"
+                      : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft dark:text-ink-muted"
                   }`}
                   onClick={() => setGridSize((g) => (g === 0 ? 8 : g === 8 ? 16 : g === 16 ? 24 : 0))}
                   title="Toggle snap-to-grid (cycles off / 8 / 16 / 24 px)"
@@ -2704,7 +2730,7 @@ export default function BuilderClient() {
                 >
                   grid {gridSize === 0 ? "off" : `${gridSize}px`}
                 </button>
-                <span className="text-[11px] text-zinc-400 dark:text-zinc-500">
+                <span className="text-[11px] text-ink-muted">
                   {root.width}×{root.height}px
                 </span>
               </div>
@@ -2726,7 +2752,7 @@ export default function BuilderClient() {
                   // remounting the iframe element (preserves the ResizeObserver
                   // binding above).
                   src={`${RENDERER_URL}${RENDERER_URL.includes("?") ? "&" : "?"}r=${renderer.reloadKey}`}
-                  className="absolute inset-0 h-full w-full bg-zinc-50 dark:bg-zinc-800"
+                  className="absolute inset-0 h-full w-full bg-surface-warm"
                   style={{ pointerEvents: runMode ? "auto" : "none" }}
                   title="canvas-renderer"
                   onLoad={handleIframeLoad}
@@ -2746,8 +2772,8 @@ export default function BuilderClient() {
                 && root.children.length === 0
                 && (
                   <div className="pointer-events-none absolute inset-0 z-[1] flex items-center justify-center">
-                    <div className="rounded-lg border border-dashed border-zinc-300 bg-white/70 px-6 py-5 text-center backdrop-blur-sm dark:border-zinc-700 dark:bg-zinc-900/60">
-                      <div className="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-full bg-indigo-100 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400">
+                    <div className="rounded-lg border border-dashed border-border-soft bg-canvas/70 px-6 py-5 text-center backdrop-blur-sm/60">
+                      <div className="mx-auto mb-3 flex h-9 w-9 items-center justify-center rounded-full bg-surface-warm text-accent dark:bg-surface-warm dark:text-accent">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                           <rect x="3" y="3" width="7" height="7" rx="1" />
                           <rect x="14" y="3" width="7" height="7" rx="1" />
@@ -2755,11 +2781,11 @@ export default function BuilderClient() {
                           <rect x="14" y="14" width="7" height="7" rx="1" />
                         </svg>
                       </div>
-                      <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-100">
+                      <div className="text-xs font-semibold text-ink">
                         Empty canvas
                       </div>
-                      <p className="mx-auto mt-1 max-w-xs text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
-                        Drag a component from the left palette, pick a <span className="text-zinc-700 dark:text-zinc-300">Template</span>, or hit <span className="font-medium text-indigo-600 dark:text-indigo-400">✦ Ask AI</span> to describe what you want.
+                      <p className="mx-auto mt-1 max-w-xs text-[11px] leading-relaxed text-ink-muted">
+                        Drag a component from the left palette, pick a <span className="text-ink-muted">Template</span>, or hit <span className="font-medium text-accent">✦ Ask AI</span> to describe what you want.
                       </p>
                     </div>
                   </div>
@@ -2797,7 +2823,7 @@ export default function BuilderClient() {
         </main>
 
         {/* Inspector */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-3">
+        <aside className="w-72 shrink-0 overflow-y-auto border-l border-border-subtle bg-canvas p-3">
           <ModulePanel
             meta={moduleMeta}
             onChange={setModuleMeta}
@@ -2805,23 +2831,25 @@ export default function BuilderClient() {
             iconFilename={iconFilename}
             iconError={iconError}
             onIconUpload={handleIconUpload}
+            onGenerateIcon={handleGenerateIcon}
+            iconGenerating={iconGenerating}
             sanitizedName={sanitizeName(moduleMeta.name) || "my_widget"}
           />
 
-          <div className="my-4 border-t border-zinc-200 dark:border-zinc-800" />
+          <div className="my-4 border-t border-border-subtle" />
 
           <div className="mb-2 flex items-center justify-between">
-            <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <span className="text-xs font-semibold uppercase text-ink-muted dark:text-ink-muted">
               Inspector
             </span>
             {(selectedIds.size > 0 && (selectedIds.size > 1 || (primaryNode && primaryId !== root.id))) && (
               <div className="flex items-center gap-2">
                 <button
-                  className="text-[11px] text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                  className="text-[11px] text-ink-muted dark:text-ink-muted hover:underline"
                   onClick={duplicateSelected}
                 >duplicate</button>
                 <button
-                  className="text-[11px] text-red-600 dark:text-red-400 hover:underline"
+                  className="text-[11px] text-danger hover:underline"
                   onClick={deleteSelected}
                 >delete</button>
               </div>
@@ -2834,17 +2862,17 @@ export default function BuilderClient() {
               <IconBtn title="Send backward (Cmd+[)"        onClick={() => zOrderSelected("backward")} ><AlignIcon kind="centerX" /></IconBtn>
               <IconBtn title="Bring forward (Cmd+])"        onClick={() => zOrderSelected("forward")}  ><AlignIcon kind="right" /></IconBtn>
               <IconBtn title="Bring to front (Cmd+Shift+])" onClick={() => zOrderSelected("front")}    ><AlignIcon kind="distH" /></IconBtn>
-              <span className="ml-1 text-[10px] text-zinc-400 dark:text-zinc-500">z-order</span>
+              <span className="ml-1 text-[10px] text-ink-muted">z-order</span>
             </div>
           )}
           {selectedIds.size === 0 ? (
-            <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <p className="text-xs text-ink-muted dark:text-ink-muted">
               Click a node in the canvas to edit. Shift-click to add to selection.
               Click empty space to deselect.
             </p>
           ) : selectedIds.size > 1 ? (
             <div className="flex flex-col gap-3">
-              <p className="text-xs text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">
+              <p className="text-xs text-ink-muted dark:text-ink-muted">
                 <span className="font-mono">{selectedIds.size}</span> items selected.
                 Drag to move together; Delete / Cmd+D / arrows apply to all.
               </p>
@@ -2869,7 +2897,7 @@ export default function BuilderClient() {
             />
           ) : null}
           <details className="mt-6">
-            <summary className="cursor-pointer text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <summary className="cursor-pointer text-xs font-semibold uppercase text-ink-muted dark:text-ink-muted">
               Generated QML
             </summary>
             {/*
@@ -2880,7 +2908,7 @@ export default function BuilderClient() {
             */}
             <pre
               suppressHydrationWarning
-              className="mt-2 max-h-64 overflow-auto rounded bg-zinc-50 dark:bg-zinc-800 p-2 text-[10px] leading-tight text-zinc-700 dark:text-zinc-300"
+              className="mt-2 max-h-64 overflow-auto rounded bg-surface-warm p-2 text-[10px] leading-tight text-ink-muted"
             >
               {qmlExport}
             </pre>
@@ -2894,22 +2922,22 @@ export default function BuilderClient() {
           onClick={() => setExportOpen(false)}
         >
           <div
-            className="w-[440px] rounded-lg bg-white dark:bg-zinc-900 p-5 shadow-xl"
+            className="w-[440px] rounded-lg bg-canvas p-5 shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-3">
-              <div className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">Export project</div>
-              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+              <div className="text-sm font-semibold text-ink">Export project</div>
+              <div className="text-[11px] text-ink-muted dark:text-ink-muted">
                 Pick what to download. Each artifact ships as a separate <span className="font-mono">.lgx</span>; install whichever ones aren&apos;t already in your Basecamp.
               </div>
               {deliveryNeedsRelay && (
-                <div className="mt-2 rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950 p-2 text-[11px] leading-tight text-amber-900 dark:text-amber-200">
+                <div className="mt-2 rounded border border-warning bg-warning-bg dark:bg-warning-bg p-2 text-[11px] leading-tight text-warning">
                   <span className="font-semibold">Delivery is enabled.</span> Install both the UI and the bundled <span className="font-mono">delivery_relay.lgx</span> on every Basecamp instance. The relay is the same file for every project — install once, reuse forever.
                 </div>
               )}
             </div>
             <div className="flex flex-col gap-3">
-              <label className="flex items-start gap-2 rounded border border-zinc-200 dark:border-zinc-700 p-2 cursor-pointer hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800">
+              <label className="flex items-start gap-2 rounded border border-border-subtle p-2 cursor-pointer hover:bg-surface-warm">
                 <input
                   type="checkbox"
                   checked={exportUi}
@@ -2917,10 +2945,10 @@ export default function BuilderClient() {
                   className="mt-0.5 h-4 w-4"
                 />
                 <div>
-                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                  <div className="text-xs font-semibold text-ink">
                     UI plugin (<span className="font-mono">.lgx</span>, portable)
                   </div>
-                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                  <div className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
                     The QML widget — the thing the user sees. Always available; UI-only widgets are complete with just this. Built and packaged in the canonical portable shape, ready to drop into Basecamp.
                   </div>
                 </div>
@@ -2929,8 +2957,8 @@ export default function BuilderClient() {
               <label
                 className={`flex items-start gap-2 rounded border p-2 ${
                   deliveryNeedsRelay
-                    ? "border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 cursor-pointer hover:bg-amber-50 dark:bg-amber-950"
-                    : "border-zinc-200 dark:border-zinc-700 cursor-pointer hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+                    ? "border-warning bg-warning-bg cursor-pointer hover:bg-warning-bg/80"
+                    : "border-border-subtle cursor-pointer hover:bg-surface-warm"
                 }`}
               >
                 <input
@@ -2941,13 +2969,13 @@ export default function BuilderClient() {
                   className="mt-0.5 h-4 w-4"
                 />
                 <div>
-                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                  <div className="text-xs font-semibold text-ink">
                     <span className="font-mono">delivery_relay.lgx</span> (pre-built, ready to install){" "}
                     {deliveryNeedsRelay && (
-                      <span className="ml-1 rounded bg-amber-100 dark:bg-amber-900 px-1 py-0.5 text-[9px] font-mono text-amber-900 dark:text-amber-200">required</span>
+                      <span className="ml-1 rounded bg-warning-bg dark:bg-warning-bg px-1 py-0.5 text-[9px] font-mono text-warning">required</span>
                     )}
                   </div>
-                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                  <div className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
                     Bundled C++ relay that owns <span className="font-mono">delivery_module</span>&apos;s lifecycle and exposes <span className="font-mono">sendMessage</span> / <span className="font-mono">subscribeToTopic</span> / <span className="font-mono">takeRecentMessages</span> to widgets. Same file for every project — install once per Basecamp; reuse across all your delivery widgets.
                   </div>
                 </div>
@@ -2961,8 +2989,8 @@ export default function BuilderClient() {
               <div
                 className={`rounded border p-3 ${
                   hasCoreModule
-                    ? "border-zinc-200 dark:border-zinc-700"
-                    : "border-zinc-100 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50 opacity-60"
+                    ? "border-border-subtle"
+                    : "border-border-subtle bg-surface-warm/50 opacity-60"
                 }`}
               >
                 <label className="flex cursor-pointer items-start gap-2">
@@ -2974,15 +3002,15 @@ export default function BuilderClient() {
                     className="mt-0.5 h-4 w-4"
                   />
                   <div>
-                    <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                    <div className="text-xs font-semibold text-ink">
                       Custom backend module
                       {hasCoreModule && (
-                        <span className="ml-1 rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 font-mono text-[9px] font-normal text-zinc-600 dark:text-zinc-400">
+                        <span className="ml-1 rounded bg-surface-cool px-1 py-0.5 font-mono text-[9px] font-normal text-ink-muted">
                           {app.coreModule!.id}
                         </span>
                       )}
                     </div>
-                    <div className="mt-0.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                    <div className="mt-0.5 text-[10px] leading-tight text-ink-muted">
                       {hasCoreModule
                         ? "Native C++ — needs compilation for the target OS. Pick a build path:"
                         : "Only shown when you've added a module via Ask AI → build a backend. Most apps don't need this."}
@@ -2996,8 +3024,8 @@ export default function BuilderClient() {
                     <label
                       className={`flex cursor-pointer flex-col gap-1 rounded border p-2 transition-colors ${
                         coreBuildMethod === "local"
-                          ? "border-indigo-300 bg-indigo-50 dark:border-indigo-700 dark:bg-indigo-950/40"
-                          : "border-zinc-200 hover:border-zinc-300 dark:border-zinc-700 dark:hover:border-zinc-600"
+                          ? "border-accent bg-surface-warm dark:border-accent dark:bg-surface-warm/40"
+                          : "border-border-subtle hover:border-border-soft"
                       }`}
                     >
                       <div className="flex items-center gap-1.5">
@@ -3009,15 +3037,15 @@ export default function BuilderClient() {
                           onChange={() => setCoreBuildMethod("local")}
                           className="h-3.5 w-3.5"
                         />
-                        <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                        <div className="text-[11px] font-semibold text-ink">
                           Build locally
                         </div>
                       </div>
-                      <div className="text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
+                      <div className="text-[10px] leading-tight text-ink-muted">
                         Downloads a source archive. You run <span className="font-mono">nix build</span> on your machine — produces a <span className="font-mono">.lgx</span> for whatever OS you ran it on. ~30s with warm cache.
                       </div>
-                      <div className="mt-0.5 text-[9px] text-zinc-500 dark:text-zinc-500">
-                        Requires: <a className="underline hover:text-zinc-700 dark:hover:text-zinc-300" href="https://nixos.org/download" target="_blank" rel="noopener">nix</a> on PATH.
+                      <div className="mt-0.5 text-[9px] text-ink-muted">
+                        Requires: <a className="underline hover:text-ink-muted dark:hover:text-ink-muted" href="https://nixos.org/download" target="_blank" rel="noopener">nix</a> on PATH.
                       </div>
                     </label>
 
@@ -3025,8 +3053,8 @@ export default function BuilderClient() {
                     <label
                       className={`flex cursor-pointer flex-col gap-1 rounded border p-2 transition-colors ${
                         coreBuildMethod === "github"
-                          ? "border-indigo-300 bg-indigo-50 dark:border-indigo-700 dark:bg-indigo-950/40"
-                          : "border-zinc-200 hover:border-zinc-300 dark:border-zinc-700 dark:hover:border-zinc-600"
+                          ? "border-accent bg-surface-warm dark:border-accent dark:bg-surface-warm/40"
+                          : "border-border-subtle hover:border-border-soft"
                       }`}
                     >
                       <div className="flex items-center gap-1.5">
@@ -3038,17 +3066,17 @@ export default function BuilderClient() {
                           onChange={() => setCoreBuildMethod("github")}
                           className="h-3.5 w-3.5"
                         />
-                        <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                        <div className="text-[11px] font-semibold text-ink">
                           Build via GitHub
                         </div>
                         {isGitHubConfigured(ghSettings) && (
-                          <span className="ml-auto rounded bg-emerald-100 px-1 py-0.5 text-[9px] font-mono text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">configured</span>
+                          <span className="ml-auto rounded bg-success-bg px-1 py-0.5 text-[9px] font-mono text-success dark:bg-success-bg dark:text-success">configured</span>
                         )}
                       </div>
-                      <div className="text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
+                      <div className="text-[10px] leading-tight text-ink-muted">
                         Pushes your spec to a GitHub repo, Actions builds it for both Linux and macOS in parallel. Returns a single multi-arch <span className="font-mono">.lgx</span> installable on any Basecamp.
                       </div>
-                      <div className="mt-0.5 text-[9px] text-zinc-500 dark:text-zinc-500">
+                      <div className="mt-0.5 text-[9px] text-ink-muted">
                         $0 on public repos · ~5–10 min per build.
                       </div>
                     </label>
@@ -3058,8 +3086,8 @@ export default function BuilderClient() {
                 {/* Inline build instructions when "local" is selected — the
                     user knows exactly what to do after the download. */}
                 {hasCoreModule && exportCore && coreBuildMethod === "local" && (
-                  <div className="mt-2 ml-6 rounded bg-zinc-50 p-2 font-mono text-[10px] leading-relaxed text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
-                    <div className="mb-0.5 text-[9px] uppercase tracking-wider text-zinc-500 dark:text-zinc-500">After download:</div>
+                  <div className="mt-2 ml-6 rounded bg-surface-warm p-2 font-mono text-[10px] leading-relaxed text-ink-muted">
+                    <div className="mb-0.5 text-[9px] uppercase tracking-wider text-ink-muted">After download:</div>
                     tar -xzf {app.coreModule!.id}-core-source.lgx<br />
                     cd {app.coreModule!.id}-core && nix build &apos;.#lgx-portable&apos;<br />
                     cp result/{app.coreModule!.id}.lgx ~/Desktop/
@@ -3071,52 +3099,52 @@ export default function BuilderClient() {
                     separate Settings panel. PAT lives in localStorage; this
                     is the BYO-token MVP, replaced by GitHub App OAuth later. */}
                 {hasCoreModule && exportCore && coreBuildMethod === "github" && !building && (
-                  <div className="mt-2 ml-6 space-y-2 rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-900">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                  <div className="mt-2 ml-6 space-y-2 rounded border border-border-subtle bg-surface-warm p-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
                       GitHub configuration
                     </div>
                     <div>
-                      <label className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400">Repo</label>
+                      <label className="text-[10px] font-medium text-ink-muted">Repo</label>
                       <input
                         type="text"
                         placeholder="username/lgx-modules"
                         value={ghSettings.repo}
                         onChange={(e) => saveGhSettings({ ...ghSettings, repo: e.target.value.trim() })}
-                        className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-1.5 py-1 font-mono text-[11px] text-zinc-800 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-200"
+                        className="mt-0.5 w-full rounded border border-border-soft bg-canvas px-1.5 py-1 font-mono text-[11px] text-ink"
                       />
                     </div>
                     <div>
-                      <label className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400">
+                      <label className="text-[10px] font-medium text-ink-muted">
                         Fine-grained PAT
-                        <span className="ml-1 font-normal text-zinc-500"> — needs Contents: R/W, Workflows: R/W, Actions: R, Metadata: R</span>
+                        <span className="ml-1 font-normal text-ink-muted"> — needs Contents: R/W, Workflows: R/W, Actions: R, Metadata: R</span>
                       </label>
                       <input
                         type="password"
                         placeholder="github_pat_…"
                         value={ghSettings.token}
                         onChange={(e) => saveGhSettings({ ...ghSettings, token: e.target.value })}
-                        className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-1.5 py-1 font-mono text-[11px] text-zinc-800 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-200"
+                        className="mt-0.5 w-full rounded border border-border-soft bg-canvas px-1.5 py-1 font-mono text-[11px] text-ink"
                       />
                       <a
                         href="https://github.com/settings/personal-access-tokens/new"
                         target="_blank"
                         rel="noopener"
-                        className="mt-1 inline-block text-[10px] text-indigo-600 hover:underline dark:text-indigo-400"
+                        className="mt-1 inline-block text-[10px] text-accent hover:underline dark:text-accent"
                       >Generate one →</a>
                     </div>
                     <div className="flex items-center gap-2">
                       <button
                         onClick={probeGh}
                         disabled={ghProbing || !ghSettings.repo || !ghSettings.token}
-                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-[10px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                        className="rounded border border-border-soft bg-canvas px-2 py-1 text-[10px] text-ink-muted hover:bg-surface-warm disabled:opacity-40"
                       >{ghProbing ? "Testing…" : "Test connection"}</button>
                       {ghProbe && (
-                        <span className={`text-[10px] ${ghProbe.ok ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                        <span className={`text-[10px] ${ghProbe.ok ? "text-success" : "text-danger"}`}>
                           {ghProbe.msg}
                         </span>
                       )}
                     </div>
-                    <div className="text-[9px] leading-snug text-zinc-500">
+                    <div className="text-[9px] leading-snug text-ink-muted">
                       Settings are stored in this browser only. The token never reaches lgx.guru&apos;s server — your browser talks directly to api.github.com.
                     </div>
                   </div>
@@ -3124,11 +3152,11 @@ export default function BuilderClient() {
 
                 {/* Live build progress when a GitHub build is in flight. */}
                 {hasCoreModule && exportCore && coreBuildMethod === "github" && (building || buildProgress) && (
-                  <div className="mt-2 ml-6 rounded border border-indigo-200 bg-indigo-50 p-2 dark:border-indigo-800 dark:bg-indigo-950/40">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">
+                  <div className="mt-2 ml-6 rounded border border-accent bg-surface-warm p-2 dark:border-accent dark:bg-surface-warm/40">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-accent">
                       Build in progress
                     </div>
-                    <div className="mt-1 text-[11px] text-zinc-700 dark:text-zinc-200">
+                    <div className="mt-1 text-[11px] text-ink-muted">
                       {!buildProgress && "Starting…"}
                       {buildProgress?.kind === "pushing" && `Pushing files (${buildProgress.fileIndex + 1}/${buildProgress.totalFiles}): ${buildProgress.path}`}
                       {buildProgress?.kind === "triggering" && "Triggering workflow…"}
@@ -3137,7 +3165,7 @@ export default function BuilderClient() {
                       {buildProgress?.kind === "downloading" && "Downloading artifact…"}
                       {buildProgress?.kind === "done" && "Done ✓ (download starting)"}
                       {buildProgress?.kind === "error" && (
-                        <span className="text-rose-600 dark:text-rose-400">
+                        <span className="text-danger">
                           Error: {buildProgress.message}
                           {buildProgress.logsUrl && (
                             <> — <a className="underline" href={buildProgress.logsUrl} target="_blank" rel="noopener">view logs</a></>
@@ -3153,30 +3181,30 @@ export default function BuilderClient() {
                   because it's not installable. It's the round-trippable
                   JSON snapshot of the editor state, useful for sharing a
                   project with someone or moving it to another browser. */}
-              <div className="mt-1 flex items-start gap-2 rounded border border-dashed border-zinc-300 dark:border-zinc-600 bg-zinc-50 dark:bg-zinc-800/40 p-2">
+              <div className="mt-1 flex items-start gap-2 rounded border border-dashed border-border-soft bg-surface-warm/40 p-2">
                 <div className="flex-1">
-                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                  <div className="text-xs font-semibold text-ink">
                     Project file (<span className="font-mono">.lgx-design.json</span>)
                   </div>
-                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                  <div className="text-[10px] leading-tight text-ink-muted">
                     Portable backup of this editor session — pages, variables, triggers, custom backend spec, and assets. Re-import via <span className="font-semibold">Open</span>. Your project is auto-saved to this browser; this is for moving it elsewhere.
                   </div>
                 </div>
                 <button
                   onClick={handleDownloadDesign}
-                  className="shrink-0 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-2 py-1 text-[10px] font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  className="shrink-0 rounded border border-border-soft bg-canvas px-2 py-1 text-[10px] font-medium text-ink-muted hover:bg-surface-warm"
                 >Download</button>
               </div>
             </div>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 onClick={() => setExportOpen(false)}
-                className="rounded border border-zinc-300 dark:border-zinc-600 px-3 py-1.5 text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+                className="rounded border border-border-soft px-3 py-1.5 text-xs text-ink-muted hover:bg-surface-warm"
               >Cancel</button>
               <button
                 onClick={runExport}
                 disabled={!exportUi && !(exportCore && hasCoreModule) && !(exportRelay || deliveryNeedsRelay)}
-                className="rounded bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-40"
+                className="rounded bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:opacity-90 disabled:opacity-40"
               >Export</button>
             </div>
           </div>
@@ -3286,7 +3314,7 @@ function IconBtn({
       title={title}
       disabled={disabled}
       onClick={onClick}
-      className="flex h-7 w-7 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:border-zinc-400 dark:border-zinc-500 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800 disabled:opacity-30 disabled:hover:bg-white dark:bg-zinc-900"
+      className="flex h-7 w-7 items-center justify-center rounded border border-border-soft bg-canvas text-ink-muted hover:border-border-soft dark:border-border-soft hover:bg-surface-warm disabled:opacity-30 disabled:hover:bg-canvas"
     >
       {children}
     </button>
@@ -3368,23 +3396,23 @@ function AlignToolbar({
 }) {
   return (
     <div>
-      <div className="mb-1 text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Align</div>
+      <div className="mb-1 text-[10px] font-semibold uppercase text-ink-muted dark:text-ink-muted">Align</div>
       <div className="flex gap-1">
         <IconBtn title="Align left"     disabled={!canAlign} onClick={() => onAlign("left")}    ><AlignIcon kind="left" /></IconBtn>
         <IconBtn title="Align center X" disabled={!canAlign} onClick={() => onAlign("centerX")} ><AlignIcon kind="centerX" /></IconBtn>
         <IconBtn title="Align right"    disabled={!canAlign} onClick={() => onAlign("right")}   ><AlignIcon kind="right" /></IconBtn>
-        <span className="mx-0.5 w-px self-stretch bg-zinc-200" />
+        <span className="mx-0.5 w-px self-stretch bg-surface-cool" />
         <IconBtn title="Align top"      disabled={!canAlign} onClick={() => onAlign("top")}     ><AlignIcon kind="top" /></IconBtn>
         <IconBtn title="Align center Y" disabled={!canAlign} onClick={() => onAlign("centerY")} ><AlignIcon kind="centerY" /></IconBtn>
         <IconBtn title="Align bottom"   disabled={!canAlign} onClick={() => onAlign("bottom")}  ><AlignIcon kind="bottom" /></IconBtn>
       </div>
-      <div className="mt-2 mb-1 text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Distribute</div>
+      <div className="mt-2 mb-1 text-[10px] font-semibold uppercase text-ink-muted dark:text-ink-muted">Distribute</div>
       <div className="flex gap-1">
         <IconBtn title="Distribute horizontally" disabled={!canDistribute} onClick={() => onDistribute("horizontal")}><AlignIcon kind="distH" /></IconBtn>
         <IconBtn title="Distribute vertically"   disabled={!canDistribute} onClick={() => onDistribute("vertical")}  ><AlignIcon kind="distV" /></IconBtn>
       </div>
       {!canAlign && (
-        <p className="mt-1 text-[10px] text-zinc-400 dark:text-zinc-500">
+        <p className="mt-1 text-[10px] text-ink-muted">
           Align/distribute requires the selection to share one parent.
         </p>
       )}
@@ -3568,7 +3596,7 @@ function ResizeOverlay({
       {ANCHORS.map((a) => (
         <div
           key={a.anchor}
-          className="pointer-events-auto absolute rounded-sm border border-indigo-500 bg-white dark:bg-zinc-900"
+          className="pointer-events-auto absolute rounded-sm border border-ink bg-canvas"
           style={{
             width: HANDLE,
             height: HANDLE,
@@ -3585,11 +3613,11 @@ function ResizeOverlay({
 
 // ── Inspector ──────────────────────────────────────────────────────────────
 
-const I_LABEL = "block text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 mb-0.5";
+const I_LABEL = "block text-[11px] font-medium text-ink-muted dark:text-ink-muted mb-0.5";
 const I_INPUT =
-  "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-indigo-500 focus:outline-none";
+  "w-full rounded border border-border-soft px-1.5 py-1 text-xs focus:border-ink focus:outline-none";
 const I_SUMMARY =
-  "cursor-pointer text-[11px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 select-none mb-2";
+  "cursor-pointer text-[11px] font-semibold uppercase text-ink-muted dark:text-ink-muted select-none mb-2";
 
 // Sidebar-panel chrome: one shared `<details>` container that gives every
 // left-aside panel a uniform header + collapse affordance. Children are the
@@ -3606,16 +3634,16 @@ function SidebarSection({
   children: React.ReactNode;
 }) {
   return (
-    <details open={defaultOpen} className="shrink-0 border-b border-zinc-100 dark:border-zinc-800 [&[open]>summary>span.chev]:rotate-90">
+    <details open={defaultOpen} className="shrink-0 border-b border-border-subtle [&[open]>summary>span.chev]:rotate-90">
       <summary
         // Reset the native disclosure triangle (`list-none` / Webkit) so we
         // own the visual; the rotating ▸ glyph below is the open indicator.
-        className="flex cursor-pointer select-none items-center gap-1.5 px-3 py-2.5 transition-colors hover:bg-zinc-50/60 dark:hover:bg-zinc-800/40 list-none [&::-webkit-details-marker]:hidden"
+        className="flex cursor-pointer select-none items-center gap-1.5 px-3 py-2.5 transition-colors hover:bg-surface-warm/60/40 list-none [&::-webkit-details-marker]:hidden"
       >
-        <span className="chev inline-block text-[10px] text-zinc-400 dark:text-zinc-500 transition-transform">▸</span>
-        <span className="flex-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">{title}</span>
+        <span className="chev inline-block text-[10px] text-ink-muted transition-transform">▸</span>
+        <span className="flex-1 text-[10px] font-semibold uppercase tracking-wider text-ink-muted">{title}</span>
         {badge !== undefined && badge !== "" && (
-          <span className="rounded-full bg-zinc-100 px-1.5 py-0.5 text-[9px] font-medium leading-none text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">{badge}</span>
+          <span className="rounded-full bg-surface-cool px-1.5 py-0.5 text-[9px] font-medium leading-none text-ink-muted dark:bg-surface-warm dark:text-ink-muted">{badge}</span>
         )}
         {/* Right-side button area (e.g. "+") — stop propagation so clicking
             it doesn't toggle the section. */}
@@ -3689,12 +3717,12 @@ function CheckboxField({
   label, checked, onChange,
 }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <label className="flex items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">
+    <label className="flex items-center gap-2 text-[11px] text-ink-muted dark:text-ink-muted">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        className="h-3.5 w-3.5 rounded border-zinc-300 dark:border-zinc-600"
+        className="h-3.5 w-3.5 rounded border-border-soft"
       />
       {label}
     </label>
@@ -3717,7 +3745,7 @@ function ColorField({
           type="color"
           value={isHex ? value : "#000000"}
           onChange={(e) => onChange(e.target.value)}
-          className="h-7 w-7 shrink-0 cursor-pointer rounded border border-zinc-300 dark:border-zinc-600 p-0"
+          className="h-7 w-7 shrink-0 cursor-pointer rounded border border-border-soft p-0"
           title="Pick color"
         />
         <input
@@ -3731,8 +3759,8 @@ function ColorField({
           onClick={() => onChange(isTransparent ? "#ffffff" : "transparent")}
           className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${
             isTransparent
-              ? "border-indigo-400 dark:border-indigo-600 bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300"
-              : "border-zinc-300 dark:border-zinc-600 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              ? "border-accent dark:border-accent bg-surface-warm text-accent"
+              : "border-border-soft text-ink-muted hover:bg-surface-warm"
           }`}
           title={isTransparent ? "Currently transparent — click to switch to a color" : "Make this transparent (no fill)"}
         >∅</button>
@@ -3767,12 +3795,12 @@ function BindingSelect({
         ))}
       </select>
       {value && !stillBound && (
-        <p className="mt-1 text-[10px] text-amber-600">
+        <p className="mt-1 text-[10px] text-warning">
           Bound variable was deleted — clear or pick a new one.
         </p>
       )}
       {compatible.length === 0 && !value && (
-        <p className="mt-1 text-[10px] text-zinc-400 dark:text-zinc-500">
+        <p className="mt-1 text-[10px] text-ink-muted">
           No {acceptType} variables defined yet — add one in the left sidebar.
         </p>
       )}
@@ -3865,7 +3893,7 @@ function ButtonOnClickEditor({
     else onChange({ kind: "openUrl", url: "" });
   };
   return (
-    <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+    <div className="rounded border border-border-subtle p-2">
       <label className={I_LABEL}>on click</label>
       <select
         className={I_INPUT}
@@ -3921,7 +3949,7 @@ function ButtonOnClickEditor({
                       // re-flow back down.
                       setAction({ varId: id });
                     }}
-                    className="text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline"
+                    className="text-[10px] text-accent hover:underline"
                   >+ new</button>
                 )}
               </div>
@@ -3938,7 +3966,7 @@ function ButtonOnClickEditor({
               <label className={I_LABEL}>set to</label>
               <button
                 onClick={() => setAction({ mode: mode === "literal" ? "expression" : "literal" })}
-                className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                className="text-[10px] text-ink-muted dark:text-ink-muted hover:underline"
                 title="Switch between literal value and JS-style expression"
               >{mode === "literal" ? "use expression →" : "← use literal"}</button>
             </div>
@@ -3972,7 +4000,7 @@ function ButtonOnClickEditor({
               />
             )}
             {mode === "expression" && (
-              <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              <p className="text-[10px] leading-tight text-ink-muted">
                 Spliced into QML as-is. Reference state via{" "}
                 <span className="font-mono">app.var_*</span>; quote string
                 literals.
@@ -4016,7 +4044,7 @@ function ButtonOnClickEditor({
                       const id = onAddVariable("messages");
                       setAppend({ varId: id });
                     }}
-                    className="text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline"
+                    className="text-[10px] text-accent hover:underline"
                   >+ new</button>
                 )}
               </div>
@@ -4030,7 +4058,7 @@ function ButtonOnClickEditor({
                   <option key={v.id} value={v.id}>{v.name}</option>
                 ))}
               </select>
-              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">
                 A string variable whose value is a JSON array (e.g. set initial to{" "}
                 <span className="font-mono">[]</span>). Bind a List node to the same variable to render every item.
               </p>
@@ -4039,7 +4067,7 @@ function ButtonOnClickEditor({
               <label className={I_LABEL}>append</label>
               <button
                 onClick={() => setAppend({ mode: mode === "literal" ? "expression" : "literal" })}
-                className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:underline"
+                className="text-[10px] text-ink-muted hover:underline"
                 title="Switch between literal value and JS-style expression"
               >{mode === "literal" ? "use expression →" : "← use literal"}</button>
             </div>
@@ -4081,7 +4109,7 @@ function ButtonOnClickEditor({
                 onChange={(e) => setSend({ topic: e.target.value })}
                 placeholder="/myapp/1/messages/json"
               />
-              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">
                 Format: <span className="font-mono">/&lt;app&gt;/&lt;version&gt;/&lt;subtopic&gt;/&lt;format&gt;</span>. Anyone subscribed to the same topic receives the message.
               </p>
             </div>
@@ -4090,7 +4118,7 @@ function ButtonOnClickEditor({
                 <label className={I_LABEL}>message</label>
                 <button
                   onClick={() => setSend({ payloadMode: mode === "literal" ? "expression" : "literal" })}
-                  className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                  className="text-[10px] text-ink-muted dark:text-ink-muted hover:underline"
                   title="Literal text vs. a QML expression (e.g. read from a variable)"
                 >{mode === "literal" ? "use expression →" : "← use literal"}</button>
               </div>
@@ -4111,12 +4139,12 @@ function ButtonOnClickEditor({
                 />
               )}
               {mode === "expression" && (
-                <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">
                   Splice in any QML expression — usually <span className="font-mono">app.var_*</span> to send the contents of a Text Field.
                 </p>
               )}
             </div>
-            <p className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <p className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
               Delivery is set up automatically — no need to add the module separately.
             </p>
           </div>
@@ -4145,7 +4173,7 @@ function ButtonOnClickEditor({
                 onChange={(e) => setIf({ condition: e.target.value })}
                 placeholder='e.g. app.var_count > 5'
               />
-              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">
                 Inner actions run only when this expression is truthy. Reference variables via <span className="font-mono">app.var_*</span>; use <span className="font-mono">payload</span> / <span className="font-mono">topic</span> inside on-message triggers.
               </p>
             </div>
@@ -4155,22 +4183,22 @@ function ButtonOnClickEditor({
                 <button
                   type="button"
                   onClick={addInner}
-                  className="text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline"
+                  className="text-[10px] text-accent hover:underline"
                 >+ action</button>
               </div>
-              <div className="mt-1 flex flex-col gap-1.5 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/40 p-1.5">
+              <div className="mt-1 flex flex-col gap-1.5 rounded border border-border-subtle bg-surface-warm/50 dark:bg-surface-warm/40 p-1.5">
                 {inner.length === 0 && (
-                  <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                  <p className="text-[10px] leading-tight text-ink-muted">
                     No inner actions yet. Click <span className="font-mono">+ action</span> to add one.
                   </p>
                 )}
                 {inner.map((sub, idx) => (
-                  <div key={idx} className="rounded border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-1">
+                  <div key={idx} className="rounded border border-border-subtle bg-canvas p-1">
                     <div className="mb-0.5 flex items-center justify-between">
-                      <span className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500">#{idx + 1}</span>
+                      <span className="text-[10px] font-mono text-ink-muted">#{idx + 1}</span>
                       <button
                         onClick={() => deleteInner(idx)}
-                        className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:text-red-600 dark:hover:text-red-400"
+                        className="text-[10px] text-ink-muted hover:text-danger dark:hover:text-danger"
                       >×</button>
                     </div>
                     {/* Recursive editor — supports nested `if`s, etc. */}
@@ -4241,12 +4269,12 @@ function ButtonOnClickEditor({
                 ))}
               </select>
               {method?.description && (
-                <p className="mt-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">{method.description}</p>
+                <p className="mt-1 text-[10px] leading-tight text-ink-muted dark:text-ink-muted">{method.description}</p>
               )}
             </div>
             {method && method.args.length > 0 && (
-              <div className="flex flex-col gap-2 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-2">
-                <div className="text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Arguments</div>
+              <div className="flex flex-col gap-2 rounded border border-border-subtle bg-surface-warm p-2">
+                <div className="text-[10px] font-semibold uppercase text-ink-muted dark:text-ink-muted">Arguments</div>
                 {method.args.map((p, idx) => {
                   const arg = action.args[idx] ?? { value: "", mode: "literal" as SetVariableMode };
                   const mode = arg.mode ?? "literal";
@@ -4255,11 +4283,11 @@ function ButtonOnClickEditor({
                       <div className="flex items-center justify-between">
                         <label className={I_LABEL}>
                           <span className="font-mono">{p.name}</span>{" "}
-                          <span className="text-zinc-400 dark:text-zinc-500">({p.type})</span>
+                          <span className="text-ink-muted">({p.type})</span>
                         </label>
                         <button
                           onClick={() => setArg(idx, { mode: mode === "literal" ? "expression" : "literal" })}
-                          className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:underline"
+                          className="text-[10px] text-ink-muted dark:text-ink-muted hover:underline"
                         >{mode === "literal" ? "use expression →" : "← use literal"}</button>
                       </div>
                       {mode === "expression" ? (
@@ -4288,7 +4316,7 @@ function ButtonOnClickEditor({
                         />
                       )}
                       {p.description && (
-                        <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">{p.description}</p>
+                        <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">{p.description}</p>
                       )}
                     </div>
                   );
@@ -4351,13 +4379,13 @@ function ButtonOnClickEditor({
                       const id = onAddVariable("result");
                       setVarId(id);
                     }}
-                    className="shrink-0 rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    className="shrink-0 rounded border border-border-soft px-1.5 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
                     title="Create a new variable to hold the result"
                   >+ new</button>
                 )}
               </div>
               {method && (
-                <p className="mt-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                <p className="mt-1 text-[10px] leading-tight text-ink-muted">
                   Returns <span className="font-mono">{method.returns}</span> — pick a string variable for text, a number variable for numbers, etc.
                 </p>
               )}
@@ -4384,12 +4412,12 @@ function ButtonOnClickEditor({
                 ))}
               </select>
               {method?.description && (
-                <p className="mt-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{method.description}</p>
+                <p className="mt-1 text-[10px] leading-tight text-ink-muted">{method.description}</p>
               )}
             </div>
             {method && method.args.length > 0 && (
-              <div className="flex flex-col gap-2 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-2">
-                <div className="text-[10px] font-semibold uppercase text-zinc-500 dark:text-zinc-400">Arguments</div>
+              <div className="flex flex-col gap-2 rounded border border-border-subtle bg-surface-warm p-2">
+                <div className="text-[10px] font-semibold uppercase text-ink-muted">Arguments</div>
                 {method.args.map((p, idx) => {
                   const arg = action.args[idx] ?? { value: "", mode: "literal" as SetVariableMode };
                   const mode = arg.mode ?? "literal";
@@ -4398,11 +4426,11 @@ function ButtonOnClickEditor({
                       <div className="flex items-center justify-between">
                         <label className={I_LABEL}>
                           <span className="font-mono">{p.name}</span>{" "}
-                          <span className="text-zinc-400 dark:text-zinc-500">({p.type})</span>
+                          <span className="text-ink-muted">({p.type})</span>
                         </label>
                         <button
                           onClick={() => setArg(idx, { mode: mode === "literal" ? "expression" : "literal" })}
-                          className="text-[10px] text-zinc-500 dark:text-zinc-400 hover:underline"
+                          className="text-[10px] text-ink-muted hover:underline"
                         >{mode === "literal" ? "use expression →" : "← use literal"}</button>
                       </div>
                       {mode === "expression" ? (
@@ -4431,14 +4459,14 @@ function ButtonOnClickEditor({
                         />
                       )}
                       {p.description && (
-                        <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">{p.description}</p>
+                        <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">{p.description}</p>
                       )}
                     </div>
                   );
                 })}
               </div>
             )}
-            <p className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+            <p className="text-[10px] leading-tight text-ink-muted">
               Note: this captures the method&apos;s synchronous return. If the module fetches over the network and emits the result via an event, use a trigger on the event instead.
             </p>
           </div>
@@ -4495,9 +4523,9 @@ function TextSourcePicker({
   // ── Static + variable modes — no wizard, just present existing UI ─────
   if (mode === "static") {
     return (
-      <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+      <div className="rounded border border-border-subtle p-2">
         <SourceModeTabs mode={mode} setMode={setMode} hasVariables={variables.length > 0} />
-        <p className="mt-2 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
+        <p className="mt-2 text-[10px] leading-snug text-ink-muted">
           The Text shows whatever you type below.
         </p>
       </div>
@@ -4506,7 +4534,7 @@ function TextSourcePicker({
 
   if (mode === "variable") {
     return (
-      <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+      <div className="rounded border border-border-subtle p-2">
         <SourceModeTabs mode={mode} setMode={setMode} hasVariables={variables.length > 0} />
         <div className="mt-2">
           <label className={I_LABEL}>variable</label>
@@ -4524,7 +4552,7 @@ function TextSourcePicker({
             ))}
           </select>
           {node.binding && !variables.find((v) => v.id === node.binding) && (
-            <p className="mt-1 text-[10px] text-amber-600">
+            <p className="mt-1 text-[10px] text-warning">
               Bound variable was deleted — pick a new one or switch sources.
             </p>
           )}
@@ -4562,17 +4590,17 @@ function SourceModeTabs({
       title={title}
       className={`flex-1 rounded px-2 py-1 text-[10px] font-medium transition-colors ${
         mode === id
-          ? "bg-indigo-600 text-white"
+          ? "bg-action text-white"
           : disabled
-          ? "text-zinc-400 dark:text-zinc-600 cursor-not-allowed"
-          : "text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          ? "text-ink-muted dark:text-ink-muted cursor-not-allowed"
+          : "text-ink-muted hover:bg-surface-cool"
       }`}
     >
       {label}
     </button>
   );
   return (
-    <div className="flex gap-0.5 rounded bg-zinc-50 dark:bg-zinc-800 p-0.5">
+    <div className="flex gap-0.5 rounded bg-surface-warm p-0.5">
       <Tab id="static"   label="Static" />
       <Tab id="variable" label="Variable" disabled={!hasVariables}
         title={hasVariables ? undefined : "No variables yet — create one in the Logic tab, or use Live mode."} />
@@ -4686,14 +4714,14 @@ function LiveSourceWizard({
   };
 
   return (
-    <div className="rounded border border-zinc-200 dark:border-zinc-700 p-2">
+    <div className="rounded border border-border-subtle p-2">
       {tabs}
       {modules.length === 0 ? (
-        <p className="mt-3 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
+        <p className="mt-3 text-[10px] leading-snug text-ink-muted">
           Enable a module in the Modules tab first, then come back here.
         </p>
       ) : sourceOptions.length === 0 && mod ? (
-        <p className="mt-3 text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
+        <p className="mt-3 text-[10px] leading-snug text-ink-muted">
           <span className="font-mono">{mod.name}</span> doesn&apos;t expose any methods (with no args) or events that we can auto-wire.
         </p>
       ) : (
@@ -4721,7 +4749,7 @@ function LiveSourceWizard({
             </div>
           )}
           {source?.kind === "event" && kickoffSuggestion && (
-            <label className="flex items-start gap-2 text-[10px] leading-snug text-zinc-600 dark:text-zinc-300">
+            <label className="flex items-start gap-2 text-[10px] leading-snug text-ink-muted">
               <input
                 type="checkbox"
                 className="mt-0.5"
@@ -4730,7 +4758,7 @@ function LiveSourceWizard({
               />
               <span>
                 Call <span className="font-mono">{kickoffSuggestion}()</span> on app load to start the fetch.{" "}
-                <span className="text-zinc-500 dark:text-zinc-400">Without this, the event never fires.</span>
+                <span className="text-ink-muted">Without this, the event never fires.</span>
               </span>
             </label>
           )}
@@ -4738,18 +4766,18 @@ function LiveSourceWizard({
             <button
               onClick={handleWire}
               disabled={!canWire}
-              className="flex-1 rounded bg-indigo-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+              className="flex-1 rounded bg-action px-3 py-1.5 text-[11px] font-medium text-white hover:bg-surface-warm0 disabled:opacity-40"
             >
               ✦ Wire it up
             </button>
             <button
               onClick={onCancel}
-              className="rounded border border-zinc-300 dark:border-zinc-600 px-2 py-1 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              className="rounded border border-border-soft px-2 py-1 text-[10px] text-ink-muted hover:bg-surface-cool"
             >
               Cancel
             </button>
           </div>
-          <p className="text-[10px] leading-snug text-zinc-400 dark:text-zinc-500">
+          <p className="text-[10px] leading-snug text-ink-muted">
             Wiring creates a variable + the triggers needed to keep it updated, then binds this Text to it. You can edit the result in the Logic tab.
           </p>
         </div>
@@ -4787,7 +4815,7 @@ function Inspector({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+      <div className="text-[11px] text-ink-muted dark:text-ink-muted">
         kind: <span className="font-mono">{node.kind}</span>
       </div>
 
@@ -4795,11 +4823,11 @@ function Inspector({
       <details open>
         <summary className={I_SUMMARY}>Position</summary>
         {isRoot ? (
-          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+          <div className="text-[11px] text-ink-muted dark:text-ink-muted">
             <div className="mb-1">
               size <span className="font-mono">{node.width}×{node.height}px</span>
             </div>
-            <div className="text-zinc-400 dark:text-zinc-500">auto-sized to the live preview</div>
+            <div className="text-ink-muted">auto-sized to the live preview</div>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
@@ -4857,7 +4885,7 @@ function Inspector({
               placeholder="(always visible)"
               onChange={(e) => onChange({ visibleWhen: e.target.value || undefined } as Partial<Node>)}
             />
-            <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+            <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">
               Empty = always shown. Examples:{" "}
               <span className="font-mono">app.var_active</span> · {" "}
               <span className="font-mono">app.var_count &gt; 0</span>
@@ -5080,7 +5108,7 @@ function Inspector({
               onChange={(v) => onChange({ pixelSize: Math.max(1, v) } as Partial<LeafNode>)} />
             <CheckboxField label="checked" checked={node.checked}
               onChange={(v) => onChange({ checked: v } as Partial<LeafNode>)} />
-            <p className="text-[11px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <p className="text-[11px] leading-tight text-ink-muted dark:text-ink-muted">
               Wire multiple radios to a shared ButtonGroup post-export for
               mutual exclusion.
             </p>
@@ -5157,7 +5185,7 @@ function Inspector({
             />
             <CheckboxField label="playing" checked={node.playing}
               onChange={(v) => onChange({ playing: v } as Partial<LeafNode>)} />
-            <p className="text-[11px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <p className="text-[11px] leading-tight text-ink-muted dark:text-ink-muted">
               For local files, paste a data: URL or use the Image upload as
               a starting point. GIF / animated WebP recommended.
             </p>
@@ -5181,7 +5209,7 @@ function Inspector({
                   <option key={v.id} value={v.id}>{v.name}</option>
                 ))}
               </select>
-              <p className="mt-0.5 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+              <p className="mt-0.5 text-[10px] leading-tight text-ink-muted">
                 String variable whose value is a JSON array — e.g. set its initial to{" "}
                 <span className="font-mono">[&quot;hello&quot;,&quot;world&quot;]</span> for a 2-row preview, then update it at runtime via <span className="font-mono">setVariable</span> or by polling a relay method.
               </p>
@@ -5201,7 +5229,7 @@ function Inspector({
             <ColorField label="item color" value={node.itemColor}
               onChange={(v) => onChange({ itemColor: v } as Partial<LeafNode>)} />
             <details className="mt-1">
-              <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400 select-none">
+              <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-ink-muted select-none">
                 Item bubble (chat-style)
               </summary>
               <div className="mt-2 flex flex-col gap-2">
@@ -5213,7 +5241,7 @@ function Inspector({
                   <NumField label="bubble padding" value={node.itemPadding}
                     onChange={(v) => onChange({ itemPadding: Math.max(0, v) } as Partial<LeafNode>)} />
                 </div>
-                <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+                <p className="text-[10px] leading-tight text-ink-muted">
                   Set a bg colour, radius, and padding to render each item as a chat bubble. Leave bg transparent and radius/padding 0 for plain text.
                 </p>
               </div>
@@ -5247,36 +5275,36 @@ function ModelListField({
   };
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">model</label>
+      <label className="text-[11px] font-medium text-ink-muted dark:text-ink-muted">model</label>
       {value.map((v, i) => (
         <div key={i} className="flex items-center gap-1">
           <input
             value={v}
             onChange={(e) => update(i, e.target.value)}
-            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded border border-border-soft px-1.5 py-1 text-xs focus:border-ink focus:outline-none"
           />
           <button
             onClick={() => move(i, -1)}
             disabled={i === 0}
-            className="rounded px-1 text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
+            className="rounded px-1 text-ink-muted dark:text-ink-muted hover:bg-surface-cool disabled:opacity-30"
             title="move up"
           >▲</button>
           <button
             onClick={() => move(i, 1)}
             disabled={i === value.length - 1}
-            className="rounded px-1 text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200 disabled:opacity-30"
+            className="rounded px-1 text-ink-muted dark:text-ink-muted hover:bg-surface-cool disabled:opacity-30"
             title="move down"
           >▼</button>
           <button
             onClick={() => remove(i)}
-            className="rounded px-1 text-red-500 hover:bg-red-50"
+            className="rounded px-1 text-danger hover:bg-danger-bg"
             title="delete"
           >×</button>
         </div>
       ))}
       <button
         onClick={add}
-        className="self-start rounded border border-dashed border-zinc-300 dark:border-zinc-600 px-2 py-1 text-[11px] text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:border-zinc-500"
+        className="self-start rounded border border-dashed border-border-soft px-2 py-1 text-[11px] text-ink-muted dark:text-ink-muted hover:border-border-soft"
       >+ add option</button>
     </div>
   );
@@ -5305,7 +5333,7 @@ function ImageSection({
         <img
           src={node.src}
           alt=""
-          className="h-20 w-full rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 object-contain"
+          className="h-20 w-full rounded border border-border-subtle bg-surface-warm object-contain"
         />
         <input
           ref={fileRef}
@@ -5319,7 +5347,7 @@ function ImageSection({
           }}
         />
         <button
-          className="w-full rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-1 text-xs hover:border-zinc-400 dark:border-zinc-500"
+          className="w-full rounded border border-border-soft bg-canvas px-1.5 py-1 text-xs hover:border-border-soft dark:border-border-soft"
           onClick={() => fileRef.current?.click()}
         >
           Replace image…
@@ -5344,6 +5372,8 @@ function ModulePanel({
   iconFilename,
   iconError,
   onIconUpload,
+  onGenerateIcon,
+  iconGenerating,
   sanitizedName,
 }: {
   meta: ModuleMeta;
@@ -5352,18 +5382,20 @@ function ModulePanel({
   iconFilename: string;
   iconError: string | null;
   onIconUpload: (f: File) => void;
+  onGenerateIcon: () => void;
+  iconGenerating: boolean;
   sanitizedName: string;
 }) {
-  const labelClass = "block text-[11px] font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 mb-0.5";
+  const labelClass = "block text-[11px] font-medium text-ink-muted dark:text-ink-muted mb-0.5";
   const inputClass =
-    "w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-xs focus:border-indigo-500 focus:outline-none";
+    "w-full rounded border border-border-soft px-1.5 py-1 text-xs focus:border-ink focus:outline-none";
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const update = (patch: Partial<ModuleMeta>) => onChange({ ...meta, ...patch });
 
   return (
     <div>
-      <div className="mb-2 text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+      <div className="mb-2 text-xs font-semibold uppercase text-ink-muted dark:text-ink-muted">
         Module
       </div>
       <div className="flex flex-col gap-2.5">
@@ -5373,7 +5405,7 @@ function ModulePanel({
             <img
               src={iconPreviewUrl}
               alt="icon"
-              className="h-12 w-12 shrink-0 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 object-contain"
+              className="h-12 w-12 shrink-0 rounded border border-border-subtle bg-surface-warm object-contain"
             />
           )}
           <div className="flex-1 min-w-0">
@@ -5389,14 +5421,24 @@ function ModulePanel({
                 e.target.value = "";
               }}
             />
-            <button
-              className="w-full truncate rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-1 text-left text-xs hover:border-zinc-400 dark:border-zinc-500"
-              onClick={() => fileInputRef.current?.click()}
-              title={iconFilename}
-            >
-              {iconFilename}
-            </button>
-            {iconError && <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{iconError}</p>}
+            <div className="flex gap-1">
+              <button
+                className="flex-1 truncate rounded border border-border-soft bg-canvas px-1.5 py-1 text-left text-xs hover:border-border-soft dark:border-border-soft"
+                onClick={() => fileInputRef.current?.click()}
+                title={iconFilename}
+              >
+                {iconFilename}
+              </button>
+              <button
+                onClick={onGenerateIcon}
+                disabled={iconGenerating}
+                className="shrink-0 rounded gradient-accent px-1.5 py-1 text-[10px] font-medium text-white hover:opacity-90 disabled:opacity-50"
+                title="Generate icon with AI based on module name and description"
+              >
+                {iconGenerating ? "..." : "AI"}
+              </button>
+            </div>
+            {iconError && <p className="mt-1 text-[11px] text-danger">{iconError}</p>}
           </div>
         </div>
 
@@ -5408,7 +5450,7 @@ function ModulePanel({
             onChange={(e) => update({ name: e.target.value })}
           />
           {sanitizedName !== meta.name.toLowerCase() && (
-            <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+            <p className="mt-0.5 text-[11px] text-ink-muted dark:text-ink-muted">
               ships as <span className="font-mono">{sanitizedName}</span>
             </p>
           )}
@@ -5593,7 +5635,7 @@ function PagesPanel({
       headerRight={
         <button
           onClick={onAdd}
-          className="flex h-5 w-5 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 text-xs leading-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          className="flex h-5 w-5 items-center justify-center rounded border border-border-soft text-xs leading-none text-ink-muted hover:bg-surface-cool"
           title="Add a new page"
         >+</button>
       }
@@ -5607,7 +5649,7 @@ function PagesPanel({
               onClick={() => onSwitch(p.id)}
               onDoubleClick={() => promptRename(p)}
               className={`group flex items-center gap-1 rounded px-2 py-1 text-xs cursor-pointer ${
-                active ? "bg-indigo-100 dark:bg-indigo-900 text-indigo-900 dark:text-indigo-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                active ? "bg-surface-warm text-accent dark:text-accent" : "text-ink-muted hover:bg-surface-warm"
               }`}
             >
               <span className="flex-1 truncate" title={p.name}>{p.name}</span>
@@ -5615,13 +5657,13 @@ function PagesPanel({
                 <>
                   <button
                     onClick={(e) => { e.stopPropagation(); promptRename(p); }}
-                    className="text-[10px] text-zinc-500 dark:text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-zinc-800 dark:hover:text-zinc-200"
+                    className="text-[10px] text-ink-muted opacity-0 group-hover:opacity-100 hover:text-ink"
                     title="Rename"
                   >edit</button>
                   {pages.length > 1 && (
                     <button
                       onClick={(e) => { e.stopPropagation(); onDelete(p.id); }}
-                      className="text-[10px] text-red-600 dark:text-red-400 opacity-0 group-hover:opacity-100 hover:underline"
+                      className="text-[10px] text-danger opacity-0 group-hover:opacity-100 hover:underline"
                       title="Delete"
                     >del</button>
                   )}
@@ -5631,7 +5673,7 @@ function PagesPanel({
           );
         })}
       </div>
-      <p className="mt-2 text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+      <p className="mt-2 text-[10px] leading-tight text-ink-muted">
         Double-click to rename.
       </p>
     </SidebarSection>
@@ -5701,32 +5743,32 @@ function TriggersPanel({
       <div className="mb-2 flex items-center gap-1">
         <button
           onClick={() => onAdd("appStart")}
-          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
           title="Run actions when the widget loads"
         >+ load</button>
         <button
           onClick={() => onAdd("interval")}
-          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
           title="Run actions every N milliseconds while the widget is open (polling, stopwatch tick, etc.)"
         >+ tick</button>
         <button
           onClick={() => onAdd("onMessageReceived")}
-          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
           title="Run actions when a message arrives on a content topic"
         >+ message</button>
         <button
           onClick={() => onAdd("moduleEvent")}
           disabled={enabledModules.every((m) => (m.events?.length ?? 0) === 0)}
-          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
+          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool disabled:opacity-40"
           title="Advanced: run actions when a module emits a raw event"
         >+ event</button>
       </div>
-      <p className="mb-2 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+      <p className="mb-2 text-[10px] leading-tight text-ink-muted">
         React to widget load, incoming messages, or raw module events.
       </p>
       <div className="flex flex-col gap-2">
         {triggers.length === 0 && (
-          <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+          <p className="text-[10px] leading-tight text-ink-muted">
             No triggers yet. Add &quot;on load&quot; for setup, or &quot;on message&quot; to react to incoming messages.
           </p>
         )}
@@ -5783,9 +5825,9 @@ function TriggerEditor({
     ? enabledModules.find((m) => m.id === trigger.moduleId)
     : undefined;
   return (
-    <div className="rounded border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-1.5">
+    <div className="rounded border border-border-subtle bg-canvas p-1.5">
       <div className="mb-1 flex items-center gap-1">
-        <span className="font-mono text-[10px] uppercase text-zinc-400 dark:text-zinc-500">
+        <span className="font-mono text-[10px] uppercase text-ink-muted">
           {trigger.kind === "appStart" ? "on load"
             : trigger.kind === "onMessageReceived" ? "on message"
             : trigger.kind === "interval" ? "every"
@@ -5794,31 +5836,31 @@ function TriggerEditor({
         <span className="flex-1" />
         <button
           onClick={onDelete}
-          className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+          className="text-[10px] text-danger hover:underline"
         >del</button>
       </div>
       {trigger.kind === "interval" && (
         <div className="mb-1.5 flex items-center gap-1">
-          <label className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400">every</label>
+          <label className="text-[10px] font-medium text-ink-muted">every</label>
           <input
             type="number"
             min={1}
             step={1}
-            className="w-20 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            className="w-20 rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
             value={trigger.intervalMs ?? 1000}
             onChange={(e) => {
               const n = parseInt(e.target.value, 10);
               onChange({ intervalMs: Number.isFinite(n) && n > 0 ? n : 1 });
             }}
           />
-          <span className="text-[10px] text-zinc-500 dark:text-zinc-400">ms — runs the actions below repeatedly while the widget is open. Use 100 for stopwatch-style ticks; 1000+ for polling.</span>
+          <span className="text-[10px] text-ink-muted">ms — runs the actions below repeatedly while the widget is open. Use 100 for stopwatch-style ticks; 1000+ for polling.</span>
         </div>
       )}
       {trigger.kind === "onMessageReceived" && (
         <div className="mb-1.5 flex flex-col gap-1">
-          <label className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400">topic to listen on</label>
+          <label className="text-[10px] font-medium text-ink-muted">topic to listen on</label>
           <input
-            className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            className="rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
             value={trigger.topic ?? ""}
             placeholder="/myapp/1/messages/json"
             onChange={(e) => onChange({ topic: e.target.value })}
@@ -5826,18 +5868,18 @@ function TriggerEditor({
           {/* Inline cheat-sheet for the two magic identifiers that are in
               scope inside actions on this trigger. New users won't know
               these exist without it. */}
-          <div className="mt-1 rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 px-1.5 py-1 text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
-            <div className="font-semibold text-zinc-700 dark:text-zinc-300">In actions below, you can use:</div>
-            <div><span className="font-mono text-zinc-800 dark:text-zinc-200">payload</span> &nbsp;— the incoming message text</div>
-            <div><span className="font-mono text-zinc-800 dark:text-zinc-200">topic</span> &nbsp;— the content topic it came on</div>
-            <div className="mt-0.5 text-[9px] text-zinc-500 dark:text-zinc-500">Use them via the &quot;use expression →&quot; toggle on Set variable / Send message.</div>
+          <div className="mt-1 rounded border border-border-subtle bg-surface-warm/40 px-1.5 py-1 text-[10px] leading-tight text-ink-muted">
+            <div className="font-semibold text-ink-muted">In actions below, you can use:</div>
+            <div><span className="font-mono text-ink">payload</span> &nbsp;— the incoming message text</div>
+            <div><span className="font-mono text-ink">topic</span> &nbsp;— the content topic it came on</div>
+            <div className="mt-0.5 text-[9px] text-ink-muted">Use them via the &quot;use expression →&quot; toggle on Set variable / Send message.</div>
           </div>
         </div>
       )}
       {trigger.kind === "moduleEvent" && (
         <div className="mb-1.5 flex items-center gap-1">
           <select
-            className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            className="flex-1 rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
             value={trigger.moduleId ?? ""}
             onChange={(e) => {
               const newMod = enabledModules.find((m) => m.id === e.target.value);
@@ -5851,9 +5893,9 @@ function TriggerEditor({
               <option key={m.id} value={m.id}>{m.name}</option>
             ))}
           </select>
-          <span className="text-[10px] text-zinc-400 dark:text-zinc-500">·</span>
+          <span className="text-[10px] text-ink-muted">·</span>
           <select
-            className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+            className="flex-1 rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
             value={trigger.eventName ?? ""}
             onChange={(e) => onChange({ eventName: e.target.value })}
           >
@@ -5867,12 +5909,12 @@ function TriggerEditor({
         const ev = mod.events?.find((e) => e.name === trigger.eventName);
         if (!ev) return null;
         return (
-          <div className="mb-1.5 rounded bg-zinc-50 dark:bg-zinc-800 p-1.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+          <div className="mb-1.5 rounded bg-surface-warm p-1.5 text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
             {ev.description && <div className="mb-0.5">{ev.description}</div>}
             <div>
               data: <span className="font-mono">[{ev.data.map((d) => `${d.name}: ${d.type}`).join(", ")}]</span>
             </div>
-            <div className="text-zinc-400 dark:text-zinc-500">
+            <div className="text-ink-muted">
               Use <span className="font-mono">data[0]</span>, <span className="font-mono">data[1]</span>, … in expression-mode actions.
             </div>
           </div>
@@ -5880,15 +5922,15 @@ function TriggerEditor({
       })()}
       <div className="flex flex-col gap-1.5">
         {trigger.actions.length === 0 && (
-          <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">No actions. Add one below.</p>
+          <p className="text-[10px] leading-tight text-ink-muted">No actions. Add one below.</p>
         )}
         {trigger.actions.map((a, idx) => (
-          <div key={idx} className="rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-1">
+          <div key={idx} className="rounded border border-border-subtle bg-surface-warm p-1">
             <div className="mb-0.5 flex items-center justify-between">
-              <span className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500">#{idx + 1}</span>
+              <span className="text-[10px] font-mono text-ink-muted">#{idx + 1}</span>
               <button
                 onClick={() => onDeleteAction(idx)}
-                className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-red-600 dark:text-red-400"
+                className="text-[10px] text-ink-muted dark:text-ink-muted hover:text-danger"
               >×</button>
             </div>
             <ButtonOnClickEditor
@@ -5904,7 +5946,7 @@ function TriggerEditor({
         ))}
         <button
           onClick={onAddAction}
-          className="self-start rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+          className="self-start rounded border border-border-soft bg-canvas px-1.5 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
         >+ action</button>
       </div>
     </div>
@@ -5959,9 +6001,9 @@ function ModulesPanel({
             const baseRow = `flex items-start gap-2 rounded border px-2 py-1.5 ${
               interactive
                 ? isOn
-                  ? "border-indigo-300 bg-indigo-50 dark:border-indigo-700 dark:bg-indigo-950"
-                  : "border-zinc-200 dark:border-zinc-700"
-                : "border-zinc-200 bg-zinc-50 opacity-60 dark:border-zinc-700 dark:bg-zinc-900"
+                  ? "border-accent bg-surface-warm dark:border-accent dark:bg-surface-warm"
+                  : "border-border-subtle"
+                : "border-border-subtle bg-surface-warm opacity-60"
             }`;
             return (
               <div key={m.id} className={baseRow}>
@@ -5976,21 +6018,21 @@ function ModulesPanel({
                 <button
                   type="button"
                   onClick={() => onShowDetails(m)}
-                  className="flex-1 min-w-0 text-left rounded hover:bg-zinc-50 dark:hover:bg-zinc-800/40"
+                  className="flex-1 min-w-0 text-left rounded hover:bg-surface-warm/40"
                   title={`Show what ${m.label} can do`}
                 >
                   <div className="flex items-center gap-2">
-                    <span className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-200">
+                    <span className="text-[11px] font-semibold text-ink">
                       {m.label}
                     </span>
                     {!m.available && (
-                      <span className="rounded bg-zinc-200 px-1 py-0.5 text-[9px] font-medium text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
+                      <span className="rounded bg-surface-cool px-1 py-0.5 text-[9px] font-medium text-ink-muted">
                         coming soon
                       </span>
                     )}
-                    <span className="ml-auto text-[10px] text-zinc-400 dark:text-zinc-500">view ›</span>
+                    <span className="ml-auto text-[10px] text-ink-muted">view ›</span>
                   </div>
-                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                  <div className="text-[10px] leading-tight text-ink-muted">
                     {m.description}
                   </div>
                 </button>
@@ -5998,14 +6040,14 @@ function ModulesPanel({
             );
           })}
         </div>
-        <p className="mt-2 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+        <p className="mt-2 text-[10px] leading-tight text-ink-muted">
           Click a module to see what it can do. Enabled modules&apos; methods appear in any button&apos;s <span className="font-mono">Call module</span> action and in trigger pickers.
         </p>
       </SidebarSection>
 
       <SidebarSection title="Custom backend module" defaultOpen badge={core ? 1 : undefined}>
         {core ? (
-          <div className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1.5 dark:border-emerald-700 dark:bg-emerald-950">
+          <div className="rounded border border-accent/30 bg-accent/10 px-2 py-1.5 dark:border-accent/20 dark:bg-accent/5">
             <button
               type="button"
               onClick={() => onShowDetails({
@@ -6014,36 +6056,36 @@ function ModulesPanel({
                 description: core.description || "Custom backend module built by AI for this project.",
                 available: true,
               })}
-              className="block w-full text-left rounded hover:bg-emerald-100/60 dark:hover:bg-emerald-900/40"
+              className="block w-full text-left rounded hover:bg-accent/10 dark:hover:bg-accent/10"
               title="Show what this module can do"
             >
               <div className="flex items-center gap-2">
-                <span className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                <span className="text-[11px] font-semibold text-ink">
                   {core.name || core.id}
                 </span>
-                <span className="ml-auto text-[10px] text-zinc-500 dark:text-zinc-400">view ›</span>
+                <span className="ml-auto text-[10px] text-ink-muted">view ›</span>
               </div>
               {core.description && (
-                <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                <div className="text-[10px] leading-tight text-ink-muted">
                   {core.description}
                 </div>
               )}
-              <div className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+              <div className="mt-1 text-[10px] text-ink-muted">
                 {core.methods.length} method{core.methods.length === 1 ? "" : "s"}
                 {core.dependencies.length > 0 && ` · uses ${core.dependencies.join(", ")}`}
               </div>
             </button>
             <button
               onClick={onOpenBuildModule}
-              className="mt-2 w-full rounded bg-zinc-900 px-2 py-1 text-[10px] font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              className="mt-2 w-full rounded bg-action px-2 py-1 text-[10px] font-medium text-action-on hover:opacity-90"
             >
               Modify or extend with AI
             </button>
           </div>
         ) : (
-          <div className="rounded border border-dashed border-zinc-300 bg-zinc-50 px-2 py-2 text-[10px] leading-tight text-zinc-500 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">
+          <div className="rounded border border-dashed border-border-soft bg-surface-warm px-2 py-2 text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
             Need backend logic the visual editor can&apos;t express? Describe it in plain English — AI writes the C++.
-            <div className="mt-1 text-zinc-400 dark:text-zinc-500">
+            <div className="mt-1 text-ink-muted">
               Examples: a relay that drops old messages, a fetcher that pulls from a public API, a stateful aggregator across topics.
             </div>
           </div>
@@ -6051,9 +6093,9 @@ function ModulesPanel({
         {!core && (
           <button
             onClick={onOpenBuildModule}
-            className="mt-2 w-full rounded bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            className="mt-2 w-full rounded bg-action px-2 py-1.5 text-[11px] font-medium text-action-on hover:opacity-90"
           >
-            ✦ Build a module
+            Build a module
           </button>
         )}
       </SidebarSection>
@@ -6099,13 +6141,13 @@ function CoreModulePanel({
         headerRight={
           <button
             onClick={onEnable}
-            className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            className="rounded border border-border-soft px-1.5 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
             title="Author a custom backend module for this project"
           >+ Add</button>
         }
       >
-        <p className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
-          Author your own backend module in C++ (optional). Pick this when you need custom server-side logic that wraps the modules above — e.g. a polling module that uses <span className="font-mono">delivery_module</span>. <span className="text-zinc-400 dark:text-zinc-500">Skip for UI-only widgets.</span>
+        <p className="text-[10px] leading-tight text-ink-muted">
+          Author your own backend module in C++ (optional). Pick this when you need custom server-side logic that wraps the modules above — e.g. a polling module that uses <span className="font-mono">delivery_module</span>. <span className="text-ink-muted">Skip for UI-only widgets.</span>
         </p>
       </SidebarSection>
     );
@@ -6118,45 +6160,45 @@ function CoreModulePanel({
       headerRight={
         <button
           onClick={onDisable}
-          className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+          className="text-[10px] text-danger hover:underline"
         >remove</button>
       }
     >
-      <p className="mb-2 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+      <p className="mb-2 text-[10px] leading-tight text-ink-muted">
         Authoring a custom backend (compiled to <span className="font-mono">.lgx</span>). Export produces a buildable C++ project.
       </p>
 
       <div className="flex flex-col gap-2">
         <div>
-          <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">id (used in callModule + dependencies)</label>
+          <label className="block text-[10px] text-ink-muted dark:text-ink-muted">id (used in callModule + dependencies)</label>
           <input
-            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px] font-mono"
+            className="w-full rounded border border-border-soft px-1.5 py-1 text-[11px] font-mono"
             value={spec.id}
             onChange={(e) => onUpdate({ id: e.target.value })}
           />
         </div>
         <div className="grid grid-cols-2 gap-1">
           <div>
-            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">version</label>
+            <label className="block text-[10px] text-ink-muted dark:text-ink-muted">version</label>
             <input
-              className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px]"
+              className="w-full rounded border border-border-soft px-1.5 py-1 text-[11px]"
               value={spec.version}
               onChange={(e) => onUpdate({ version: e.target.value })}
             />
           </div>
           <div>
-            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">category</label>
+            <label className="block text-[10px] text-ink-muted dark:text-ink-muted">category</label>
             <input
-              className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px]"
+              className="w-full rounded border border-border-soft px-1.5 py-1 text-[11px]"
               value={spec.category}
               onChange={(e) => onUpdate({ category: e.target.value })}
             />
           </div>
         </div>
         <div>
-          <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">description</label>
+          <label className="block text-[10px] text-ink-muted dark:text-ink-muted">description</label>
           <input
-            className="w-full rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-1 text-[11px]"
+            className="w-full rounded border border-border-soft px-1.5 py-1 text-[11px]"
             value={spec.description}
             onChange={(e) => onUpdate({ description: e.target.value })}
           />
@@ -6164,10 +6206,10 @@ function CoreModulePanel({
 
         {/* Dependencies — pick from the catalog of primitives. */}
         <div>
-          <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">depends on (Logos primitives)</label>
+          <label className="block text-[10px] text-ink-muted dark:text-ink-muted">depends on (Logos primitives)</label>
           <div className="flex flex-col gap-0.5">
             {MODULE_CATALOG.map((m) => (
-              <label key={m.id} className="flex items-center gap-1 text-[11px] text-zinc-700 dark:text-zinc-300">
+              <label key={m.id} className="flex items-center gap-1 text-[11px] text-ink-muted">
                 <input
                   type="checkbox"
                   checked={spec.dependencies.includes(m.id)}
@@ -6175,7 +6217,7 @@ function CoreModulePanel({
                   className="h-3.5 w-3.5"
                 />
                 <span className="font-mono">{m.id}</span>
-                <span className="text-[10px] text-zinc-400 dark:text-zinc-500">— {m.name}</span>
+                <span className="text-[10px] text-ink-muted">— {m.name}</span>
               </label>
             ))}
           </div>
@@ -6184,14 +6226,14 @@ function CoreModulePanel({
         {/* State fields */}
         <div>
           <div className="mb-1 flex items-center justify-between">
-            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">state fields (private members)</label>
+            <label className="block text-[10px] text-ink-muted dark:text-ink-muted">state fields (private members)</label>
             <button
               onClick={onAddStateField}
-              className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+              className="rounded border border-border-soft px-1.5 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
             >+ field</button>
           </div>
           {spec.state.length === 0 && (
-            <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+            <p className="text-[10px] leading-tight text-ink-muted">
               Add typed C++ members like <span className="font-mono">QHash&lt;QString, MyData&gt;</span> — they&apos;re declared as <span className="font-mono">m_&lt;name&gt;</span> in the generated header.
             </p>
           )}
@@ -6199,19 +6241,19 @@ function CoreModulePanel({
             {spec.state.map((s, idx) => (
               <div key={idx} className="flex items-center gap-1">
                 <input
-                  className="w-20 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                  className="w-20 rounded border border-border-soft bg-canvas px-1 py-0.5 font-mono text-[10px]"
                   value={s.name}
                   onChange={(e) => onUpdateStateField(idx, { name: e.target.value })}
                   placeholder="name"
                 />
                 <input
-                  className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                  className="flex-1 rounded border border-border-soft bg-canvas px-1 py-0.5 font-mono text-[10px]"
                   value={s.cppType}
                   onChange={(e) => onUpdateStateField(idx, { cppType: e.target.value })}
                   placeholder="QString"
                 />
                 <input
-                  className="w-16 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                  className="w-16 rounded border border-border-soft bg-canvas px-1 py-0.5 font-mono text-[10px]"
                   value={s.initial ?? ""}
                   onChange={(e) => onUpdateStateField(idx, { initial: e.target.value })}
                   placeholder="init"
@@ -6219,7 +6261,7 @@ function CoreModulePanel({
                 />
                 <button
                   onClick={() => onDeleteStateField(idx)}
-                  className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-red-600 dark:text-red-400"
+                  className="text-[10px] text-ink-muted dark:text-ink-muted hover:text-danger"
                 >×</button>
               </div>
             ))}
@@ -6229,14 +6271,14 @@ function CoreModulePanel({
         {/* Methods table */}
         <div>
           <div className="mb-1 flex items-center justify-between">
-            <label className="block text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">methods</label>
+            <label className="block text-[10px] text-ink-muted dark:text-ink-muted">methods</label>
             <button
               onClick={onAddMethod}
-              className="rounded border border-zinc-300 dark:border-zinc-600 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+              className="rounded border border-border-soft px-1.5 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
             >+ method</button>
           </div>
           {spec.methods.length === 0 && (
-            <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+            <p className="text-[10px] leading-tight text-ink-muted">
               No methods yet. Each method becomes a Q_INVOKABLE in the generated C++ and shows up in Button → callModule.
             </p>
           )}
@@ -6273,16 +6315,16 @@ function CoreMethodEditor({
     onChange({ args: method.args.filter((_, idx) => idx !== i) });
   };
   return (
-    <div className="rounded border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 p-1.5">
+    <div className="rounded border border-border-subtle bg-surface-warm p-1.5">
       <div className="mb-1 flex items-center gap-1">
         <input
-          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 font-mono text-[11px]"
+          className="flex-1 rounded border border-border-soft bg-canvas px-1.5 py-0.5 font-mono text-[11px]"
           value={method.name}
           onChange={(e) => onChange({ name: e.target.value })}
           placeholder="methodName"
         />
         <select
-          className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+          className="rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
           value={method.returns}
           onChange={(e) => onChange({ returns: e.target.value as ParamType | "void" })}
         >
@@ -6293,7 +6335,7 @@ function CoreMethodEditor({
         </select>
         <button
           onClick={onDelete}
-          className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+          className="text-[10px] text-danger hover:underline"
         >del</button>
       </div>
       {method.args.length > 0 && (
@@ -6301,13 +6343,13 @@ function CoreMethodEditor({
           {method.args.map((a, i) => (
             <div key={i} className="flex items-center gap-1">
               <input
-                className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 font-mono text-[10px]"
+                className="flex-1 rounded border border-border-soft bg-canvas px-1 py-0.5 font-mono text-[10px]"
                 value={a.name}
                 onChange={(e) => updateArg(i, { name: e.target.value })}
                 placeholder="argName"
               />
               <select
-                className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+                className="rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
                 value={a.type}
                 onChange={(e) => updateArg(i, { type: e.target.value as ParamType })}
               >
@@ -6317,7 +6359,7 @@ function CoreMethodEditor({
               </select>
               <button
                 onClick={() => deleteArg(i)}
-                className="text-[10px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-red-600 dark:text-red-400"
+                className="text-[10px] text-ink-muted dark:text-ink-muted hover:text-danger"
               >×</button>
             </div>
           ))}
@@ -6326,10 +6368,10 @@ function CoreMethodEditor({
       <div className="flex items-center gap-1">
         <button
           onClick={addArg}
-          className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:hover:bg-zinc-200"
+          className="rounded border border-border-soft bg-canvas px-1.5 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
         >+ arg</button>
         <input
-          className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1.5 py-0.5 text-[10px]"
+          className="flex-1 rounded border border-border-soft bg-canvas px-1.5 py-0.5 text-[10px]"
           value={method.description ?? ""}
           onChange={(e) => onChange({ description: e.target.value })}
           placeholder="(optional description)"
@@ -6362,35 +6404,35 @@ function VariablesPanel({
       headerRight={
         <button
           onClick={() => onAdd()}
-          className="flex h-5 w-5 items-center justify-center rounded border border-zinc-300 dark:border-zinc-600 text-xs leading-none text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          className="flex h-5 w-5 items-center justify-center rounded border border-border-soft text-xs leading-none text-ink-muted hover:bg-surface-cool"
           title="Add a new variable"
         >+</button>
       }
     >
       {variables.length === 0 ? (
-        <p className="text-[10px] leading-tight text-zinc-400 dark:text-zinc-500">
+        <p className="text-[10px] leading-tight text-ink-muted">
           App-level state. Reference from Text bindings or Button → set-variable
           actions. Auto-emits as Qt properties.
         </p>
       ) : (
         <div className="flex flex-col gap-1.5">
           {variables.map((v) => (
-            <div key={v.id} className="rounded border border-zinc-200 dark:border-zinc-700 p-1.5">
+            <div key={v.id} className="rounded border border-border-subtle p-1.5">
               <div className="mb-1 flex items-center gap-1">
                 <input
-                  className="flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] font-mono hover:border-zinc-300 dark:border-zinc-600 focus:border-indigo-500 focus:bg-white dark:bg-zinc-900 focus:outline-none"
+                  className="flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] font-mono hover:border-border-soft focus:border-ink focus:bg-canvas focus:outline-none"
                   value={v.name}
                   onChange={(e) => onUpdate(v.id, { name: e.target.value })}
                 />
                 <button
                   onClick={() => onDelete(v.id)}
-                  className="text-[10px] text-red-600 dark:text-red-400 hover:underline"
+                  className="text-[10px] text-danger hover:underline"
                   title="Delete variable"
                 >del</button>
               </div>
               <div className="flex items-center gap-1">
                 <select
-                  className="rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+                  className="rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
                   value={v.type}
                   onChange={(e) => onUpdate(v.id, { type: e.target.value as VariableType })}
                 >
@@ -6400,7 +6442,7 @@ function VariablesPanel({
                 </select>
                 {v.type === "boolean" ? (
                   <select
-                    className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 px-1 py-0.5 text-[10px]"
+                    className="flex-1 rounded border border-border-soft bg-canvas px-1 py-0.5 text-[10px]"
                     value={v.initial === "true" ? "true" : "false"}
                     onChange={(e) => onUpdate(v.id, { initial: e.target.value })}
                   >
@@ -6410,7 +6452,7 @@ function VariablesPanel({
                 ) : (
                   <input
                     type={v.type === "number" ? "number" : "text"}
-                    className="flex-1 rounded border border-zinc-300 dark:border-zinc-600 px-1 py-0.5 text-[10px]"
+                    className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px]"
                     value={v.initial}
                     placeholder={v.type === "number" ? "0" : "initial value"}
                     onChange={(e) => onUpdate(v.id, { initial: e.target.value })}
@@ -6509,15 +6551,15 @@ function LayersPanel({
         style={{ paddingLeft: 4 + depth * 12 }}
         className={[
           "relative flex items-center gap-1 py-1 pr-2 text-[11px] cursor-pointer select-none",
-          isSelected ? "bg-indigo-100 dark:bg-indigo-900 text-indigo-900 dark:text-indigo-100" : "text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800",
+          isSelected ? "bg-surface-warm text-accent dark:text-accent" : "text-ink-muted hover:bg-surface-warm",
           node.hidden ? "opacity-50" : "",
         ].join(" ")}
       >
         {dropMark === "before" && (
-          <div className="pointer-events-none absolute inset-x-0 -top-px h-0.5 bg-indigo-500" />
+          <div className="pointer-events-none absolute inset-x-0 -top-px h-0.5 bg-surface-warm0" />
         )}
         {dropMark === "after" && (
-          <div className="pointer-events-none absolute inset-x-0 -bottom-px h-0.5 bg-indigo-500" />
+          <div className="pointer-events-none absolute inset-x-0 -bottom-px h-0.5 bg-surface-warm0" />
         )}
         {dropMark === "inside" && (
           <div className="pointer-events-none absolute inset-0 ring-1 ring-indigo-500" />
@@ -6527,7 +6569,7 @@ function LayersPanel({
         {isFrame && node.children.length > 0 ? (
           <button
             onClick={(e) => { e.stopPropagation(); onToggleCollapsed(node.id); }}
-            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[8px] text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-zinc-800 dark:text-zinc-200"
+            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[8px] text-ink-muted dark:text-ink-muted hover:text-ink"
           >
             {isCollapsed ? "▶" : "▼"}
           </button>
@@ -6535,7 +6577,7 @@ function LayersPanel({
           <span className="w-3.5 shrink-0" />
         )}
 
-        <NodeIcon kind={node.kind} className="text-zinc-500 dark:text-zinc-400" />
+        <NodeIcon kind={node.kind} className="text-ink-muted" />
         <span className="flex-1 truncate">{kindLabel(node)}</span>
 
         {!isRoot && (
@@ -6543,14 +6585,14 @@ function LayersPanel({
             <button
               title={node.locked ? "Unlock" : "Lock"}
               onClick={(e) => { e.stopPropagation(); onToggleLocked(node.id); }}
-              className={`shrink-0 ${node.locked ? "text-amber-600" : "text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:text-zinc-300"}`}
+              className={`shrink-0 ${node.locked ? "text-warning" : "text-ink-muted hover:text-ink-muted"}`}
             >
               <IconLock locked={node.locked} />
             </button>
             <button
               title={node.hidden ? "Show" : "Hide"}
               onClick={(e) => { e.stopPropagation(); onToggleHidden(node.id); }}
-              className={`shrink-0 ${node.hidden ? "text-zinc-400 dark:text-zinc-500" : "text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:text-zinc-300"}`}
+              className={`shrink-0 ${node.hidden ? "text-ink-muted" : "text-ink-muted dark:text-ink-muted hover:text-ink-muted"}`}
             >
               <IconEye off={node.hidden} />
             </button>

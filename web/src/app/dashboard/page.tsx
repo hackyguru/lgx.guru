@@ -9,6 +9,7 @@ import {
   createProject, deleteProject, listProjects, migrateLegacy, renameProject,
   type ProjectMeta,
 } from "../lib/projects";
+import ThemeToggle from "../ThemeToggle";
 
 export default function DashboardPage() {
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
@@ -61,91 +62,130 @@ export default function DashboardPage() {
   const now = hydrated ? Date.now() : 0;
 
   return (
-    <main className="min-h-screen bg-linear-to-b from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-950">
-      <div className="mx-auto max-w-3xl px-6 py-12">
-        <header className="mb-10 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="/lgx-logo.svg"
-              alt=""
-              width={36}
-              height={36}
-              className="h-9 w-9 dark:invert"
-            />
-            <div>
-              <h1 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-                Projects
-              </h1>
-              <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                lgx.guru — visual builder for Logos Basecamp modules
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={handleNew}
-            className="rounded-md bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400"
-          >
-            <span className="mr-1">+</span>New project
+    <main className="flex min-h-screen flex-col bg-canvas text-ink">
+      <header className="flex w-full items-center justify-between border-b border-border-subtle px-6 py-4 sm:px-10 sm:py-5">
+        <a href="/" className="flex items-center gap-3 link-inline">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/lgx-logo.svg"
+            alt="lgx.guru"
+            width={32}
+            height={32}
+            className="h-8 w-8 dark:invert"
+          />
+          <span className="text-ink-muted">/</span>
+          <span className="eyebrow">Projects</span>
+        </a>
+        <div className="flex items-center gap-3">
+          <ThemeToggle />
+          <button onClick={handleNew} className="gradient-accent h-10 px-5 inline-flex items-center gap-2 rounded-[160px] text-sm font-medium text-white transition-opacity hover:opacity-90 cursor-pointer">
+            <span className="text-[16px] leading-none" aria-hidden>+</span>
+            New project
           </button>
-        </header>
+        </div>
+      </header>
+      <div className="w-full px-6 py-12 sm:px-10 sm:py-16">
+        <div className="mb-10 flex items-end justify-between gap-6">
+          <h1 className="font-display max-w-[20ch] text-[clamp(1.75rem,4vw,2.5rem)] font-medium leading-[1.1] tracking-tight text-ink">
+            Your projects.
+          </h1>
+          {hydrated && projects.length > 0 && (
+            <p className="eyebrow shrink-0">
+              {projects.length} {projects.length === 1 ? "project" : "projects"}
+            </p>
+          )}
+        </div>
 
         {!hydrated ? (
-          <div className="rounded-lg border border-zinc-200 bg-white/60 p-8 text-center text-xs text-zinc-400 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/40 dark:text-zinc-500">
-            Loading…
+          <div
+            className="flex min-h-40 items-center justify-center"
+            role="status"
+            aria-label="Loading projects"
+          >
+            <svg
+              className="h-6 w-6 animate-spin text-ink-muted"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" opacity="0.2" />
+              <path
+                d="M22 12a10 10 0 0 1-10 10"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+            </svg>
           </div>
         ) : projects.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-zinc-300 bg-white/60 p-12 text-center backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/40">
-            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-indigo-100 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <div className="card-feature-lg text-center">
+            <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-border-soft bg-canvas">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-ink" aria-hidden="true">
                 <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
                 <polyline points="9 22 9 12 15 12 15 22" />
               </svg>
             </div>
-            <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+            <h2 className="text-[18px] font-medium leading-[1.2] text-ink">
               No projects yet
-            </div>
-            <p className="mx-auto mt-1.5 max-w-sm text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-              Each project is a self-contained <span className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-[10px] dark:bg-zinc-800">.lgx</span> module — drag-and-drop UI plus optional AI-built backend logic.
+            </h2>
+            <p className="mx-auto mt-2 max-w-[44ch] text-[14px] leading-normal text-ink-muted">
+              Each project is a self-contained{" "}
+              <span className="font-mono text-[12px] text-ink">.lgx</span> module —
+              drag-and-drop UI plus optional AI-built backend logic.
             </p>
-            <button
-              onClick={handleNew}
-              className="mt-5 rounded-md bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400"
-            >
+            <button onClick={handleNew} className="btn-primary mt-7">
               Create your first project
+              <span aria-hidden>→</span>
             </button>
           </div>
         ) : (
-          <ul className="space-y-1.5">
+          // Project cards. Each is a sage-on-canvas card with its name as a
+          // display heading, an updated-meta eyebrow, and a watermarked
+          // initial as a soft visual hook on the right. Open is the primary
+          // affordance — the whole card is a button. Rename / Delete sit on
+          // top as siblings (z-10) so clicks don't bubble to the card.
+          <ul className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
             {projects.map((p) => (
-              <li
-                key={p.id}
-                className="group flex items-stretch gap-2 rounded-md border border-zinc-200 bg-white shadow-sm transition-all hover:border-indigo-300 hover:shadow dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-indigo-700"
-              >
+              <li key={p.id} className="group relative">
                 <button
                   onClick={() => handleOpen(p.id)}
-                  className="flex-1 px-4 py-3 text-left"
+                  className="block w-full overflow-hidden rounded-card-lg bg-surface-warm p-7 text-left transition-all hover:bg-canvas hover:ring-1 hover:ring-border-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink"
+                  aria-label={`Open ${p.name}`}
                 >
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-zinc-900 dark:text-zinc-50">
+                  <div className="flex min-h-30 flex-col">
+                    <p className="eyebrow">
+                      Updated {fmtUpdated(p.updatedAt, now)}
+                    </p>
+                    <h3 className="font-display mt-3 text-[22px] font-medium leading-[1.15] tracking-tight text-ink line-clamp-2">
                       {p.name}
+                    </h3>
+                  </div>
+                  <div className="mt-6 flex items-center justify-between">
+                    <span className="eyebrow text-ink-muted opacity-60">
+                      Open
+                    </span>
+                    <span
+                      aria-hidden
+                      className="text-ink-muted transition-transform duration-200 group-hover:translate-x-1 group-hover:text-ink"
+                    >
+                      →
                     </span>
                   </div>
-                  <div className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">
-                    Updated {fmtUpdated(p.updatedAt, now)}
-                  </div>
                 </button>
-                <div className="flex items-center gap-1 pr-2.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                {/* Action buttons — siblings of the open-button so clicks
+                    don't bubble. Hidden until row hover/focus to keep the
+                    card visually clean. */}
+                <div className="absolute right-4 top-4 z-10 flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
                   <button
                     onClick={() => handleRename(p)}
-                    className="rounded px-2 py-1 text-[10px] text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    className="rounded-pill px-3 py-1.5 text-[11px] font-medium text-ink-muted hover:bg-canvas hover:text-ink transition-colors"
                     title="Rename"
                   >
                     Rename
                   </button>
                   <button
                     onClick={() => handleDelete(p)}
-                    className="rounded px-2 py-1 text-[10px] text-zinc-500 transition-colors hover:bg-rose-50 hover:text-rose-600 dark:text-zinc-400 dark:hover:bg-rose-950/40 dark:hover:text-rose-400"
+                    className="rounded-pill px-3 py-1.5 text-[11px] font-medium text-ink-muted hover:bg-danger-bg hover:text-danger transition-colors"
                     title="Delete"
                   >
                     Delete
@@ -156,10 +196,14 @@ export default function DashboardPage() {
           </ul>
         )}
 
-        <p className="mt-8 text-center text-[10px] leading-relaxed text-zinc-400 dark:text-zinc-500">
-          Projects are stored in this browser. Use Export → Download project (.json) for a portable backup.
-        </p>
       </div>
+
+      <footer className="mt-auto border-t border-border-subtle">
+        <p className="px-6 py-6 text-center text-[11px] leading-normal text-ink-muted sm:px-10">
+          Projects are stored in this browser. Use Export → Download project (.json)
+          for a portable backup.
+        </p>
+      </footer>
     </main>
   );
 }

@@ -24,9 +24,11 @@
     "diagnose": "node scripts/diagnose-basecamp.mjs",
     "test:ai": "node scripts/test-ask-ai.mjs",
     "sync-renderer": "node scripts/sync-renderer.mjs",
-    "sync-github-templates": "node scripts/sync-github-templates.mjs"
+    "sync-github-templates": "node scripts/sync-github-templates.mjs",
+    "gen:og": "node scripts/gen-og-assets.mjs"
   },
   "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
     "fast-json-patch": "^3.1.1",
     "next": "16.2.4",
     "openai": "^6.35.0",
@@ -44,6 +46,7 @@
     "@vitest/ui": "^3.2.4",
     "eslint": "^9",
     "eslint-config-next": "16.2.4",
+    "sharp": "^0.34.5",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^3.2.4"

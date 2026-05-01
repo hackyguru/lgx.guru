@@ -76,10 +76,15 @@ function ghHeaders(token: string, accept = "application/vnd.github+json") {
 }
 
 async function ghFetch<T>(token: string, path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${GH_BASE}${path}`, {
-    ...init,
-    headers: { ...ghHeaders(token), ...(init?.headers ?? {}) },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${GH_BASE}${path}`, {
+      ...init,
+      headers: { ...ghHeaders(token), ...(init?.headers ?? {}) },
+    });
+  } catch {
+    throw new Error(`Network error reaching api.github.com (${init?.method ?? "GET"} ${path}). Check your connection and token.`);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`GitHub ${init?.method ?? "GET"} ${path} → ${res.status}: ${text.slice(0, 500)}`);
@@ -96,42 +101,104 @@ async function ghFetch<T>(token: string, path: string, init?: RequestInit): Prom
   return JSON.parse(text) as T;
 }
 
-// Push a single file. Uses the contents API which handles both create
-// (no sha needed) and update (sha required). We always GET first to find
-// out — saves a round trip when the file already exists with the same
-// content (no-op).
-async function pushFile(
+// Push all files in a SINGLE commit using the Git Trees API. This avoids
+// triggering a separate workflow run for every file (the old Contents API
+// approach created one commit per file).
+async function pushAllFiles(
   cfg: GitHubConfig,
-  filePath: string,
-  contentBytes: Uint8Array,
+  files: { path: string; data: Uint8Array }[],
   message: string,
-): Promise<void> {
-  // Try to GET the existing file — if it exists, we get the sha needed
-  // to update it. If 404, this is a create (no sha).
-  let existingSha: string | undefined;
-  try {
-    const existing = await ghFetch<{ sha: string; content?: string }>(
-      cfg.token,
-      `/repos/${cfg.repo}/contents/${encodeURIComponent(filePath)}`,
+  onProgress?: ProgressFn,
+): Promise<string> {
+  // 1. Get the current HEAD sha + tree sha for main.
+  const ref = await ghFetch<{ object: { sha: string } }>(
+    cfg.token,
+    `/repos/${cfg.repo}/git/ref/heads/main`,
+  );
+  const headSha = ref.object.sha;
+  const headCommit = await ghFetch<{ tree: { sha: string } }>(
+    cfg.token,
+    `/repos/${cfg.repo}/git/commits/${headSha}`,
+  );
+  const baseTreeSha = headCommit.tree.sha;
+
+  // 2. Create blobs for each file.
+  const treeEntries: { path: string; mode: string; type: string; sha: string }[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    onProgress?.({ kind: "pushing", fileIndex: i, totalFiles: files.length, path: f.path });
+    const contentB64 = btoa(
+      Array.from(f.data, (b) => String.fromCharCode(b)).join(""),
     );
-    existingSha = existing.sha;
-  } catch (e) {
-    if (!(e as Error).message.includes("404")) throw e;
+    const blob = await ghFetch<{ sha: string }>(
+      cfg.token,
+      `/repos/${cfg.repo}/git/blobs`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: contentB64, encoding: "base64" }),
+      },
+    );
+    treeEntries.push({ path: f.path, mode: "100644", type: "blob", sha: blob.sha });
   }
 
-  const contentB64 = btoa(
-    Array.from(contentBytes, (b) => String.fromCharCode(b)).join(""),
+  // 3. Create a new tree with all files at once.
+  const tree = await ghFetch<{ sha: string }>(
+    cfg.token,
+    `/repos/${cfg.repo}/git/trees`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_tree: baseTreeSha, tree: treeEntries }),
+    },
   );
 
-  await ghFetch<unknown>(cfg.token, `/repos/${cfg.repo}/contents/${encodeURIComponent(filePath)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      content: contentB64,
-      ...(existingSha ? { sha: existingSha } : {}),
-    }),
-  });
+  // 4. Create a single commit pointing to the new tree.
+  const commit = await ghFetch<{ sha: string }>(
+    cfg.token,
+    `/repos/${cfg.repo}/git/commits`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, tree: tree.sha, parents: [headSha] }),
+    },
+  );
+
+  // 5. Fast-forward main to the new commit.
+  await ghFetch<unknown>(
+    cfg.token,
+    `/repos/${cfg.repo}/git/refs/heads/main`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sha: commit.sha }),
+    },
+  );
+
+  return commit.sha;
+}
+
+// Cancel all in-progress and queued runs for a workflow so stale builds
+// don't pile up when the user exports repeatedly.
+async function cancelStaleRuns(cfg: GitHubConfig, workflowFile: string): Promise<void> {
+  try {
+    const data = await ghFetch<{ workflow_runs: WorkflowRun[] }>(
+      cfg.token,
+      `/repos/${cfg.repo}/actions/workflows/${workflowFile}/runs?per_page=20&branch=main`,
+    );
+    const active = data.workflow_runs.filter(
+      (r) => r.status === "queued" || r.status === "in_progress" || r.status === "waiting" || r.status === "pending",
+    );
+    await Promise.all(
+      active.map((r) =>
+        ghFetch<unknown>(cfg.token, `/repos/${cfg.repo}/actions/runs/${r.id}/cancel`, {
+          method: "POST",
+        }).catch(() => {}),
+      ),
+    );
+  } catch {
+    // Best-effort — if we can't cancel, proceed anyway.
+  }
 }
 
 interface WorkflowRun {
@@ -148,21 +215,19 @@ interface ArtifactsResponse {
   artifacts: { id: number; name: string; archive_download_url: string }[];
 }
 
-// Find the most recent run on `main` for this workflow, created after a
-// known timestamp (so we don't mistakenly pick up an old run someone
-// triggered manually).
+// Find the run we triggered by matching on the commit SHA we just pushed.
+// workflow_dispatch runs use the HEAD of the ref at dispatch time, which
+// is the commit we created via pushAllFiles. Matching by SHA is more
+// reliable than matching by timestamp.
 async function findOurRun(
   cfg: GitHubConfig,
   workflowFile: string,
-  triggeredAfter: Date,
+  headSha: string,
 ): Promise<WorkflowRun | null> {
   const path = `/repos/${cfg.repo}/actions/workflows/${workflowFile}/runs?per_page=10&branch=main`;
   const data = await ghFetch<{ workflow_runs: WorkflowRun[] }>(cfg.token, path);
-  // The runs list is descending by created_at. The first run with
-  // created_at >= triggeredAfter is ours (workflow_dispatch creates a
-  // run almost immediately).
   for (const r of data.workflow_runs) {
-    if (new Date(r.created_at) >= triggeredAfter) return r;
+    if (r.head_sha === headSha) return r;
   }
   return null;
 }
@@ -205,14 +270,22 @@ async function downloadMergedLgx(
   if (!merged) {
     throw new Error("merged-lgx artifact not found in workflow run output");
   }
-  // Download the artifact ZIP. GitHub redirects to a signed CDN URL;
-  // fetch follows redirects automatically, but the response is the ZIP.
-  const res = await fetch(
-    `${GH_BASE}/repos/${cfg.repo}/actions/artifacts/${merged.id}/zip`,
-    { headers: ghHeaders(cfg.token) },
-  );
+  // Download the artifact ZIP via our server-side proxy. GitHub redirects
+  // to a signed CDN URL that lacks CORS headers, so a direct browser
+  // fetch fails on the redirect. The proxy follows the redirect server-side.
+  let res: Response;
+  try {
+    res = await fetch("/api/download-artifact", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: cfg.repo, artifactId: merged.id, token: cfg.token }),
+    });
+  } catch {
+    throw new Error("Network error downloading artifact. Check your connection.");
+  }
   if (!res.ok) {
-    throw new Error(`Artifact download failed: ${res.status}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(`Artifact download failed: ${res.status} ${body.slice(0, 300)}`);
   }
   const zipBytes = new Uint8Array(await res.arrayBuffer());
 
@@ -284,21 +357,16 @@ export async function pushAndBuild(
     { path: "tools/merge-lgx.mjs",              data: enc.encode(MERGE_LGX_MJS) },
   ];
 
-  // Push every file. PUT /contents handles both create + update.
-  for (let i = 0; i < allFiles.length; i++) {
-    const f = allFiles[i];
-    onProgress?.({ kind: "pushing", fileIndex: i, totalFiles: allFiles.length, path: f.path });
-    await pushFile(cfg, f.path, f.data, `lgx.guru: build ${f.path}`);
-  }
+  // Cancel any stale runs before pushing new files.
+  await cancelStaleRuns(cfg, "build-lgx.yml");
 
-  // Trigger the workflow. We record the timestamp first so we can
-  // disambiguate the run we just created from any earlier ones.
+  // Push ALL files in a single commit (Git Trees API). The workflow only
+  // triggers on workflow_dispatch (not push), so this won't start a run.
+  const commitSha = await pushAllFiles(cfg, allFiles, "lgx.guru: update module source", onProgress);
+
+  // Trigger the workflow via dispatch. The run will use our commitSha as
+  // its head_sha, which we use to identify the correct run later.
   onProgress?.({ kind: "triggering" });
-  const triggeredAt = new Date();
-  // Tiny pause — sometimes the timestamp on GitHub's side is slightly
-  // behind, and a too-tight `created_at >= triggeredAt` filter can miss
-  // our own run.
-  await sleep(500);
   await ghFetch<unknown>(
     cfg.token,
     `/repos/${cfg.repo}/actions/workflows/build-lgx.yml/dispatches`,
@@ -314,7 +382,7 @@ export async function pushAndBuild(
   let run: WorkflowRun | null = null;
   for (let attempt = 0; attempt < 10; attempt++) {
     await sleep(2000);
-    run = await findOurRun(cfg, "build-lgx.yml", triggeredAt);
+    run = await findOurRun(cfg, "build-lgx.yml", commitSha);
     if (run) break;
   }
   if (!run) {
@@ -322,7 +390,7 @@ export async function pushAndBuild(
   }
 
   // Wait for it to complete.
-  const completed = await waitForRun(cfg, run.id, triggeredAt, onProgress);
+  const completed = await waitForRun(cfg, run.id, new Date(), onProgress);
 
   // Did it succeed? The workflow's merge job runs `if: always() &&
   // contains(needs.build.result, 'success')`, so a partial-platform

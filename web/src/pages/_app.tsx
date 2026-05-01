@@ -1,6 +1,6 @@
 import "@/app/globals.css";
 import type { AppProps } from "next/app";
-import { Geist, Geist_Mono, Instrument_Serif } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -12,16 +12,10 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const instrumentSerif = Instrument_Serif({
-  subsets: ["latin"],
-  variable: "--font-instrument-serif",
-  weight: "400",
-});
-
 const App = ({ Component, pageProps }: AppProps) => {
   return (
     <div
-      className={`${geistSans.variable} ${geistMono.variable} ${instrumentSerif.variable} font-sans min-h-screen flex flex-col bg-background text-foreground`}
+      className={`${geistSans.variable} ${geistMono.variable} font-sans min-h-screen flex flex-col bg-canvas text-ink`}
     >
       <Component {...pageProps} />
     </div>
