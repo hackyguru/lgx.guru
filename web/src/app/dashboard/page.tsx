@@ -27,11 +27,11 @@ export default function DashboardPage() {
     const name = window.prompt("Name your project", "Untitled project");
     if (name === null) return;
     const meta = createProject(name);
-    window.location.assign(`/?project=${encodeURIComponent(meta.id)}`);
+    window.location.assign(`/builder?project=${encodeURIComponent(meta.id)}`);
   };
 
   const handleOpen = (id: string) => {
-    window.location.assign(`/?project=${encodeURIComponent(id)}`);
+    window.location.assign(`/builder?project=${encodeURIComponent(id)}`);
   };
 
   const handleRename = (p: ProjectMeta) => {

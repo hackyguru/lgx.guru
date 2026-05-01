@@ -97,6 +97,59 @@ describe("safeExpr defence — malformed AI-spliced expressions", () => {
     expect(qml).toContain("app.var_count = app.var_count + 1");
   });
 
+  it("survives non-string `if` condition (AI generated undefined / object / number)", () => {
+    // The exact failure that crashed the editor in production — AI emitted
+    // an `if` action with condition: undefined (or some non-string value).
+    // qmlEmit's .trim() crashed and the entire React tree errored with
+    // "TypeError: e.condition.trim is not a function".
+    resetIds();
+    const v = mkVar("count", "number", "0");
+    const trigger: Trigger = {
+      id: "t1",
+      kind: "appStart",
+      actions: [
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { kind: "if", condition: undefined as any, actions: [
+          { kind: "setVariable", varId: v.id, value: "0", mode: "literal" } as ButtonAction,
+        ] } as ButtonAction,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { kind: "if", condition: { stuff: "thing" } as any, actions: [
+          { kind: "setVariable", varId: v.id, value: "1", mode: "literal" } as ButtonAction,
+        ] } as ButtonAction,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { kind: "if", condition: 42 as any, actions: [
+          { kind: "setVariable", varId: v.id, value: "2", mode: "literal" } as ButtonAction,
+        ] } as ButtonAction,
+      ],
+    };
+    const app = mkApp({
+      pages: [mkPage(mkFrame([]))],
+      variables: [v],
+      triggers: [trigger],
+    });
+    app.currentPageId = app.pages[0].id;
+    // Must NOT throw.
+    const qml = emitMainQml(app, true);
+    expect(qml).toContain("if (true)"); // empty/non-string conditions become true
+  });
+
+  it("survives non-string sendMessage.topic + onMessageReceived.topic", () => {
+    resetIds();
+    const btn = mkButton({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      onClick: { kind: "sendMessage", topic: undefined as any, payload: "hi", payloadMode: "literal" } as ButtonAction,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trigger: Trigger = { id: "t1", kind: "onMessageReceived", topic: 42 as any, actions: [] };
+    const app = mkApp({
+      pages: [mkPage(mkFrame([btn]))],
+      triggers: [trigger],
+    });
+    app.currentPageId = app.pages[0].id;
+    // Must NOT throw on the .trim() of a non-string.
+    expect(() => emitMainQml(app, true)).not.toThrow();
+  });
+
   it("emitted Main.qml stays parseable even with several malformed expressions in one app", () => {
     resetIds();
     const v1 = mkVar("a", "string", "");

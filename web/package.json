@@ -23,7 +23,8 @@
     "test:watch": "vitest",
     "diagnose": "node scripts/diagnose-basecamp.mjs",
     "test:ai": "node scripts/test-ask-ai.mjs",
-    "sync-renderer": "node scripts/sync-renderer.mjs"
+    "sync-renderer": "node scripts/sync-renderer.mjs",
+    "sync-github-templates": "node scripts/sync-github-templates.mjs"
   },
   "dependencies": {
     "fast-json-patch": "^3.1.1",

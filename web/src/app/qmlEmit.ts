@@ -45,7 +45,10 @@ const indent = (depth: number) => "    ".repeat(depth);
 // fallback (defaulting to `null`) plus a console.log so the user can see
 // what was dropped without the whole UI dying.
 const safeExpr = (raw: string, fallback = "null"): string => {
-  const s = raw.trim();
+  // AI patches sometimes pass non-string values (undefined/object/number)
+  // through fields the schema declares as string. Coerce defensively so
+  // .trim() doesn't crash the entire QML emit.
+  const s = (typeof raw === "string" ? raw : "").trim();
   if (!s) return fallback;
   try {
     // eslint-disable-next-line no-new-func
@@ -245,7 +248,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     return `app.${prop} = logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
   }
   if (action.kind === "sendMessage") {
-    const topic = action.topic.trim();
+    const topic = (typeof action.topic === "string" ? action.topic : "").trim();
     if (!topic) return null;
     // Payload — literal mode quotes the user's text; expression mode splices
     // it raw so users can pass `app.var_input` or any QML expression. Validate
@@ -280,7 +283,13 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // break the surrounding QML parse — falls back to `false` (skip branch).
     // Also wrapped in try/catch so a runtime error in the body or condition
     // doesn't kill the whole handler.
-    const cond = action.condition.trim() ? safeExpr(action.condition, "false") : "true";
+    //
+    // Coerce condition to a string defensively. The AI sometimes emits
+    // condition: undefined / null / object / number when patching — the
+    // schema lets it through and the runtime crashes on `.trim()` of a
+    // non-string. Treat anything-not-a-string as empty (= always true).
+    const rawCond = typeof action.condition === "string" ? action.condition : "";
+    const cond = rawCond.trim() ? safeExpr(rawCond, "false") : "true";
     const body = actionBlockJs(action.actions, ctx);
     if (!body) return null;
     return `try { if (${cond}) { ${body} } } catch(_ifErr) { console.log("if condition error:", _ifErr) }`;
@@ -314,8 +323,9 @@ export const usesDelivery = (app: AppState): boolean => {
 const subscribedTopics = (app: AppState): string[] => {
   const topics = new Set<string>();
   for (const t of app.triggers ?? []) {
-    if (t.kind === "onMessageReceived" && t.topic && t.topic.trim()) {
-      topics.add(t.topic.trim());
+    const topicStr = typeof t.topic === "string" ? t.topic.trim() : "";
+    if (t.kind === "onMessageReceived" && topicStr) {
+      topics.add(topicStr);
     }
   }
   return Array.from(topics);
@@ -836,7 +846,7 @@ const triggersQml = (
     );
     for (const t of onMsg) {
       const body = actionBlockJs(t.actions, ctx);
-      const filter = (t.topic ?? "").trim();
+      const filter = (typeof t.topic === "string" ? t.topic : "").trim();
       if (!body) continue;
       if (filter) {
         lines.push(`${indent}            if (topic === "${escapeStr(filter)}") { ${body} }`);

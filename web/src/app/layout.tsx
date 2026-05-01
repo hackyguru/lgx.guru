@@ -20,7 +20,7 @@ export const metadata: Metadata = {
 // Inline bootstrap: runs synchronously before React hydrates so the page
 // renders in the right theme on first paint (no flash of light-on-dark).
 // Reads the persisted preference, falling back to the OS preference. Mirrors
-// what useTheme() in page.tsx does — keep both in sync if changed.
+// what useTheme() in BuilderClient.tsx does — keep both in sync if changed.
 const themeBootstrap = `
 (function () {
   try {

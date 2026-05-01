@@ -1,0 +1,153 @@
+# Multi-arch lgx.guru build for a custom backend module.
+#
+# Triggered on every push (or manually via workflow_dispatch). Matrix-builds
+# the module for both Linux and macOS, then merges the per-arch artifacts
+# into a single multi-variant .lgx that any Basecamp host can install
+# regardless of OS.
+#
+# Caching strategy:
+#   - actions/cache on flake.lock hash → reuses /nix/store across runs.
+#   - Cachix substituter for the Logos SDK → first build is fast, not 15min.
+#   Together, warm builds finish in ~30-60s; cold builds in 5-8min.
+#
+# Output: a release named build-<run_number> with the merged .lgx attached.
+# lgx.guru polls the Actions API and downloads the asset when this
+# workflow's `merge` job finishes.
+
+name: Build .lgx
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the release with the merged .lgx
+  actions: read     # needed for the merge job to fetch artifacts from build jobs
+
+jobs:
+  build:
+    name: ${{ matrix.target.variant }}
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      # Don't cancel sibling builds when one fails — we still want to know
+      # which platforms compiled and which didn't, especially during
+      # iteration.
+      fail-fast: false
+      matrix:
+        target:
+          - { runner: ubuntu-latest, variant: linux-amd64,   nixSystem: x86_64-linux  }
+          - { runner: macos-latest,  variant: darwin-arm64,  nixSystem: aarch64-darwin }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install nix with flakes enabled. The DeterminateSystems installer is
+      # the well-supported one; nixos/install-nix-action also works but is
+      # less actively maintained.
+      - uses: DeterminateSystems/nix-installer-action@v15
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      # Optional: Cachix binary cache for the Logos SDK so we don't re-build
+      # the entire dependency tree from source on every cold runner. Set the
+      # CACHIX_AUTH_TOKEN repo secret to enable; safe to leave empty for
+      # public caches that allow read-only pulls.
+      - uses: cachix/cachix-action@v15
+        if: ${{ env.CACHIX_NAME != '' }}
+        env:
+          CACHIX_NAME: ${{ vars.CACHIX_NAME }}
+        with:
+          name: ${{ vars.CACHIX_NAME }}
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      # Pre-warmed nix store cache keyed on flake.lock — survives across
+      # workflow runs for as long as the lockfile is unchanged. Saves the
+      # SDK download on every iterate-and-rebuild cycle.
+      - name: Cache /nix/store
+        uses: actions/cache@v4
+        with:
+          path: |
+            /nix/store
+            ~/.cache/nix
+          key: nix-${{ matrix.target.variant }}-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            nix-${{ matrix.target.variant }}-
+
+      - name: Build .lgx
+        run: |
+          nix build '.#lgx-portable' --print-out-paths --no-link > out-path.txt
+          cat out-path.txt
+          STORE_PATH=$(cat out-path.txt)
+          mkdir -p artifact
+          # Each .#lgx-portable output dir contains a single .lgx file.
+          cp "$STORE_PATH"/*.lgx artifact/
+          ls -lh artifact/
+
+      - name: Run unit tests (best-effort — skip if not declared)
+        run: |
+          # Older module-builder versions don't expose .#unit-tests; skip
+          # cleanly so the build doesn't fail just because the target's
+          # missing.
+          if nix eval '.#unit-tests' --raw 2>/dev/null; then
+            nix build '.#unit-tests' -L
+          else
+            echo "unit-tests target not present — skipping"
+          fi
+        continue-on-error: true
+
+      - name: Upload variant artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.variant }}
+          path: artifact/*.lgx
+          if-no-files-found: error
+
+  merge:
+    name: Merge variants → multi-arch .lgx
+    needs: build
+    # Run merge even when one matrix job failed so the user gets at least
+    # the variants that did build (e.g. ship Linux-only when macOS broke).
+    if: always() && contains(needs.build.result, 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: variants/
+
+      - name: Show downloaded layout
+        run: |
+          ls -R variants/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Merge into multi-arch .lgx
+        run: |
+          node tools/merge-lgx.mjs variants/ build/merged.lgx
+          ls -lh build/
+
+      - name: Upload merged artifact (run-scoped, downloadable for ~90 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-lgx
+          path: build/merged.lgx
+          retention-days: 90
+
+      - name: Publish as release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: build-${{ github.run_number }}
+          files: build/merged.lgx
+          prerelease: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

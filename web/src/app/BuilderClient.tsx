@@ -18,6 +18,15 @@ import { readLgx } from "./lgxImport";
 import { TEMPLATES, Template } from "./templates";
 import { generateCoreModuleFiles } from "./codegen/coreModule";
 import { packTarGz } from "./codegen/sourceBundle";
+import {
+  emptySettings,
+  isGitHubConfigured,
+  probeGitHubAccess,
+  readGitHubSettings,
+  writeGitHubSettings,
+  type GitHubSettings,
+} from "./lib/githubSettings";
+import { pushAndBuild, type BuildPhase } from "./lib/githubBuilder";
 import { ModuleDetailModal, ModuleInfo } from "./ModuleDetailModal";
 import { AskAIModal } from "./AskAIModal";
 import { RendererStatus, useRendererStatus } from "./RendererStatus";
@@ -447,7 +456,7 @@ const saveToStorage = (projectId: string, s: SaveState) => {
 
 // ── Page ────────────────────────────────────────────────────────────────────
 
-export default function Page() {
+export default function BuilderClient() {
   // First render must produce identical HTML on the server and the client
   // for hydration to succeed. We initialise from defaults and apply any
   // localStorage-restored snapshot in a post-mount effect below.
@@ -2159,35 +2168,21 @@ export default function Page() {
   };
 
   // ── Export: custom core module ────────────────────────────────────────────
-  // Prefers the pre-built .lgx the AI build pipeline cached server-side
-  // (Modules tab → Build a module → nix build). Falls back to packaging the
-  // source for the user to `nix build` themselves if the cache is empty.
+  // Always exports the SOURCE archive — caller has chosen "Build locally" in
+  // the Export modal, which means they want to run `nix build` on their own
+  // machine and get a binary that matches their host OS. We deliberately do
+  // NOT fall back on the pre-built .lgx from /api/built-module: when running
+  // on lgx.guru's managed (Hetzner-Linux) backend, the pre-built is Linux-
+  // only and would silently install a wrong-arch artifact for users on Mac
+  // or Windows. Better to be predictable than convenient.
+  //
+  // The "Build via GitHub Actions" path (Phase 2) bypasses this function
+  // entirely — it'll push the spec to a user repo and download the multi-
+  // arch artifact from a release.
   const handleExportCore = async () => {
     if (!app.coreModule) return;
     const id = app.coreModule.id || "my_module";
 
-    // Try pre-built first.
-    try {
-      const res = await fetch(`/api/built-module/${encodeURIComponent(id)}`);
-      if (res.ok) {
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `${id}.lgx`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-        return;
-      }
-    } catch {
-      // Network or server error — fall through to source export.
-    }
-
-    // No cached build available — ship the source bundle so the user can
-    // `nix build` it manually. Tells the user via alert so the flow isn't
-    // silent about which artifact they got.
     const files = generateCoreModuleFiles(app.coreModule);
     const blob = packTarGz(files, `${id}-core`);
     const url = URL.createObjectURL(blob);
@@ -2198,11 +2193,6 @@ export default function Page() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    window.alert(
-      `Pre-built artifact wasn't available — exported the source bundle instead. ` +
-      `Run \`nix build '.#lgx-portable'\` inside ${id}-core/ to produce the installable .lgx, ` +
-      `or rebuild from the Modules tab to regenerate the cache.`
-    );
   };
 
   // ── Export: shared delivery_relay (pre-built, ships with the editor) ────
@@ -2230,20 +2220,94 @@ export default function Page() {
   const [exportUi, setExportUi] = useState(true);
   const [exportCore, setExportCore] = useState(false);
   const [exportRelay, setExportRelay] = useState(false);
+  // How to build the custom core when exportCore is on:
+  //  - "local"  → download source archive, user runs `nix build` themselves.
+  //               Single-arch (their machine), fast (~30s warm cache).
+  //  - "github" → push spec to a GitHub repo, Actions builds for both Linux
+  //               and macOS, returns multi-arch .lgx. (Coming soon — Phase 2.)
+  const [coreBuildMethod, setCoreBuildMethod] = useState<"local" | "github">("local");
   const deliveryNeedsRelay = usesDelivery(app);
+
+  // GitHub config (Phase 2 MVP — BYO fine-grained PAT, no OAuth yet).
+  // Stored in localStorage; loaded once on mount.
+  const [ghSettings, setGhSettings] = useState<GitHubSettings>(emptySettings);
+  const [ghProbe, setGhProbe] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [ghProbing, setGhProbing] = useState(false);
+  useEffect(() => {
+    setGhSettings(readGitHubSettings());
+  }, []);
+  const saveGhSettings = (next: GitHubSettings) => {
+    setGhSettings(next);
+    writeGitHubSettings(next);
+    setGhProbe(null);   // invalidate probe result whenever config changes
+  };
+  const probeGh = async () => {
+    setGhProbing(true);
+    try {
+      const err = await probeGitHubAccess(ghSettings);
+      setGhProbe(err === null ? { ok: true, msg: "Connected ✓" } : { ok: false, msg: err });
+    } finally {
+      setGhProbing(false);
+    }
+  };
+
+  // Live build progress when "Build via GitHub" is in flight. null when
+  // idle. Used by the inline progress UI below the radio chooser.
+  const [buildProgress, setBuildProgress] = useState<BuildPhase | null>(null);
+  const [building, setBuilding] = useState(false);
+
   // Default checkboxes when opening: relay on if delivery is used; custom
   // core on if the user has authored one.
   useEffect(() => {
     if (exportOpen) {
       setExportRelay(deliveryNeedsRelay);
       setExportCore(hasCoreModule);
+      setBuildProgress(null);
     }
   }, [exportOpen, hasCoreModule, deliveryNeedsRelay]);
   const runExport = async () => {
     if (exportUi) await handleExportUi();
     if (exportRelay || deliveryNeedsRelay) await handleExportRelay();
-    if (hasCoreModule && exportCore) handleExportCore();
-    setExportOpen(false);
+    if (hasCoreModule && exportCore) {
+      if (coreBuildMethod === "local") {
+        handleExportCore();
+      } else if (coreBuildMethod === "github") {
+        if (!isGitHubConfigured(ghSettings)) {
+          window.alert("Configure your GitHub repo + PAT first (in this modal).");
+          return;
+        }
+        setBuilding(true);
+        try {
+          const files = generateCoreModuleFiles(app.coreModule!);
+          const lgx = await pushAndBuild(
+            ghSettings,
+            files,
+            (phase) => setBuildProgress(phase),
+          );
+          // Save the multi-arch .lgx the workflow returned.
+          const id = app.coreModule!.id || "my_module";
+          const url = URL.createObjectURL(lgx);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${id}.lgx`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        } catch (e) {
+          // pushAndBuild already calls onProgress with kind:"error" on
+          // hard failure — keep that message visible. Otherwise dump the
+          // exception text to the progress slot.
+          if (!buildProgress || buildProgress.kind !== "error") {
+            setBuildProgress({ kind: "error", message: (e as Error).message });
+          }
+          setBuilding(false);
+          return;   // keep modal open so the user sees the error
+        }
+        setBuilding(false);
+      }
+    }
+    if (!building) setExportOpen(false);
   };
 
   // The Inspector + ResizeOverlay are single-selection only. `primaryId` is
@@ -2889,37 +2953,201 @@ export default function Page() {
                 </div>
               </label>
 
-              <label
-                className={`flex items-start gap-2 rounded border p-2 ${
+              {/* Custom backend block. UI plugins above are platform-
+                  independent QML, but core modules ship native code so
+                  they need to be compiled for the target Basecamp's OS.
+                  Two paths: build locally (single-arch, fast) or via
+                  GitHub Actions (multi-arch, multi-platform install). */}
+              <div
+                className={`rounded border p-3 ${
                   hasCoreModule
-                    ? "border-zinc-200 dark:border-zinc-700 cursor-pointer hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-800"
+                    ? "border-zinc-200 dark:border-zinc-700"
                     : "border-zinc-100 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50 opacity-60"
                 }`}
               >
-                <input
-                  type="checkbox"
-                  checked={exportCore && hasCoreModule}
-                  disabled={!hasCoreModule}
-                  onChange={(e) => setExportCore(e.target.checked)}
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div>
-                  <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
-                    Custom backend source (<span className="font-mono">.lgx</span>, buildable)
+                <label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={exportCore && hasCoreModule}
+                    disabled={!hasCoreModule}
+                    onChange={(e) => setExportCore(e.target.checked)}
+                    className="mt-0.5 h-4 w-4"
+                  />
+                  <div>
+                    <div className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                      Custom backend module
+                      {hasCoreModule && (
+                        <span className="ml-1 rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 font-mono text-[9px] font-normal text-zinc-600 dark:text-zinc-400">
+                          {app.coreModule!.id}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                      {hasCoreModule
+                        ? "Native C++ — needs compilation for the target OS. Pick a build path:"
+                        : "Only shown when you've added a module via Ask AI → build a backend. Most apps don't need this."}
+                    </div>
                   </div>
-                  <div className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
-                    {hasCoreModule ? (
-                      <>
-                        Source archive for your authored backend <span className="font-mono">{app.coreModule!.id}</span>. <span className="font-mono">tar -xzf</span>, then <span className="font-mono">nix build &apos;.#lgx-portable&apos;</span> produces the installable <span className="font-mono">.lgx</span> in <span className="font-mono">result/</span>. Only needed if you&apos;ve added custom C++ logic beyond pub/sub.
-                      </>
-                    ) : (
-                      <>
-                        Only available when you&apos;ve added a module under <span className="font-semibold">Build a module</span> in the sidebar. Most apps don&apos;t need this.
-                      </>
-                    )}
+                </label>
+
+                {hasCoreModule && exportCore && (
+                  <div className="mt-3 ml-6 grid gap-2 sm:grid-cols-2">
+                    {/* Option 1: Build locally on user's machine */}
+                    <label
+                      className={`flex cursor-pointer flex-col gap-1 rounded border p-2 transition-colors ${
+                        coreBuildMethod === "local"
+                          ? "border-indigo-300 bg-indigo-50 dark:border-indigo-700 dark:bg-indigo-950/40"
+                          : "border-zinc-200 hover:border-zinc-300 dark:border-zinc-700 dark:hover:border-zinc-600"
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="radio"
+                          name="coreBuildMethod"
+                          value="local"
+                          checked={coreBuildMethod === "local"}
+                          onChange={() => setCoreBuildMethod("local")}
+                          className="h-3.5 w-3.5"
+                        />
+                        <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                          Build locally
+                        </div>
+                      </div>
+                      <div className="text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
+                        Downloads a source archive. You run <span className="font-mono">nix build</span> on your machine — produces a <span className="font-mono">.lgx</span> for whatever OS you ran it on. ~30s with warm cache.
+                      </div>
+                      <div className="mt-0.5 text-[9px] text-zinc-500 dark:text-zinc-500">
+                        Requires: <a className="underline hover:text-zinc-700 dark:hover:text-zinc-300" href="https://nixos.org/download" target="_blank" rel="noopener">nix</a> on PATH.
+                      </div>
+                    </label>
+
+                    {/* Option 2: Build via GitHub Actions */}
+                    <label
+                      className={`flex cursor-pointer flex-col gap-1 rounded border p-2 transition-colors ${
+                        coreBuildMethod === "github"
+                          ? "border-indigo-300 bg-indigo-50 dark:border-indigo-700 dark:bg-indigo-950/40"
+                          : "border-zinc-200 hover:border-zinc-300 dark:border-zinc-700 dark:hover:border-zinc-600"
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="radio"
+                          name="coreBuildMethod"
+                          value="github"
+                          checked={coreBuildMethod === "github"}
+                          onChange={() => setCoreBuildMethod("github")}
+                          className="h-3.5 w-3.5"
+                        />
+                        <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                          Build via GitHub
+                        </div>
+                        {isGitHubConfigured(ghSettings) && (
+                          <span className="ml-auto rounded bg-emerald-100 px-1 py-0.5 text-[9px] font-mono text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">configured</span>
+                        )}
+                      </div>
+                      <div className="text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
+                        Pushes your spec to a GitHub repo, Actions builds it for both Linux and macOS in parallel. Returns a single multi-arch <span className="font-mono">.lgx</span> installable on any Basecamp.
+                      </div>
+                      <div className="mt-0.5 text-[9px] text-zinc-500 dark:text-zinc-500">
+                        $0 on public repos · ~5–10 min per build.
+                      </div>
+                    </label>
                   </div>
-                </div>
-              </label>
+                )}
+
+                {/* Inline build instructions when "local" is selected — the
+                    user knows exactly what to do after the download. */}
+                {hasCoreModule && exportCore && coreBuildMethod === "local" && (
+                  <div className="mt-2 ml-6 rounded bg-zinc-50 p-2 font-mono text-[10px] leading-relaxed text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                    <div className="mb-0.5 text-[9px] uppercase tracking-wider text-zinc-500 dark:text-zinc-500">After download:</div>
+                    tar -xzf {app.coreModule!.id}-core-source.lgx<br />
+                    cd {app.coreModule!.id}-core && nix build &apos;.#lgx-portable&apos;<br />
+                    cp result/{app.coreModule!.id}.lgx ~/Desktop/
+                  </div>
+                )}
+
+                {/* GitHub config form — shown inline when "Build via GitHub"
+                    is selected so the user doesn't have to navigate to a
+                    separate Settings panel. PAT lives in localStorage; this
+                    is the BYO-token MVP, replaced by GitHub App OAuth later. */}
+                {hasCoreModule && exportCore && coreBuildMethod === "github" && !building && (
+                  <div className="mt-2 ml-6 space-y-2 rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-900">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                      GitHub configuration
+                    </div>
+                    <div>
+                      <label className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400">Repo</label>
+                      <input
+                        type="text"
+                        placeholder="username/lgx-modules"
+                        value={ghSettings.repo}
+                        onChange={(e) => saveGhSettings({ ...ghSettings, repo: e.target.value.trim() })}
+                        className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-1.5 py-1 font-mono text-[11px] text-zinc-800 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-200"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] font-medium text-zinc-600 dark:text-zinc-400">
+                        Fine-grained PAT
+                        <span className="ml-1 font-normal text-zinc-500"> — needs Contents: R/W, Workflows: R/W, Actions: R, Metadata: R</span>
+                      </label>
+                      <input
+                        type="password"
+                        placeholder="github_pat_…"
+                        value={ghSettings.token}
+                        onChange={(e) => saveGhSettings({ ...ghSettings, token: e.target.value })}
+                        className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-1.5 py-1 font-mono text-[11px] text-zinc-800 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-200"
+                      />
+                      <a
+                        href="https://github.com/settings/personal-access-tokens/new"
+                        target="_blank"
+                        rel="noopener"
+                        className="mt-1 inline-block text-[10px] text-indigo-600 hover:underline dark:text-indigo-400"
+                      >Generate one →</a>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={probeGh}
+                        disabled={ghProbing || !ghSettings.repo || !ghSettings.token}
+                        className="rounded border border-zinc-300 bg-white px-2 py-1 text-[10px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                      >{ghProbing ? "Testing…" : "Test connection"}</button>
+                      {ghProbe && (
+                        <span className={`text-[10px] ${ghProbe.ok ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                          {ghProbe.msg}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[9px] leading-snug text-zinc-500">
+                      Settings are stored in this browser only. The token never reaches lgx.guru&apos;s server — your browser talks directly to api.github.com.
+                    </div>
+                  </div>
+                )}
+
+                {/* Live build progress when a GitHub build is in flight. */}
+                {hasCoreModule && exportCore && coreBuildMethod === "github" && (building || buildProgress) && (
+                  <div className="mt-2 ml-6 rounded border border-indigo-200 bg-indigo-50 p-2 dark:border-indigo-800 dark:bg-indigo-950/40">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">
+                      Build in progress
+                    </div>
+                    <div className="mt-1 text-[11px] text-zinc-700 dark:text-zinc-200">
+                      {!buildProgress && "Starting…"}
+                      {buildProgress?.kind === "pushing" && `Pushing files (${buildProgress.fileIndex + 1}/${buildProgress.totalFiles}): ${buildProgress.path}`}
+                      {buildProgress?.kind === "triggering" && "Triggering workflow…"}
+                      {buildProgress?.kind === "queued" && "Queued — waiting for a runner…"}
+                      {buildProgress?.kind === "running" && `Building on GitHub… (${buildProgress.elapsedSec}s)`}
+                      {buildProgress?.kind === "downloading" && "Downloading artifact…"}
+                      {buildProgress?.kind === "done" && "Done ✓ (download starting)"}
+                      {buildProgress?.kind === "error" && (
+                        <span className="text-rose-600 dark:text-rose-400">
+                          Error: {buildProgress.message}
+                          {buildProgress.logsUrl && (
+                            <> — <a className="underline" href={buildProgress.logsUrl} target="_blank" rel="noopener">view logs</a></>
+                          )}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* Editor backup — separate from the .lgx artifacts above
                   because it's not installable. It's the round-trippable
