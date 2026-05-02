@@ -30,7 +30,7 @@ export const computeUiDeps = (app: AppState): string[] => {
   for (const id of app.modules ?? []) add(id);
 
   const core = app.coreModule;
-  const hasCore = !!core && core.id.trim().length > 0;
+  const hasCore = !!core && typeof core.id === "string" && core.id.trim().length > 0;
   if (hasCore) {
     add(core!.id);
     // Transitive: any modules the core itself declares it needs at runtime

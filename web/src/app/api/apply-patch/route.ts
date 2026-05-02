@@ -53,8 +53,8 @@ const moduleDocs = (coreModule?: CoreModuleSpec): string => {
       id: coreModule.id,
       name: `${coreModule.name || coreModule.id} (this project's custom backend)`,
       description: coreModule.description,
-      methods: coreModule.methods.map((m) => ({
-        name: m.name, args: m.args, returns: m.returns, description: m.description,
+      methods: (coreModule.methods ?? []).map((m) => ({
+        name: m.name, args: m.args ?? [], returns: m.returns, description: m.description,
       })),
       events: coreModule.events ?? [],
     }] : []),
@@ -66,14 +66,14 @@ const moduleDocs = (coreModule?: CoreModuleSpec): string => {
     if (m.methods.length > 0) {
       lines.push("Methods:");
       for (const method of m.methods) {
-        const args = method.args.map((a) => `${a.name}: ${a.type}`).join(", ");
+        const args = (method.args ?? []).map((a) => `${a.name}: ${a.type}`).join(", ");
         lines.push(`  - ${method.name}(${args}) -> ${method.returns}${method.description ? ` — ${method.description}` : ""}`);
       }
     }
     if (m.events && m.events.length > 0) {
       lines.push("Events:");
       for (const ev of m.events) {
-        const fields = ev.data.map((d) => `${d.name}: ${d.type}`).join(", ");
+        const fields = (ev.data ?? []).map((d) => `${d.name}: ${d.type}`).join(", ");
         lines.push(`  - ${ev.name} { ${fields} }${ev.description ? ` — ${ev.description}` : ""}`);
       }
     }
@@ -666,91 +666,99 @@ export async function POST(request: NextRequest) {
         tool_calls: toolCalls,
       });
 
-      for (const tc of toolCalls) {
-        if (tc.type !== "function") continue;
+      // Process apply_patch calls BEFORE build_backend_module so that all
+      // tool-call responses are in `messages` before any build-retry loop
+      // calls the LLM again (OpenAI requires every tool_call_id to have a
+      // corresponding tool response before the next API call).
+      const patchCalls = toolCalls.filter((tc) => tc.type === "function" && tc.function.name === "apply_patch");
+      const buildCalls = toolCalls.filter((tc) => tc.type === "function" && tc.function.name === "build_backend_module");
+      const knownNames = new Set(["apply_patch", "build_backend_module"]);
+      const otherCalls = toolCalls.filter((tc) => tc.type !== "function" || !knownNames.has(tc.function.name));
 
-        // ── apply_patch ────────────────────────────────────────────────
-        if (tc.function.name === "apply_patch") {
-          let payload: PatchPayload;
-          try {
-            payload = JSON.parse(tc.function.arguments);
-          } catch {
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify({ ok: false, error: "Malformed JSON in apply_patch arguments." }),
-            });
-            continue;
-          }
-          if (!Array.isArray(payload.operations) || typeof payload.summary !== "string") {
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify({ ok: false, error: "Patch payload missing operations[] or summary." }),
-            });
-            continue;
-          }
-          try {
-            const prevApp = workingApp;
-            const result = applyPatch(
-              prevApp,
-              payload.operations,
-              true,
-              false,
-            );
-            const candidate = result.newDocument as AppState;
-            // Validate every NEW callModule / callModuleToVariable / moduleEvent
-            // reference against the primitives catalog + the user's coreModule.
-            // Catches the AI inventing method names (the stopwatch failure)
-            // BEFORE the patch is committed, so the AI sees the error in this
-            // loop iteration and self-corrects in-conversation instead of the
-            // user discovering a dead button after Basecamp install.
-            const valid = validateModuleRefs(candidate, prevApp);
-            if (!valid.ok) {
-              messages.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: JSON.stringify({
-                  ok: false,
-                  error: "Patch references unknown module ids or methods. Fix and resubmit:\n" + valid.errors.join("\n"),
-                  operations: payload.operations,
-                }),
-              });
-              continue;
-            }
-            workingApp = candidate;
-            allOperations.push(...payload.operations);
-            summaries.push(payload.summary);
-            // Advisory: surface unwired buttons + available backend methods
-            // so the AI proactively wires them in the next loop iteration
-            // instead of shipping interactive-looking widgets that do nothing.
-            const advisory = renderUnwiredAdvisory(candidate);
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify({
-                ok: true,
-                summary: payload.summary,
-                ...(advisory ? { next_steps: advisory } : {}),
-              }),
-            });
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : "patch failed";
+      for (const tc of patchCalls) {
+        if (tc.type !== "function") continue;
+        let payload: PatchPayload;
+        try {
+          payload = JSON.parse(tc.function.arguments);
+        } catch {
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({ ok: false, error: "Malformed JSON in apply_patch arguments." }),
+          });
+          continue;
+        }
+        if (!Array.isArray(payload.operations) || typeof payload.summary !== "string") {
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({ ok: false, error: "Patch payload missing operations[] or summary." }),
+          });
+          continue;
+        }
+        try {
+          const prevApp = workingApp;
+          const result = applyPatch(
+            prevApp,
+            payload.operations,
+            true,
+            false,
+          );
+          const candidate = result.newDocument as AppState;
+          const valid = validateModuleRefs(candidate, prevApp);
+          if (!valid.ok) {
             messages.push({
               role: "tool",
               tool_call_id: tc.id,
               content: JSON.stringify({
                 ok: false,
-                error: `Patch failed: ${msg}`,
+                error: "Patch references unknown module ids or methods. Fix and resubmit:\n" + valid.errors.join("\n"),
                 operations: payload.operations,
               }),
             });
+            continue;
           }
-          continue;
+          workingApp = candidate;
+          allOperations.push(...payload.operations);
+          summaries.push(payload.summary);
+          const advisory = renderUnwiredAdvisory(candidate);
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              ok: true,
+              summary: payload.summary,
+              ...(advisory ? { next_steps: advisory } : {}),
+            }),
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "patch failed";
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              ok: false,
+              error: `Patch failed: ${msg}`,
+              operations: payload.operations,
+            }),
+          });
         }
+      }
 
-        // ── build_backend_module (with internal compile-retry loop) ────
-        if (tc.function.name === "build_backend_module") {
+      // Respond to unknown tool calls so every tool_call_id has a response
+      // before any build-retry loop calls the LLM again.
+      for (const tc of otherCalls) {
+        const name = tc.type === "function" ? tc.function.name : tc.type;
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({ ok: false, error: `Unknown tool: ${name}` }),
+        });
+      }
+
+      // ── build_backend_module (with internal compile-retry loop) ────
+      for (const tc of buildCalls) {
+          if (tc.type !== "function") continue;
           let attempt = 1;
           let lastBuild: BuildResult | null = null;
           let lastArgs = tc.function.arguments;
@@ -769,7 +777,17 @@ export async function POST(request: NextRequest) {
               });
               break;
             }
-            lastBuild = await buildCoreModule(spec);
+            try {
+              lastBuild = await buildCoreModule(spec);
+            } catch (buildErr) {
+              const msg = buildErr instanceof Error ? buildErr.message : String(buildErr);
+              messages.push({
+                role: "tool",
+                tool_call_id: lastToolCallId,
+                content: JSON.stringify({ ok: false, error: `Build crashed: ${msg}` }),
+              });
+              break;
+            }
             lastBuildAttempts = attempt;
             lastBuildDurationMs = lastBuild.durationMs;
 
@@ -779,8 +797,12 @@ export async function POST(request: NextRequest) {
               const op: Operation = workingApp.coreModule
                 ? { op: "replace", path: "/coreModule", value: spec as unknown as Record<string, unknown> }
                 : { op: "add", path: "/coreModule", value: spec as unknown as Record<string, unknown> };
-              const result = applyPatch(workingApp, [op], true, false);
-              workingApp = result.newDocument as AppState;
+              try {
+                const result = applyPatch(workingApp, [op], true, false);
+                workingApp = result.newDocument as AppState;
+              } catch {
+                workingApp = { ...workingApp, coreModule: spec } as AppState;
+              }
               allOperations.push(op);
               const buildSummary =
                 `Built ${spec.id} in ${(lastBuild.durationMs / 1000).toFixed(1)}s` +
@@ -806,7 +828,7 @@ export async function POST(request: NextRequest) {
                     id: spec.id,
                     name: spec.name,
                     description: spec.description,
-                    methods: spec.methods.map((m) => ({
+                    methods: (spec.methods ?? []).map((m) => ({
                       name: m.name, args: m.args, returns: m.returns, description: m.description,
                     })),
                     events: spec.events ?? [],
@@ -852,13 +874,23 @@ export async function POST(request: NextRequest) {
                 stderr_tail: lastBuild.stderrTail,
               }),
             });
-            const retry = await client.chat.completions.create({
-              model,
-              messages,
-              tools: [APPLY_PATCH_TOOL, BUILD_BACKEND_MODULE_TOOL],
-              tool_choice: { type: "function", function: { name: "build_backend_module" } },
-              max_completion_tokens: 4096,
-            });
+            let retry;
+            try {
+              retry = await client.chat.completions.create({
+                model,
+                messages,
+                tools: [APPLY_PATCH_TOOL, BUILD_BACKEND_MODULE_TOOL],
+                tool_choice: { type: "function", function: { name: "build_backend_module" } },
+                max_completion_tokens: 4096,
+              });
+            } catch (retryErr) {
+              messages.push({
+                role: "tool",
+                tool_call_id: lastToolCallId,
+                content: JSON.stringify({ ok: false, error: `LLM retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}` }),
+              });
+              break;
+            }
             const retryMsg = retry.choices[0]?.message;
             const retryTc = retryMsg?.tool_calls?.[0];
             if (!retryTc || retryTc.type !== "function" || retryTc.function.name !== "build_backend_module") {
@@ -893,14 +925,6 @@ export async function POST(request: NextRequest) {
             });
           }
           continue;
-        }
-
-        // Unknown tool — feed an error back and let the AI decide how to recover.
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: JSON.stringify({ ok: false, error: `Unknown tool: ${tc.function.name}` }),
-        });
       }
     }
 
@@ -920,7 +944,7 @@ export async function POST(request: NextRequest) {
       attempts: buildHappened ? lastBuildAttempts : undefined,
       durationMs: buildHappened ? lastBuildDurationMs : undefined,
     });
-  } catch (err: unknown) {
+  } catch (err) {
     if (err instanceof OpenAI.AuthenticationError) {
       const keyName = providerName === "OpenAI" ? "OPENAI_API_KEY" : "NVIDIA_API_KEY";
       return Response.json({ error: `${providerName} rejected the API key. Check ${keyName}.` }, { status: 401 });

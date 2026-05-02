@@ -38,11 +38,47 @@ const text = (s: string) => enc.encode(s);
 
 // QML/JSON id-safe — we use the user's id verbatim if it matches [a-z0-9_],
 // otherwise a fallback. Class names use PascalCase derived from the id.
-const sanitiseId = (raw: string): string =>
-  (raw.match(/^[a-z][a-z0-9_]*$/) ? raw : "my_module").toLowerCase();
+const sanitiseId = (raw: string): string => {
+  const s = typeof raw === "string" ? raw : "";
+  return (s.match(/^[a-z][a-z0-9_]*$/) ? s : "my_module").toLowerCase();
+};
 
 const pascal = (id: string): string =>
-  id.split("_").filter(Boolean).map((s) => s[0].toUpperCase() + s.slice(1)).join("");
+  (id || "").split("_").filter(Boolean).map((s) => s[0].toUpperCase() + s.slice(1)).join("");
+
+// Normalise a CoreModuleSpec from AI JSON — any field could be missing,
+// wrong type, or malformed. Returns a spec safe to pass through codegen.
+const normaliseSpec = (raw: CoreModuleSpec): CoreModuleSpec => ({
+  ...raw,
+  id: typeof raw.id === "string" ? raw.id : "my_module",
+  name: typeof raw.name === "string" ? raw.name : (raw.id ?? "Module"),
+  version: typeof raw.version === "string" ? raw.version : "1.0.0",
+  description: typeof raw.description === "string" ? raw.description : "",
+  category: typeof raw.category === "string" ? raw.category : "custom",
+  dependencies: Array.isArray(raw.dependencies) ? raw.dependencies : [],
+  methods: (Array.isArray(raw.methods) ? raw.methods : []).map((m) => ({
+    ...m,
+    name: typeof m.name === "string" ? m.name : "unnamed",
+    args: Array.isArray(m.args) ? m.args.map((a) => ({
+      ...a,
+      name: typeof a.name === "string" ? a.name : "arg",
+      type: typeof a.type === "string" ? a.type : "string" as const,
+    })) : [],
+    returns: typeof m.returns === "string" ? m.returns : "void" as const,
+    body: typeof m.body === "string" ? m.body : undefined,
+  })),
+  state: (Array.isArray(raw.state) ? raw.state : []).map((s) => ({
+    ...s,
+    name: typeof s.name === "string" ? s.name : "value",
+    cppType: typeof s.cppType === "string" ? s.cppType : "std::string",
+  })),
+  events: Array.isArray(raw.events) ? raw.events : [],
+  tests: Array.isArray(raw.tests) ? raw.tests.map((t) => ({
+    ...t,
+    name: typeof t.name === "string" ? t.name : "test",
+    body: typeof t.body === "string" ? t.body : "",
+  })) : [],
+});
 
 // ── Pure-C++ type mapping (universal module API surface) ──────────────────
 //
@@ -85,6 +121,7 @@ const stubReturn = (r: ParamType | "void"): string => {
     case "string":  return "return std::string();";
     case "number":  return "return 0.0;";
     case "boolean": return "return false;";
+    default:        return "// no return";
   }
 };
 
@@ -147,7 +184,7 @@ const detectQtNeeds = (spec: CoreModuleSpec): DetectedQtNeeds => {
     ...spec.methods.flatMap((m) => m.args.map((a) => a.cppType ?? "")),
     ...spec.state.map((s) => s.cppType ?? ""),
     ...spec.state.map((s) => s.initial ?? ""),
-    ...(spec.tests ?? []).map((t) => t.body),
+    ...(spec.tests ?? []).map((t) => t.body ?? ""),
   ].join("\n");
   const includes = new Set<string>();
   const findPackages = new Set<string>();
@@ -175,7 +212,7 @@ const usesLogosJson = (spec: CoreModuleSpec): boolean => {
     ...spec.methods.map((m) => m.body ?? ""),
     ...spec.methods.map((m) => m.cppReturn ?? ""),
     ...spec.methods.flatMap((m) => m.args.map((a) => a.cppType ?? "")),
-    ...(spec.tests ?? []).map((t) => t.body),
+    ...(spec.tests ?? []).map((t) => t.body ?? ""),
   ].join("\n");
   return detectLogosJson(corpus);
 };
@@ -326,28 +363,20 @@ const implHeader = (spec: CoreModuleSpec): string => {
   // these via #include "<id>_impl.h", so it's simpler to declare them once
   // in the header. Standard headers don't break .h's "pure C++" property.
   const stdIncludes = new Set<string>(["string"]);
-  const scanStdTypes = (raw: string) => {
-    const t = (raw ?? "").trim();
-    if (!t) return;
-    if (/\bstd::vector\b|\bstd::array\b/.test(t)) stdIncludes.add("vector");
-    if (/\bstd::map\b|\bstd::unordered_map\b/.test(t)) stdIncludes.add("map");
-    if (/\bstd::set\b|\bstd::unordered_set\b/.test(t)) stdIncludes.add("set");
-    if (/\bstd::deque\b/.test(t)) stdIncludes.add("deque");
-    if (/\bint64_t\b|\buint64_t\b|\bint32_t\b|\buint32_t\b|\bint16_t\b|\buint16_t\b|\bint8_t\b|\buint8_t\b/.test(t)) stdIncludes.add("cstdint");
-    if (/\bstd::function\b/.test(t)) stdIncludes.add("functional");
-    if (/\bstd::optional\b/.test(t)) stdIncludes.add("optional");
-    if (/\bstd::variant\b/.test(t)) stdIncludes.add("variant");
-    if (/\bstd::chrono\b/.test(t)) stdIncludes.add("chrono");
-  };
+  // Scan type declarations, state fields, and method bodies for std:: usage.
+  const allCorpus = [
+    ...spec.methods.map((m) => m.body ?? ""),
+    ...spec.methods.map((m) => m.cppReturn ?? ""),
+    ...spec.methods.flatMap((m) => m.args.map((a) => a.cppType ?? "")),
+    ...spec.state.map((s) => s.cppType ?? ""),
+  ].join("\n");
+  for (const h of scanBodyStdIncludes(allCorpus)) stdIncludes.add(h);
   for (const m of spec.methods) {
     for (const a of m.args) {
       if (a.type === "number") stdIncludes.add("cstdint");
-      scanStdTypes(a.cppType ?? "");
     }
     if (m.returns === "number") stdIncludes.add("cstdint");
-    scanStdTypes(m.cppReturn ?? "");
   }
-  for (const s of spec.state) scanStdTypes(s.cppType);
   // emitEvent uses std::function<void(const std::string&, LogosList)>
   if (hasEvents) {
     stdIncludes.add("functional");
@@ -408,6 +437,33 @@ const implHeader = (spec: CoreModuleSpec): string => {
   ].join("\n");
 };
 
+// Scan a C++ source string for standard-library usage and return the
+// set of headers that need to be #included.
+const scanBodyStdIncludes = (corpus: string): Set<string> => {
+  const out = new Set<string>();
+  if (/\bstd::(?:i|o|io)?stringstream\b/.test(corpus)) out.add("sstream");
+  if (/\bstd::(?:sort|find|transform|for_each|count|copy|remove|reverse|min|max|clamp)\b/.test(corpus)) out.add("algorithm");
+  if (/\bstd::numeric_limits\b/.test(corpus)) out.add("limits");
+  if (/\bstd::(?:abs|pow|sqrt|floor|ceil|round|fmod|fabs)\b/.test(corpus)) out.add("cmath");
+  if (/\bstd::(?:stoi|stod|stof|stol|to_string)\b/.test(corpus)) out.add("string");
+  if (/\bstd::(?:tuple|make_tuple)\b|\bstd::get</.test(corpus)) out.add("tuple");
+  if (/\bstd::(?:pair|make_pair)\b/.test(corpus)) out.add("utility");
+  if (/\bstd::(?:unique_ptr|shared_ptr|make_unique|make_shared)\b/.test(corpus)) out.add("memory");
+  if (/\bstd::(?:mutex|lock_guard)\b/.test(corpus)) out.add("mutex");
+  if (/\bstd::(?:regex|smatch)\b/.test(corpus)) out.add("regex");
+  if (/\bstd::accumulate\b/.test(corpus)) out.add("numeric");
+  if (/\bstd::vector\b|\bstd::array\b/.test(corpus)) out.add("vector");
+  if (/\bstd::map\b|\bstd::unordered_map\b/.test(corpus)) out.add("map");
+  if (/\bstd::set\b|\bstd::unordered_set\b/.test(corpus)) out.add("set");
+  if (/\bstd::deque\b/.test(corpus)) out.add("deque");
+  if (/\bstd::function\b/.test(corpus)) out.add("functional");
+  if (/\bstd::optional\b/.test(corpus)) out.add("optional");
+  if (/\bstd::variant\b/.test(corpus)) out.add("variant");
+  if (/\bstd::chrono\b/.test(corpus)) out.add("chrono");
+  if (/\bint64_t\b|\buint64_t\b|\bint32_t\b|\buint32_t\b/.test(corpus)) out.add("cstdint");
+  return out;
+};
+
 const implCpp = (spec: CoreModuleSpec): string => {
   const id = sanitiseId(spec.id);
   const cls = `${pascal(id)}Impl`;
@@ -447,11 +503,20 @@ const implCpp = (spec: CoreModuleSpec): string => {
 
   const qtIncludes = detected.includes.map((h) => `#include <${h}>`);
 
+  // Scan method bodies for standard-library usage and emit those includes
+  // directly in the .cpp (the header may also have them, but being explicit
+  // here avoids subtle breakage when logos-cpp-generator's generated glue
+  // header doesn't transitively pull everything).
+  const bodyCombined = spec.methods.map((m) => m.body ?? "").join("\n");
+  const bodyStd = scanBodyStdIncludes(bodyCombined);
+  const bodyStdIncludes = [...bodyStd].sort().map((h) => `#include <${h}>`);
+
   return [
     `#include "${id}_impl.h"`,
     ``,
     ...(detected.any ? [`// Qt headers auto-detected from method bodies / state.`] : []),
     ...qtIncludes,
+    ...bodyStdIncludes,
     ...(wantsLogosJson ? [`#include <logos_json.h>`] : []),
     ``,
     ...(usesPimpl
@@ -536,8 +601,17 @@ const testsCpp = (spec: CoreModuleSpec): string => {
     lines.push(`LOGOS_TEST(${t.name}) {`);
     // Default: instantiate impl as `impl` so the body can poke at it.
     lines.push(`    ${cls} impl;`);
-    const indented = t.body
-      .replace(/\r\n/g, "\n")
+    // Sanitise: the AI sometimes wraps the body in its own LOGOS_TEST(){}
+    // or includes a trailing `}` that conflicts with our wrapper. Strip
+    // any leading LOGOS_TEST(...){ header and the matching trailing brace.
+    let body = (t.body ?? "").replace(/\r\n/g, "\n").trim();
+    // Strip wrapping LOGOS_TEST(…) { … }
+    const wrapRe = /^LOGOS_TEST\s*\([^)]*\)\s*\{([\s\S]*)\}\s*$/;
+    const wrapM = body.match(wrapRe);
+    if (wrapM) body = wrapM[1].trim();
+    // Strip duplicate `Impl impl;` line the AI may have included
+    body = body.replace(new RegExp(`^\\s*${cls}\\s+impl\\s*;\\s*\\n?`, "m"), "");
+    const indented = body
       .split("\n")
       .map((line) => (line.length === 0 ? "" : `    ${line}`))
       .join("\n");
@@ -616,7 +690,8 @@ const readme = (spec: CoreModuleSpec): string => {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-export function generateCoreModuleFiles(spec: CoreModuleSpec): CodegenFile[] {
+export function generateCoreModuleFiles(rawSpec: CoreModuleSpec): CodegenFile[] {
+  const spec = normaliseSpec(rawSpec);
   const id = sanitiseId(spec.id);
   return [
     { path: "metadata.json",          data: text(metadataJson(spec)) },

@@ -27,14 +27,14 @@ const walkActionList = (
   pathPrefix: string,
   out: CallRef[],
 ): void => {
-  actions.forEach((a, i) => {
+  (actions ?? []).forEach((a, i) => {
     const path = `${pathPrefix}[${i}]`;
     if (a.kind === "callModule" || a.kind === "callModuleToVariable") {
       if (a.moduleId && a.method) {
         out.push({ path, kind: a.kind, moduleId: a.moduleId, method: a.method });
       }
     } else if (a.kind === "if") {
-      walkActionList(a.actions, `${path}.actions`, out);
+      walkActionList(a.actions ?? [], `${path}.actions`, out);
     }
   });
 };
@@ -53,7 +53,7 @@ const walkSingleAction = (
       });
     }
   } else if (action.kind === "if") {
-    walkActionList(action.actions, `${pathPrefix}.actions`, out);
+    walkActionList(action.actions ?? [], `${pathPrefix}.actions`, out);
   }
 };
 
@@ -61,7 +61,7 @@ const walkNode = (n: Node, pathPrefix: string, out: CallRef[]): void => {
   if (n.kind === "Button") {
     walkSingleAction(n.onClick, `${pathPrefix}.onClick`, out);
   } else if (n.kind === "Frame") {
-    n.children.forEach((c, i) => walkNode(c, `${pathPrefix}.children[${i}]`, out));
+    (n.children ?? []).forEach((c, i) => walkNode(c, `${pathPrefix}.children[${i}]`, out));
   }
 };
 
@@ -70,8 +70,8 @@ const walkNode = (n: Node, pathPrefix: string, out: CallRef[]): void => {
 export const collectCallRefs = (app: AppState): CallRef[] => {
   const out: CallRef[] = [];
   // Pages → root → children → buttons (recursively).
-  app.pages.forEach((p, pi) => {
-    p.root.children.forEach((c, ci) => {
+  (app.pages ?? []).forEach((p, pi) => {
+    (p.root?.children ?? []).forEach((c, ci) => {
       walkNode(c, `pages[${pi}].children[${ci}]`, out);
     });
   });
@@ -85,7 +85,7 @@ export const collectCallRefs = (app: AppState): CallRef[] => {
         method: t.eventName,
       });
     }
-    walkActionList(t.actions, `triggers[${ti}].actions`, out);
+    walkActionList(t.actions ?? [], `triggers[${ti}].actions`, out);
   });
   return out;
 };
@@ -105,7 +105,7 @@ const resolveModule = (id: string, coreModule: AppState["coreModule"]) => {
   if (coreModule && coreModule.id === id) {
     return {
       id,
-      methods: coreModule.methods.map((m) => m.name),
+      methods: (coreModule.methods ?? []).map((m) => m.name),
       events: (coreModule.events ?? []).map((e) => e.name),
     };
   }
@@ -206,8 +206,8 @@ const walkForUnwiredButtons = (
 
 export const findUnwiredButtons = (app: AppState): UnwiredButton[] => {
   const out: UnwiredButton[] = [];
-  app.pages.forEach((page, pi) => {
-    walkForUnwiredButtons(page.root.children, `pages[${pi}].children`, out);
+  (app.pages ?? []).forEach((page, pi) => {
+    walkForUnwiredButtons(page.root?.children ?? [], `pages[${pi}].children`, out);
   });
   return out;
 };
@@ -235,7 +235,7 @@ export const renderUnwiredAdvisory = (app: AppState): string | null => {
   }
   if (app.coreModule) {
     lines.push(
-      `Custom backend "${app.coreModule.id}" exposes: ${app.coreModule.methods.map((m) => `${m.name}(${m.args.map((a) => a.type).join(", ")}) -> ${m.returns}`).join(", ") || "(no methods declared)"}.`,
+      `Custom backend "${app.coreModule.id}" exposes: ${(app.coreModule.methods ?? []).map((m) => `${m.name}(${(m.args ?? []).map((a) => a.type).join(", ")}) -> ${m.returns}`).join(", ") || "(no methods declared)"}.`,
     );
   }
   if (app.modules && app.modules.length > 0) {

@@ -26,8 +26,10 @@ const NIX_BUILD_TIMEOUT_MS = 12 * 60 * 1000;
 
 const BUILD_ROOT = path.join(os.tmpdir(), "lgx-builds");
 
-const safeId = (raw: string): string =>
-  (raw.match(/^[a-z][a-z0-9_]*$/) ? raw : "my_module").toLowerCase();
+const safeId = (raw: string): string => {
+  const s = typeof raw === "string" ? raw : "";
+  return (s.match(/^[a-z][a-z0-9_]*$/) ? s : "my_module").toLowerCase();
+};
 
 const buildDirFor = (id: string): string => path.join(BUILD_ROOT, safeId(id));
 const cachePathFor = (id: string): string => path.join(BUILD_ROOT, `${safeId(id)}.lgx`);
@@ -74,7 +76,7 @@ export async function writeModuleSource(spec: CoreModuleSpec): Promise<string> {
 // messages are tuned so the AI can self-correct in one retry.
 function lintBodies(spec: CoreModuleSpec): string[] {
   const issues: string[] = [];
-  for (const m of spec.methods) {
+  for (const m of (spec.methods ?? [])) {
     const body = m.body ?? "";
     if (/\bm_api\b/.test(body)) {
       issues.push(
@@ -168,7 +170,12 @@ async function buildCoreModuleLocal(spec: CoreModuleSpec): Promise<BuildResult> 
     };
   }
 
-  const dir = await writeModuleSource(spec);
+  let dir: string;
+  try {
+    dir = await writeModuleSource(spec);
+  } catch (err) {
+    return { ok: false, phase: "compile", errors: [`codegen failed: ${(err as Error).message}`], stderrTail: "", durationMs: Date.now() - startedAt };
+  }
   const { code, stdout, stderr } = await runNixBuild(dir, ".#lgx-portable");
   const compileMs = Date.now() - startedAt;
 
@@ -196,7 +203,11 @@ async function buildCoreModuleLocal(spec: CoreModuleSpec): Promise<BuildResult> 
   // so /api/built-module/[id] has a stable path to serve from.
   const cachePath = cachePathFor(spec.id);
   try { await unlink(cachePath); } catch { /* ENOENT on first build */ }
-  await copyFile(path.join(storePath, lgx), cachePath);
+  try {
+    await copyFile(path.join(storePath, lgx), cachePath);
+  } catch (cpErr) {
+    return { ok: false, phase: "compile", errors: [`Failed to cache .lgx: ${(cpErr as Error).message}`], stderrTail: "", durationMs: compileMs };
+  }
   try { await chmod(cachePath, 0o644); } catch { /* best effort */ }
 
   // ── Unit tests phase ────────────────────────────────────────────────────

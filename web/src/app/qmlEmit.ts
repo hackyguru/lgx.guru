@@ -12,7 +12,7 @@
 //               Component { id: _page_0; <page root> } ... }
 // so Button.onClicked: app.navigate("<key>") can swap the visible page.
 
-import { AppState, ButtonAction, CallModuleArg, CommonStyle, ImageFit, ModuleMethod, Node, PageData, Variable, VariableType } from "./types";
+import { AppState, ButtonAction, CallModuleArg, CommonStyle, defaultStyle, ImageFit, ModuleMethod, Node, PageData, Variable, VariableType } from "./types";
 import { findModuleMethod } from "./modules/catalog";
 
 // The id of the curated delivery primitive — referenced only by the shared
@@ -30,9 +30,20 @@ export const DELIVERY_RELAY_ID = "delivery_relay";
 // burning CPU. Configurable later if needed.
 const DELIVERY_POLL_INTERVAL_MS = 1000;
 
-const escapeStr = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+const escapeStr = (s: string) => (typeof s === "string" ? s : "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
 const indent = (depth: number) => "    ".repeat(depth);
+
+// Emit a number literal as a QML double (always with a decimal point).
+// QML treats `3` as int and `3.0` as double. When passed through
+// logos.callModule() → QVariant, the C++ dispatch layer expects double
+// args (universal modules use double for all "number" params). Passing
+// an int QVariant where double is expected causes a type mismatch and
+// the method call fails with "Invalid response".
+const qmlDouble = (n: number): string => {
+  const s = String(n);
+  return s.includes(".") || s.includes("e") || s.includes("E") ? s : `${s}.0`;
+};
 
 // AI-generated patches sometimes splice expressions with unbalanced parens
 // (or other syntactic damage). Because QML parses the whole Main.qml at
@@ -115,7 +126,10 @@ const setVariableExpr = (varType: VariableType, value: string): string => {
 };
 
 // CommonStyle → QML property lines (without the geometry — caller emits that).
-const styleLines = (s: CommonStyle, i: string): string[] => {
+// Guard against nodes with a missing/undefined style (e.g. from an AI patch
+// that omitted the style object).
+const styleLines = (raw: CommonStyle | undefined, i: string): string[] => {
+  const s = raw ?? defaultStyle();
   const lines: string[] = [
     `${i}    color: '${escapeStr(s.backgroundColor)}'`,
     `${i}    radius: ${s.borderRadius}`,
@@ -187,7 +201,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     const fallback = setVariableExpr(type, "");
     const value = action.mode === "expression"
       ? safeExpr(action.value || "", fallback)
-      : setVariableExpr(type, action.value);
+      : setVariableExpr(type, action.value ?? "");
     return `app.${prop} = ${value}`;
   }
   if (action.kind === "openUrl") {
@@ -207,45 +221,63 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
       // unknown module/method, instead of staring at a dead button.
       return `console.log("[lgx] button onClick references unknown ${action.moduleId}.${action.method}() — fix the wiring or rebuild the backend module")`;
     }
-    // Render each declared arg using its declared type. Missing trailing
-    // args are emitted as empty literals so the JS array shape matches the
-    // method signature even if the user hasn't filled everything in.
+    // Render each declared arg using its declared type. Number args are
+    // emitted with a decimal point (e.g. 3.0 not 3) so QML creates a
+    // QVariant(double), matching the C++ dispatch's expected type.
     const argsExprs = spec.args.map((p, idx) => {
-      const a: CallModuleArg = action.args[idx] ?? { value: "", mode: "literal" };
-      const fb = p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""';
+      const a: CallModuleArg = (action.args ?? [])[idx] ?? { value: "", mode: "literal" };
+      const fb = p.type === "number" ? "0.0" : p.type === "boolean" ? "false" : '""';
       if (a.mode === "expression") return safeExpr(a.value || "", fb);
       if (p.type === "number") {
         const n = parseFloat(a.value);
-        return Number.isFinite(n) ? String(n) : "0";
+        return Number.isFinite(n) ? qmlDouble(n) : "0.0";
       }
       if (p.type === "boolean") return a.value === "true" ? "true" : "false";
       return `"${escapeStr(a.value)}"`;
     });
-    return `logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+    // Guard + try/catch: the module may not be connected yet (Basecamp loads
+    // core modules asynchronously). Without this, a race at startup or a
+    // missing module silently kills the handler.
+    const callExpr = `logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+    return `if (typeof logos !== "undefined" && logos.callModule) { try { ${callExpr}; } catch(_e) { console.log("[lgx] callModule error:", _e); } }`;
   }
   if (action.kind === "callModuleToVariable") {
     if (!action.moduleId || !action.method) return null;
     const prop = ctx.varQmlByVarId.get(action.varId);
     if (!prop) return null;
+    const varType = ctx.varTypeByVarId.get(action.varId);
     const spec = findModuleMethod(action.moduleId, action.method)
       ?? ctx.extraMethods.get(action.moduleId)?.get(action.method);
     if (!spec) {
       return `console.log("[lgx] callModuleToVariable references unknown ${action.moduleId}.${action.method}() — variable will not update")`;
     }
     const argsExprs = spec.args.map((p, idx) => {
-      const a: CallModuleArg = action.args[idx] ?? { value: "", mode: "literal" };
-      const fb = p.type === "number" ? "0" : p.type === "boolean" ? "false" : '""';
+      const a: CallModuleArg = (action.args ?? [])[idx] ?? { value: "", mode: "literal" };
+      const fb = p.type === "number" ? "0.0" : p.type === "boolean" ? "false" : '""';
       if (a.mode === "expression") return safeExpr(a.value || "", fb);
       if (p.type === "number") {
         const n = parseFloat(a.value);
-        return Number.isFinite(n) ? String(n) : "0";
+        return Number.isFinite(n) ? qmlDouble(n) : "0.0";
       }
       if (p.type === "boolean") return a.value === "true" ? "true" : "false";
       return `"${escapeStr(a.value)}"`;
     });
-    // QML lets us assign module call's return into a property directly. The
-    // user picked the variable; the callModule expression supplies the value.
-    return `app.${prop} = logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+    // logos.callModule() returns a QString. Coerce to the variable's type:
+    //   number  → Number(raw) with fallback to 0
+    //   boolean → raw === "true"
+    //   string  → direct (already a string)
+    // Wrapped in try/catch + logos guard so a disconnected module doesn't
+    // break the handler.
+    const rawCall = `logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+    let assignExpr: string;
+    if (varType === "number") {
+      assignExpr = `var _r = ${rawCall}; app.${prop} = Number(_r) || 0`;
+    } else if (varType === "boolean") {
+      assignExpr = `app.${prop} = (${rawCall}) === "true"`;
+    } else {
+      assignExpr = `app.${prop} = ${rawCall} || ""`;
+    }
+    return `if (typeof logos !== "undefined" && logos.callModule) { try { ${assignExpr}; } catch(_e) { console.log("[lgx] callModuleToVariable error:", _e); } }`;
   }
   if (action.kind === "sendMessage") {
     const topic = (typeof action.topic === "string" ? action.topic : "").trim();
@@ -255,7 +287,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // the expression form so a bad splice doesn't kill the whole handler.
     const payloadExpr = action.payloadMode === "expression"
       ? safeExpr(action.payload || "", '""')
-      : `"${escapeStr(action.payload)}"`;
+      : `"${escapeStr(action.payload ?? "")}"`;
     // Route through the shared delivery_relay (sendMessage), NOT
     // delivery_module directly — the relay owns lifecycle + status and is
     // the same .lgx for every project. Comma-paired with sentCount bump so
@@ -270,7 +302,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // first so a malformed splice can't break Main.qml's parse.
     const valueExpr = action.mode === "expression"
       ? safeExpr(action.value || "", '""')
-      : JSON.stringify(action.value);
+      : JSON.stringify(action.value ?? "");
     // Mutate-via-stringify pattern. Tolerates non-array / unparseable initial
     // values by falling back to []. Bound to a string variable; we re-encode
     // the array so List/Repeater (which JSON.parse(app.var_*)) can read it.
@@ -290,7 +322,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // non-string. Treat anything-not-a-string as empty (= always true).
     const rawCond = typeof action.condition === "string" ? action.condition : "";
     const cond = rawCond.trim() ? safeExpr(rawCond, "false") : "true";
-    const body = actionBlockJs(action.actions, ctx);
+    const body = actionBlockJs(action.actions ?? [], ctx);
     if (!body) return null;
     return `try { if (${cond}) { ${body} } } catch(_ifErr) { console.log("if condition error:", _ifErr) }`;
   }
@@ -311,10 +343,10 @@ export const usesDelivery = (app: AppState): boolean => {
   }
   const walk = (n: Node): boolean => {
     if (n.kind === "Button" && actionUsesDelivery(n.onClick)) return true;
-    if (n.kind === "Frame") return n.children.some(walk);
+    if (n.kind === "Frame") return (n.children ?? []).some(walk);
     return false;
   };
-  return app.pages.some((p) => p.root.children.some(walk));
+  return (app.pages ?? []).some((p) => (p.root?.children ?? []).some(walk));
 };
 
 // All distinct content topics used by onMessageReceived triggers — drives
@@ -355,7 +387,7 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         ...geomLines(node, i),
         ...styleLines(node.style, i),
       ];
-      for (const c of node.children) {
+      for (const c of node.children ?? []) {
         if (c.hidden) continue;
         lines.push(emitNode(c, depth + 1, ctx));
       }
@@ -415,7 +447,7 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
       // For an unstyled button (transparent outer Rectangle) we keep Qt's
       // chrome, otherwise the button has nothing to render and shows as
       // bare floating text.
-      const userStyledBg = node.style.backgroundColor !== "transparent";
+      const userStyledBg = (node.style ?? defaultStyle()).backgroundColor !== "transparent";
       const inner: (string | null)[] = [
         `${i}    Button {`,
         `${i}        anchors.fill: parent`,
@@ -637,7 +669,7 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
     }
 
     case "ComboBox": {
-      const items = node.model.map((m) => `'${escapeStr(m)}'`).join(", ");
+      const items = (node.model ?? []).map((m) => `'${escapeStr(m)}'`).join(", ");
       const inner: string[] = [
         `${i}    ComboBox {`,
         `${i}        anchors.fill: parent`,
@@ -984,7 +1016,7 @@ export const emitMainQml = (app: AppState, forExport: boolean): string => {
   const usedNames = new Set<string>();
   const varQmlByVarId = new Map<string, string>();
   const varTypeByVarId = new Map<string, VariableType>();
-  app.variables.forEach((v, idx) => {
+  (app.variables ?? []).forEach((v, idx) => {
     varQmlByVarId.set(v.id, varPropName(v, idx, usedNames));
     varTypeByVarId.set(v.id, v.type);
   });
@@ -994,26 +1026,28 @@ export const emitMainQml = (app: AppState, forExport: boolean): string => {
   const extraMethods: Map<string, Map<string, ModuleMethod>> = new Map();
   if (app.coreModule) {
     const m = new Map<string, ModuleMethod>();
-    for (const cm of app.coreModule.methods) {
-      m.set(cm.name, { name: cm.name, args: cm.args, returns: cm.returns, description: cm.description });
+    for (const cm of (app.coreModule.methods ?? [])) {
+      m.set(cm.name, { name: cm.name, args: cm.args ?? [], returns: cm.returns, description: cm.description });
     }
     extraMethods.set(app.coreModule.id, m);
   }
 
   const ctx: EmitCtx = {
-    pages: app.pages,
-    variables: app.variables,
+    pages: app.pages ?? [],
+    variables: app.variables ?? [],
     varQmlByVarId,
     varTypeByVarId,
     extraMethods,
   };
+  const pages = app.pages ?? [];
   const initialPage =
-    app.pages.find((p) => p.id === app.currentPageId) ?? app.pages[0];
+    pages.find((p) => p.id === app.currentPageId) ?? pages[0];
+  if (!initialPage) return "// Error: no pages defined\nRectangle { width: 400; height: 300 }";
 
   // App Rectangle dimensions match the initial page's root — every page is
   // expected to share the canvas size (the editor syncs them to the iframe).
-  const w = initialPage.root.width;
-  const h = initialPage.root.height;
+  const w = initialPage.root?.width ?? 400;
+  const h = initialPage.root?.height ?? 300;
 
   const lines: string[] = [];
   lines.push(`Rectangle {`);
@@ -1033,7 +1067,7 @@ export const emitMainQml = (app: AppState, forExport: boolean): string => {
     lines.push(`    property int recvCount: 0`);
   }
   // App-level state — emitted as Qt properties so QML bindings + setters work.
-  for (const v of app.variables) {
+  for (const v of (app.variables ?? [])) {
     const prop = varQmlByVarId.get(v.id)!;
     lines.push(`    property ${qmlPropertyType(v.type)} ${prop}: ${qmlInitial(v)}`);
   }
@@ -1049,14 +1083,14 @@ export const emitMainQml = (app: AppState, forExport: boolean): string => {
   lines.push(`    Loader {`);
   lines.push(`        anchors.fill: parent`);
   lines.push(`        sourceComponent: {`);
-  app.pages.forEach((p, idx) => {
+  pages.forEach((p, idx) => {
     lines.push(`            if (app.currentPage === "${navKey(p.id)}") return ${compId(idx)};`);
   });
   lines.push(`            return ${compId(0)};`);
   lines.push(`        }`);
   lines.push(`    }`);
 
-  app.pages.forEach((p, idx) => {
+  pages.forEach((p, idx) => {
     lines.push(``);
     lines.push(`    Component {`);
     lines.push(`        id: ${compId(idx)}`);
