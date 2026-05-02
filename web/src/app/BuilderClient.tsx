@@ -28,7 +28,7 @@ import {
 } from "./lib/githubSettings";
 import { pushAndBuild, type BuildPhase } from "./lib/githubBuilder";
 import { ModuleDetailModal, ModuleInfo } from "./ModuleDetailModal";
-import { AskAIModal } from "./AskAIModal";
+import { AskAIModal, AIHistoryEntry } from "./AskAIModal";
 import { RendererStatus, useRendererStatus } from "./RendererStatus";
 import {
   getProjectMeta, getProjectState, renameProject, saveProjectState,
@@ -2238,6 +2238,7 @@ export default function BuilderClient() {
   // custom core. When delivery is in use, the relay download is forced on.
   const [exportOpen, setExportOpen] = useState(false);
   const [askAIOpen, setAskAIOpen] = useState(false);
+  const [aiHistory, setAiHistory] = useState<AIHistoryEntry[]>([]);
   const [moduleDetail, setModuleDetail] = useState<ModuleInfo | null>(null);
   const [exportUi, setExportUi] = useState(true);
   const [exportCore, setExportCore] = useState(false);
@@ -3221,6 +3222,8 @@ export default function BuilderClient() {
         onClose={() => setAskAIOpen(false)}
         app={app}
         dispatch={dispatch}
+        history={aiHistory}
+        onHistory={setAiHistory}
       />
     </div>
   );

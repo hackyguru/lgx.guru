@@ -62,14 +62,14 @@ export const metadata: Metadata = {
     url: SITE_URL,
     locale: "en_US",
     images: [
-      { url: "/og.png", width: 1200, height: 630, alt: "lgx.guru — build Basecamp modules without writing code." },
+      { url: "/lgx-og.png", width: 640, height: 336, alt: "lgx.guru — build Basecamp modules without writing code." },
     ],
   },
   twitter: {
     card: "summary_large_image",
     title: `${SITE_NAME} — visual builder for Logos Basecamp`,
     description: SITE_DESCRIPTION,
-    images: ["/twitter-image.png"],
+    images: ["/lgx-og.png"],
   },
   robots: { index: true, follow: true },
 };

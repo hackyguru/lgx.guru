@@ -11,6 +11,7 @@ import { applyPatch, type Operation } from "fast-json-patch";
 import { renderUnwiredAdvisory, validateModuleRefs } from "../../lib/validateModuleRefs";
 import { MODULE_CATALOG } from "../../modules/catalog";
 import { buildCoreModule, type BuildResult } from "../../lib/buildModule";
+import { sanitizeApp } from "../../lib/schema";
 import type { AppState, CoreModuleSpec, ModuleSpec } from "../../types";
 
 export const runtime = "nodejs";
@@ -109,7 +110,14 @@ The same wiring obligation applies after \`apply_patch\` itself: if a patch adde
 
 Only set \`onClick: { kind: "none" }\` if a Button is **intentionally decorative** (e.g. a label styled as a button). Never leave a Button looking interactive but doing nothing.
 
-Stop calling tools (return no tool_calls) once the request is fully addressed AND every Button is wired. You can also call apply_patch alone, multiple apply_patches if appropriate, or build_backend_module alone — the loop adapts.
+CRITICAL: You MUST NOT stop (return no tool_calls) until the UI is fully wired to the backend. After building a module, you MUST call apply_patch to:
+1. Add variables for every piece of data the module returns.
+2. Add an appStart trigger that calls the module's init/fetch method.
+3. If data updates over time, add an interval trigger that polls the getter every N ms.
+4. Wire every Button's onClick to the matching callModule action.
+5. Bind Text nodes to the variables so the user can see the data.
+
+If you stop after build_backend_module without wiring the UI, the app will be DEAD — buttons do nothing, no data displays, the user sees a blank widget. This is the #1 bug users report. ALWAYS follow a build with apply_patch wiring.
 
 When you stop, the user gets a summary aggregated from each tool's summary line, so make sure each summary is concrete and one sentence.
 
@@ -622,7 +630,10 @@ export async function POST(request: NextRequest) {
   // build branch — distinct from MAX_ITER, which counts whole turns.
   const MAX_BUILD_RETRIES = 3;
 
-  let workingApp = JSON.parse(JSON.stringify(app)) as AppState;
+  // Sanitize the incoming app state — client-side data may have stale or
+  // missing fields. The Zod schema coerces to safe defaults.
+  const incomingSanitized = sanitizeApp(app);
+  let workingApp = (incomingSanitized.ok ? incomingSanitized.app : JSON.parse(JSON.stringify(app))) as AppState;
   const allOperations: Operation[] = [];
   const summaries: string[] = [];
   let lastBuildSpec: CoreModuleSpec | null = null;
@@ -643,17 +654,47 @@ export async function POST(request: NextRequest) {
       const assistantMsg = completion.choices[0]?.message;
       const toolCalls = assistantMsg?.tool_calls ?? [];
 
-      // No tool calls → AI is done.
+      // No tool calls → AI wants to stop. But if we just built a backend
+      // module and there are unwired buttons or no triggers linking the
+      // module to the UI, force a continuation — the user will get a
+      // dead-looking widget otherwise.
       if (toolCalls.length === 0) {
         if (allOperations.length === 0 && !buildHappened) {
-          // The AI didn't call any tool on the very first turn — surface
-          // its text so the user sees what it said (e.g. "I don't have
-          // enough context").
           const replyText = typeof assistantMsg?.content === "string" ? assistantMsg.content : "";
           return Response.json(
             { error: replyText.trim() || "AI did not call any tool." },
             { status: 502 },
           );
+        }
+        // Force wiring follow-up: if a build happened this turn and the
+        // UI still has unwired buttons or no triggers referencing the core
+        // module, inject a nudge and re-enter the loop with tool_choice
+        // forcing apply_patch.
+        const advisory = renderUnwiredAdvisory(workingApp);
+        const hasCoreWiring = (workingApp.triggers ?? []).some(
+          (t) => (t.actions ?? []).some(
+            (a) => (a.kind === "callModule" || a.kind === "callModuleToVariable") && a.moduleId === workingApp.coreModule?.id
+          )
+        );
+        if (buildHappened && workingApp.coreModule && (!hasCoreWiring || advisory)) {
+          const nudge = [
+            "You built the backend module but STOPPED before wiring the UI to it.",
+            "The widget will look completely dead — buttons won't work and no data will display.",
+            "You MUST now call apply_patch to:",
+            "1. Add a variable for each piece of data the module returns (callModuleToVariable needs a varId).",
+            "2. Add an appStart trigger that calls the module's fetch/init method.",
+            "3. If data changes over time, add an interval trigger that polls the getter.",
+            "4. Wire every Button's onClick to the appropriate callModule/callModuleToVariable action.",
+            "5. Bind Text nodes to the variables so the data actually displays.",
+            "",
+            advisory || `Module "${workingApp.coreModule.id}" methods: ${(workingApp.coreModule.methods ?? []).map(m => m.name).join(", ")}`,
+          ].join("\n");
+          messages.push({
+            role: "assistant",
+            content: assistantMsg?.content ?? "",
+          });
+          messages.push({ role: "user", content: nudge });
+          continue; // re-enter the loop — the next iteration uses tool_choice: "auto"
         }
         break;
       }
@@ -704,7 +745,23 @@ export async function POST(request: NextRequest) {
             true,
             false,
           );
-          const candidate = result.newDocument as AppState;
+          const rawCandidate = result.newDocument;
+          // Run through the strict Zod schema — coerces missing/bad fields
+          // to safe defaults so the QML emitter can never crash.
+          const sanitized = sanitizeApp(rawCandidate);
+          if (!sanitized.ok) {
+            messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify({
+                ok: false,
+                error: "Patch produced invalid AppState. Schema errors:\n" + sanitized.errors.join("\n"),
+                operations: payload.operations,
+              }),
+            });
+            continue;
+          }
+          const candidate = sanitized.app as AppState;
           const valid = validateModuleRefs(candidate, prevApp);
           if (!valid.ok) {
             messages.push({
@@ -818,6 +875,10 @@ export async function POST(request: NextRequest) {
               // the user gets a stopwatch-style "buttons that do nothing"
               // experience).
               const advisory = renderUnwiredAdvisory(workingApp);
+              // Include the CURRENT AppState so the AI can write correct
+              // JSON Patch paths (indexes, variable ids) in its follow-up
+              // apply_patch. Without this, the AI guesses at paths based on
+              // the stale initial state and wiring often fails.
               messages.push({
                 role: "tool",
                 tool_call_id: lastToolCallId,
@@ -833,6 +894,7 @@ export async function POST(request: NextRequest) {
                     })),
                     events: spec.events ?? [],
                   },
+                  current_app_state: workingApp,
                   ...(advisory ? { next_steps: advisory } : {}),
                 }),
               });
@@ -932,10 +994,15 @@ export async function POST(request: NextRequest) {
       return Response.json({ error: "AI didn't make any changes." }, { status: 502 });
     }
 
+    // Final sanitization pass — guarantees the returned app is schema-clean
+    // regardless of how many patches/builds mutated it.
+    const finalSanitized = sanitizeApp(workingApp);
+    const finalApp = finalSanitized.ok ? finalSanitized.app : workingApp;
+
     return Response.json({
       ok: true,
       kind: buildHappened ? "build" : "patch",
-      app: workingApp,
+      app: finalApp,
       operations: allOperations,
       summary: summaries.join(" Then "),
       providerName,

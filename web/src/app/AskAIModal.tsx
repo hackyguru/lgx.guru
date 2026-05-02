@@ -1,36 +1,14 @@
 "use client";
 
-// "Ask AI" — a focused modal that turns a natural-language request into a
-// JSON Patch against AppState and applies it as one undo step. Sibling to
-// BuildModuleModal: this one mutates the visual layer + wiring, that one
-// generates C++ backend modules.
+// "Ask AI" — a chat-style panel that keeps a running history of all AI
+// interactions. Each prompt + result is recorded so the user always knows
+// what was asked and what changed. History is lifted to BuilderClient so
+// it survives modal close/reopen.
 
 import React, { useEffect, useRef, useState } from "react";
 import type { AppState, CoreModuleSpec } from "./types";
 
 type ResultKind = "patch" | "build";
-
-type Stage =
-  | { kind: "idle" }
-  | { kind: "asking"; startedAt: number }
-  | {
-      kind: "success";
-      resultKind: ResultKind;
-      summary: string;
-      operations: PatchOp[];
-      // Build-only details:
-      spec?: CoreModuleSpec;
-      attempts?: number;
-      durationMs?: number;
-    }
-  | {
-      kind: "error";
-      message: string;
-      resultKind?: ResultKind;
-      operations?: PatchOp[];
-      errors?: string[];
-      attempts?: number;
-    };
 
 interface PatchOp {
   op: "add" | "replace" | "remove";
@@ -38,84 +16,141 @@ interface PatchOp {
   value?: unknown;
 }
 
+export interface AIHistoryEntry {
+  id: number;
+  prompt: string;
+  timestamp: number;
+  result:
+    | {
+        kind: "success";
+        resultKind: ResultKind;
+        summary: string;
+        operations: PatchOp[];
+        spec?: CoreModuleSpec;
+        attempts?: number;
+        durationMs?: number;
+      }
+    | {
+        kind: "error";
+        message: string;
+        resultKind?: ResultKind;
+        operations?: PatchOp[];
+        errors?: string[];
+        attempts?: number;
+      };
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
   app: AppState;
   dispatch: (action: { type: "commit"; app: AppState }) => void;
+  history: AIHistoryEntry[];
+  onHistory: (h: AIHistoryEntry[]) => void;
 }
 
-export function AskAIModal({ open, onClose, app, dispatch }: Props) {
+let nextId = 1;
+
+export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }: Props) {
   const [prompt, setPrompt] = useState("");
-  const [stage, setStage] = useState<Stage>({ kind: "idle" });
+  const [pending, setPending] = useState<{ prompt: string; startedAt: number } | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
-
+  // Auto-focus input when opened
   useEffect(() => {
-    if (stage.kind !== "asking") return;
-    const startedAt = stage.startedAt;
+    if (open) setTimeout(() => inputRef.current?.focus(), 50);
+  }, [open]);
+
+  // Elapsed timer for pending request
+  useEffect(() => {
+    if (!pending) return;
+    const t0 = pending.startedAt;
     const id = window.setInterval(() => {
-      setElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+      setElapsed(Math.max(0, Math.floor((Date.now() - t0) / 1000)));
     }, 1000);
     return () => window.clearInterval(id);
-  }, [stage]);
+  }, [pending]);
+
+  // Auto-scroll to bottom when history changes or pending changes
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [history.length, pending]);
 
   const close = () => {
-    if (stage.kind === "asking") return;
-    setStage({ kind: "idle" });
+    if (pending) return;
     onClose();
   };
 
   const ask = async () => {
     const trimmed = prompt.trim();
-    if (trimmed.length < 3 || stage.kind === "asking") return;
+    if (trimmed.length < 3 || pending) return;
+    const promptText = trimmed;
+    setPrompt("");
     setElapsed(0);
-    setStage({ kind: "asking", startedAt: Date.now() });
+    setPending({ prompt: promptText, startedAt: Date.now() });
+
     try {
       const res = await fetch("/api/apply-patch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: trimmed, app }),
+        body: JSON.stringify({ prompt: promptText, app }),
       });
       const data = await res.json();
       const resultKind: ResultKind = data?.kind === "build" ? "build" : "patch";
+
       if (!res.ok || !data?.ok || !data?.app) {
-        setStage({
-          kind: "error",
-          message: data?.error ?? `HTTP ${res.status}`,
-          resultKind,
-          operations: Array.isArray(data?.operations) ? (data.operations as PatchOp[]) : undefined,
-          errors: Array.isArray(data?.errors) ? (data.errors as string[]) : undefined,
-          attempts: typeof data?.attempts === "number" ? data.attempts : undefined,
-        });
-        return;
+        const entry: AIHistoryEntry = {
+          id: nextId++,
+          prompt: promptText,
+          timestamp: Date.now(),
+          result: {
+            kind: "error",
+            message: data?.error ?? `HTTP ${res.status}`,
+            resultKind,
+            operations: Array.isArray(data?.operations) ? (data.operations as PatchOp[]) : undefined,
+            errors: Array.isArray(data?.errors) ? (data.errors as string[]) : undefined,
+            attempts: typeof data?.attempts === "number" ? data.attempts : undefined,
+          },
+        };
+        onHistory([...history, entry]);
+      } else {
+        dispatch({ type: "commit", app: data.app as AppState });
+        const entry: AIHistoryEntry = {
+          id: nextId++,
+          prompt: promptText,
+          timestamp: Date.now(),
+          result: {
+            kind: "success",
+            resultKind,
+            summary: typeof data.summary === "string" ? data.summary : "Done.",
+            operations: Array.isArray(data.operations) ? (data.operations as PatchOp[]) : [],
+            spec: data.spec as CoreModuleSpec | undefined,
+            attempts: typeof data.attempts === "number" ? data.attempts : undefined,
+            durationMs: typeof data.durationMs === "number" ? data.durationMs : undefined,
+          },
+        };
+        onHistory([...history, entry]);
       }
-      // Commit lands as one history entry — Cmd-Z reverts the whole change
-      // (including builds that replaced /coreModule).
-      dispatch({ type: "commit", app: data.app as AppState });
-      setStage({
-        kind: "success",
-        resultKind,
-        summary: typeof data.summary === "string" ? data.summary : "Done.",
-        operations: Array.isArray(data.operations) ? (data.operations as PatchOp[]) : [],
-        spec: data.spec as CoreModuleSpec | undefined,
-        attempts: typeof data.attempts === "number" ? data.attempts : undefined,
-        durationMs: typeof data.durationMs === "number" ? data.durationMs : undefined,
-      });
     } catch (err) {
-      setStage({ kind: "error", message: err instanceof Error ? err.message : "Network error" });
+      const entry: AIHistoryEntry = {
+        id: nextId++,
+        prompt: promptText,
+        timestamp: Date.now(),
+        result: { kind: "error", message: err instanceof Error ? err.message : "Network error" },
+      };
+      onHistory([...history, entry]);
+    } finally {
+      setPending(null);
+      setTimeout(() => inputRef.current?.focus(), 50);
     }
   };
 
-  const newRequest = () => {
-    setPrompt("");
-    setStage({ kind: "idle" });
-    inputRef.current?.focus();
-  };
-
   if (!open) return null;
+
+  const isEmpty = history.length === 0 && !pending;
 
   const examples = [
     "Show the London time in the title",
@@ -134,44 +169,43 @@ export function AskAIModal({ open, onClose, app, dispatch }: Props) {
         className="flex max-h-[85vh] w-full max-w-160 flex-col overflow-hidden rounded-lg border border-border-subtle bg-canvas shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Header */}
         <header className="flex items-center justify-between border-b border-border-subtle px-4 py-3">
-          <div>
+          <div className="min-w-0 flex-1">
             <div className="text-sm font-semibold text-ink">Ask AI</div>
             <div className="text-[11px] text-ink-muted">
-              {stage.kind === "success"
-                ? "Applied. Cmd-Z reverts everything."
-                : "Describe the change. AI wires it up — variables, triggers, bindings, all of it."}
+              Describe changes in plain English. History is kept so you can track every change.
             </div>
           </div>
-          <button
-            onClick={close}
-            disabled={stage.kind === "asking"}
-            className="-mr-1 rounded p-1 text-ink-muted hover:bg-surface-cool hover:text-ink-muted disabled:opacity-30 dark:hover:text-ink"
-            aria-label="Close"
-          >
-            ×
-          </button>
+          <div className="flex items-center gap-1.5">
+            {history.length > 0 && (
+              <button
+                onClick={() => onHistory([])}
+                disabled={!!pending}
+                className="rounded px-2 py-1 text-[10px] text-ink-muted hover:bg-surface-cool hover:text-ink disabled:opacity-30"
+                title="Clear history"
+              >
+                Clear
+              </button>
+            )}
+            <button
+              onClick={close}
+              disabled={!!pending}
+              className="-mr-1 rounded p-1 text-ink-muted hover:bg-surface-cool hover:text-ink-muted disabled:opacity-30 dark:hover:text-ink"
+              aria-label="Close"
+            >
+              x
+            </button>
+          </div>
         </header>
 
-        <div className="flex-1 overflow-y-auto px-4 py-4">
-          {stage.kind === "idle" && (
+        {/* Scrollable conversation area */}
+        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3" style={{ minHeight: "200px", maxHeight: "calc(85vh - 160px)" }}>
+          {/* Empty state with examples */}
+          {isEmpty && (
             <div className="space-y-3">
-              <textarea
-                ref={inputRef}
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                    e.preventDefault();
-                    ask();
-                  }
-                }}
-                rows={4}
-                placeholder="What should change?"
-                className="w-full resize-none rounded border border-border-soft bg-canvas px-3 py-2 text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none dark:placeholder:text-ink-muted"
-              />
-              <div className="text-[10px] text-ink-muted">
-                ⌘/Ctrl+Enter to send.
+              <div className="py-4 text-center text-[11px] text-ink-muted">
+                No changes yet. Ask AI to modify your app.
               </div>
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
@@ -193,210 +227,183 @@ export function AskAIModal({ open, onClose, app, dispatch }: Props) {
             </div>
           )}
 
-          {stage.kind === "asking" && (
-            <div className="space-y-3 py-2">
-              <div className="space-y-2.5">
-                <div className="h-3 w-4/5 animate-pulse rounded-full bg-border-subtle" />
-                <div className="h-3 w-3/5 animate-pulse rounded-full bg-border-subtle" />
-                <div className="h-3 w-2/5 animate-pulse rounded-full bg-border-subtle" />
-                <div className="mt-1 text-[11px] text-ink-muted">
-                  Working out the change... {fmt(elapsed)}
-                </div>
-              </div>
-              {/* After ~10s the request is probably a backend build (nix
-                  download + compile dominates). Surface that so users
-                  don't think the spinner is stuck. */}
-              {elapsed >= 10 && (
-                <div className="rounded border border-warning bg-warning-bg px-3 py-2 text-[11px] leading-snug text-warning dark:border-warning dark:bg-warning-bg dark:text-warning">
-                  Looks like a backend module build — first compile of a fresh module can take several minutes while the Logos SDK downloads. Subsequent builds are much faster.
-                </div>
-              )}
-              <div className="rounded border border-border-subtle bg-surface-warm px-3 py-2 text-[11px] text-ink-muted">
-                <span className="font-mono text-ink-muted">»</span> {prompt}
-              </div>
-            </div>
-          )}
-
-          {stage.kind === "success" && (() => {
-            // For multi-step (build + wire) responses, count UI ops separately
-            // from the /coreModule replace so the secondary line reads naturally.
-            const uiOps = stage.operations.filter((o) => !o.path.startsWith("/coreModule"));
-            const uiCount = uiOps.length;
-            const secondary = stage.resultKind === "build"
-              ? uiCount === 0
-                ? "Module compiled and added to your project."
-                : `Module compiled, plus ${uiCount} UI change${uiCount === 1 ? "" : "s"} applied.`
-              : `${stage.operations.length} change${stage.operations.length === 1 ? "" : "s"} applied`;
-            return (
-            <div className="space-y-3">
-              <div className="flex items-start gap-2">
-                <span className="mt-0.5 text-success dark:text-success">✓</span>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[12px] font-medium text-ink">
-                    {stage.summary}
-                  </div>
-                  <div className="text-[11px] text-ink-muted">
-                    {secondary}
+          {/* History entries */}
+          {history.map((entry, i) => (
+            <div key={entry.id} className={i > 0 ? "mt-4" : ""}>
+              {/* User prompt */}
+              <div className="flex justify-end">
+                <div className="max-w-[85%] rounded-lg rounded-br-sm bg-accent/10 px-3 py-2 dark:bg-accent/20">
+                  <div className="text-[11px] leading-snug text-ink">{entry.prompt}</div>
+                  <div className="mt-0.5 text-right text-[9px] text-ink-muted">
+                    {fmtTime(entry.timestamp)}
                   </div>
                 </div>
               </div>
 
-              {stage.resultKind === "build" && stage.spec && (
-                <div className="space-y-2">
-                  {stage.spec.methods.length > 0 && (
-                    <div>
-                      <div className="text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
-                        Methods
-                      </div>
-                      <ul className="mt-1 space-y-1">
-                        {stage.spec.methods.map((m) => (
-                          <li key={m.name} className="rounded border border-border-subtle px-2 py-1.5">
-                            <div className="font-mono text-[11px] text-ink">
-                              {m.name}({m.args.map((a) => `${a.name}: ${a.type}`).join(", ")}){" "}
-                              <span className="text-ink-muted">→ {m.returns}</span>
-                            </div>
-                            {m.description && (
-                              <div className="mt-0.5 text-[10px] text-ink-muted">{m.description}</div>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                  {(stage.spec.events ?? []).length > 0 && (
-                    <div>
-                      <div className="text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
-                        Events
-                      </div>
-                      <ul className="mt-1 space-y-1">
-                        {(stage.spec.events ?? []).map((ev) => (
-                          <li key={ev.name} className="rounded border border-border-subtle px-2 py-1.5">
-                            <div className="font-mono text-[11px] text-ink">
-                              {ev.name} {`{ ${ev.data.map((d) => `${d.name}: ${d.type}`).join(", ")} }`}
-                            </div>
-                            {ev.description && (
-                              <div className="mt-0.5 text-[10px] text-ink-muted">{ev.description}</div>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
+              {/* AI response */}
+              <div className="mt-1.5 flex justify-start">
+                <div className="max-w-[85%] rounded-lg rounded-bl-sm border border-border-subtle bg-surface-warm px-3 py-2">
+                  {entry.result.kind === "success" ? (
+                    <SuccessResult result={entry.result} />
+                  ) : (
+                    <ErrorResult result={entry.result} />
                   )}
                 </div>
-              )}
-
-              {stage.operations.length > 0 && (
-                <details className="rounded border border-border-subtle">
-                  <summary className="cursor-pointer px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
-                    What changed (advanced)
-                  </summary>
-                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all border-t border-border-subtle bg-surface-warm px-3 py-2 text-[10px] text-ink-muted">
-                    {stage.operations.map((o) =>
-                      `${o.op.padEnd(8)} ${o.path}${o.op !== "remove" ? ` = ${shortValue(o.value)}` : ""}`
-                    ).join("\n")}
-                  </pre>
-                </details>
-              )}
-            </div>
-            );
-          })()}
-
-          {stage.kind === "error" && (
-            <div className="space-y-2">
-              <div className="text-[12px] font-medium text-ink">
-                {stage.resultKind === "build"
-                  ? `Build failed${stage.attempts ? ` after ${stage.attempts} attempt${stage.attempts === 1 ? "" : "s"}` : ""}`
-                  : "Couldn't apply"}
               </div>
-              <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded border border-danger bg-danger-bg px-3 py-2 text-[11px] text-danger">
-                {stage.message}
-              </pre>
-              {stage.errors && stage.errors.length > 0 && (
-                <details className="rounded border border-border-subtle">
-                  <summary className="cursor-pointer px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
-                    Compiler errors (last attempt)
-                  </summary>
-                  <pre className="max-h-72 overflow-y-auto whitespace-pre-wrap border-t border-danger bg-danger-bg px-3 py-2 text-[10px] leading-snug text-danger">
-                    {stage.errors.join("\n\n")}
-                  </pre>
-                </details>
-              )}
-              {stage.operations && stage.operations.length > 0 && (
-                <details className="rounded border border-border-subtle">
-                  <summary className="cursor-pointer px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
-                    Patch the AI tried (advanced)
-                  </summary>
-                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-all border-t border-border-subtle bg-surface-warm px-3 py-2 text-[10px] text-ink-muted">
-                    {stage.operations.map((o) =>
-                      `${o.op.padEnd(8)} ${o.path}${o.op !== "remove" ? ` = ${shortValue(o.value)}` : ""}`
-                    ).join("\n")}
-                  </pre>
-                </details>
-              )}
+            </div>
+          ))}
+
+          {/* Pending request */}
+          {pending && (
+            <div className={history.length > 0 ? "mt-4" : ""}>
+              <div className="flex justify-end">
+                <div className="max-w-[85%] rounded-lg rounded-br-sm bg-accent/10 px-3 py-2 dark:bg-accent/20">
+                  <div className="text-[11px] leading-snug text-ink">{pending.prompt}</div>
+                </div>
+              </div>
+              <div className="mt-1.5 flex justify-start">
+                <div className="max-w-[85%] rounded-lg rounded-bl-sm border border-border-subtle bg-surface-warm px-3 py-2">
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+                      <span className="text-[11px] text-ink-muted">
+                        Working... {fmt(elapsed)}
+                      </span>
+                    </div>
+                    {elapsed >= 10 && (
+                      <div className="text-[10px] leading-snug text-warning">
+                        Backend module build in progress — first compile can take several minutes.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </div>
 
-        <footer className="flex items-center justify-end gap-2 border-t border-border-subtle px-4 py-3">
-          {stage.kind === "idle" && (
-            <>
-              <button
-                onClick={close}
-                className="rounded border border-border-soft px-3 py-1.5 text-xs text-ink-muted hover:bg-surface-cool"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={ask}
-                disabled={prompt.trim().length < 3}
-                className="rounded gradient-accent px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
-              >
-                Send
-              </button>
-            </>
-          )}
-          {stage.kind === "asking" && (
-            <div className="flex items-center gap-2">
-              <div className="h-3 w-16 animate-pulse rounded-full bg-border-subtle" />
-            </div>
-          )}
-          {stage.kind === "success" && (
-            <>
-              <button
-                onClick={close}
-                className="rounded border border-border-soft px-3 py-1.5 text-xs text-ink-muted hover:bg-surface-cool"
-              >
-                Done
-              </button>
-              <button
-                onClick={newRequest}
-                className="rounded gradient-accent px-3 py-1.5 text-xs font-medium text-white hover:opacity-90"
-              >
-                Ask another
-              </button>
-            </>
-          )}
-          {stage.kind === "error" && (
-            <>
-              <button
-                onClick={close}
-                className="rounded border border-border-soft px-3 py-1.5 text-xs text-ink-muted hover:bg-surface-cool"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => setStage({ kind: "idle" })}
-                className="rounded bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:opacity-90"
-              >
-                Try again
-              </button>
-            </>
-          )}
+        {/* Input area — always visible at bottom */}
+        <footer className="border-t border-border-subtle px-4 py-3">
+          <div className="flex gap-2">
+            <textarea
+              ref={inputRef}
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  ask();
+                }
+              }}
+              rows={2}
+              placeholder={pending ? "Waiting for response..." : "What should change?"}
+              disabled={!!pending}
+              className="flex-1 resize-none rounded border border-border-soft bg-canvas px-3 py-2 text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none disabled:opacity-50 dark:placeholder:text-ink-muted"
+            />
+            <button
+              onClick={ask}
+              disabled={prompt.trim().length < 3 || !!pending}
+              className="self-end rounded gradient-accent px-3 py-2 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
+            >
+              {pending ? "..." : "Send"}
+            </button>
+          </div>
+          <div className="mt-1 text-[10px] text-ink-muted">
+            {pending ? "Cmd-Z reverts applied changes." : "Cmd/Ctrl+Enter to send."}
+          </div>
         </footer>
       </div>
     </div>
   );
 }
+
+// ── Sub-components for history entries ─────────────────────────────────────
+
+function SuccessResult({ result }: {
+  result: Extract<AIHistoryEntry["result"], { kind: "success" }>;
+}) {
+  const uiOps = result.operations.filter((o) => !o.path.startsWith("/coreModule"));
+  const uiCount = uiOps.length;
+  const secondary = result.resultKind === "build"
+    ? uiCount === 0
+      ? "Module compiled and added."
+      : `Module compiled + ${uiCount} UI change${uiCount === 1 ? "" : "s"}.`
+    : `${result.operations.length} change${result.operations.length === 1 ? "" : "s"} applied.`;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-start gap-1.5">
+        <span className="mt-px text-[11px] text-success">+</span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[11px] font-medium leading-snug text-ink">{result.summary}</div>
+          <div className="text-[10px] text-ink-muted">{secondary}</div>
+        </div>
+      </div>
+
+      {result.resultKind === "build" && result.spec && result.spec.methods.length > 0 && (
+        <details className="rounded border border-border-subtle">
+          <summary className="cursor-pointer px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
+            Methods
+          </summary>
+          <ul className="border-t border-border-subtle px-2 py-1.5 space-y-1">
+            {result.spec.methods.map((m) => (
+              <li key={m.name} className="font-mono text-[10px] text-ink">
+                {m.name}({m.args.map((a) => `${a.name}: ${a.type}`).join(", ")})
+                <span className="text-ink-muted"> -&gt; {m.returns}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {result.operations.length > 0 && (
+        <details className="rounded border border-border-subtle">
+          <summary className="cursor-pointer px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
+            Changes ({result.operations.length})
+          </summary>
+          <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap break-all border-t border-border-subtle px-2 py-1.5 text-[9px] text-ink-muted">
+            {result.operations.map((o) =>
+              `${o.op.padEnd(8)} ${o.path}${o.op !== "remove" ? ` = ${shortValue(o.value)}` : ""}`
+            ).join("\n")}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function ErrorResult({ result }: {
+  result: Extract<AIHistoryEntry["result"], { kind: "error" }>;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-start gap-1.5">
+        <span className="mt-px text-[11px] text-danger">x</span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[11px] font-medium leading-snug text-ink">
+            {result.resultKind === "build"
+              ? `Build failed${result.attempts ? ` (${result.attempts} attempt${result.attempts === 1 ? "" : "s"})` : ""}`
+              : "Couldn't apply"}
+          </div>
+          <div className="mt-0.5 text-[10px] leading-snug text-danger">{result.message}</div>
+        </div>
+      </div>
+
+      {result.errors && result.errors.length > 0 && (
+        <details className="rounded border border-danger/30">
+          <summary className="cursor-pointer px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-danger">
+            Compiler errors
+          </summary>
+          <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap border-t border-danger/30 bg-danger-bg px-2 py-1.5 text-[9px] leading-snug text-danger">
+            {result.errors.join("\n\n")}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 function fmt(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -404,9 +411,13 @@ function fmt(seconds: number): string {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+function fmtTime(ts: number): string {
+  const d = new Date(ts);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function shortValue(v: unknown): string {
   if (v === undefined) return "(no value)";
   const s = JSON.stringify(v);
-  return s.length > 200 ? s.slice(0, 200) + "…" : s;
+  return s.length > 120 ? s.slice(0, 120) + "..." : s;
 }
-

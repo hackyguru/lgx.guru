@@ -122,7 +122,52 @@ function lintBodies(spec: CoreModuleSpec): string[] {
         `Cross-module events go through the UI layer (logos.callModule from QML on a polling Timer), not C++ signals.`
       );
     }
+    // #include inside a method body is always wrong — those belong at file
+    // scope and the codegen auto-injects them via detectQtNeeds. Letting
+    // them through causes "expected ';' at end of declaration" which is
+    // cryptic to the AI.
+    if (/^\s*#include\b/m.test(body)) {
+      issues.push(
+        `Method ${m.name}: has \`#include\` inside the method body. ` +
+        `Includes are auto-generated at file scope by the codegen — remove them from the body. ` +
+        `Just use the types/functions directly (e.g. QNetworkAccessManager, QJsonDocument) and the build will find them.`
+      );
+    }
+    // Q_OBJECT / Q_SIGNALS / Q_SLOTS / Q_PROPERTY macros inside method bodies
+    if (/\bQ_(?:OBJECT|SIGNALS|SLOTS|PROPERTY)\b/.test(body)) {
+      issues.push(
+        `Method ${m.name}: uses Q_OBJECT/Q_SIGNALS/Q_SLOTS/Q_PROPERTY macro. ` +
+        `The impl class is a plain C++ class, not a QObject. These macros can't appear inside method bodies or non-QObject classes.`
+      );
+    }
+    // Qt modules that are NOT available in the build environment. These
+    // always fail to compile and the retry loop wastes 3 build cycles
+    // producing the same "incomplete type" / "file not found" errors.
+    // Catch them in ms instead of minutes and suggest alternatives.
+    const unsupported: [RegExp, string][] = [
+      [/\bQWebSocket\b/, `Use QNetworkAccessManager for HTTP APIs instead. WebSocket is not available.`],
+      [/\bQWebEngine\b/, `WebEngine is a massive dependency and not available. Use QNetworkAccessManager for web requests.`],
+      [/\bQMultimedia\b|\bQMediaPlayer\b|\bQAudioOutput\b/, `Multimedia is not available in the build. Modules should focus on data, not media playback.`],
+      [/\bQBluetooth\b/, `Bluetooth is not available in the build environment.`],
+      [/\bQSerialPort\b/, `SerialPort is not available in the build environment.`],
+      [/\bQQuick\b|\bQQmlEngine\b|\bQQmlComponent\b/, `QML engine classes are not usable from impl classes. The QML layer is generated separately by lgx.guru.`],
+      [/\bQWidget\b|\bQMainWindow\b|\bQPushButton\b|\bQLabel\b|\bQLayout\b|\bQApplication\b/, `Qt Widgets are not available — Basecamp uses QML for all UI. Don't use QWidget classes in module code.`],
+    ];
+    for (const [rx, advice] of unsupported) {
+      if (rx.test(body)) {
+        issues.push(`Method ${m.name}: uses an unsupported Qt module. ${advice}`);
+      }
+    }
   }
+
+  // Also scan state field cppTypes for unsupported Qt classes
+  for (const s of (spec.state ?? [])) {
+    const t = s.cppType ?? "";
+    if (/\bQSqlDatabase\b/.test(t) && !(spec.methods ?? []).some(m => /\bQSql/.test(m.body ?? ""))) {
+      // QSqlDatabase in state is fine as long as Qt6Sql is detected — just check it's in the method bodies too
+    }
+  }
+
   return issues;
 }
 

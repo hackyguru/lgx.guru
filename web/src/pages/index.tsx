@@ -62,9 +62,9 @@ const HomePage = () => {
           property="og:description"
           content="Build Logos Basecamp modules without writing code. Drag-and-drop editor, AI-wired logic, live Qt-WASM preview, cross-platform .lgx export."
         />
-        <meta property="og:image" content="https://lgx.guru/og.png" />
-        <meta property="og:image:width" content="1200" />
-        <meta property="og:image:height" content="630" />
+        <meta property="og:image" content="https://lgx.guru/lgx-og.png" />
+        <meta property="og:image:width" content="640" />
+        <meta property="og:image:height" content="336" />
         <meta
           property="og:image:alt"
           content="lgx.guru — build Basecamp modules without writing code."
@@ -76,7 +76,7 @@ const HomePage = () => {
           name="twitter:description"
           content="Drag, drop, ship. AI-wired logic, Qt-WASM preview, cross-platform .lgx export."
         />
-        <meta name="twitter:image" content="https://lgx.guru/twitter-image.png" />
+        <meta name="twitter:image" content="https://lgx.guru/lgx-og.png" />
       </Head>
 
       <a

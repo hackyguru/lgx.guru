@@ -31,6 +31,21 @@ export const DELIVERY_RELAY_ID = "delivery_relay";
 const DELIVERY_POLL_INTERVAL_MS = 1000;
 
 const escapeStr = (s: string) => (typeof s === "string" ? s : "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+// Double-quote variant: escapes \ and " for use inside "..."-delimited JS strings.
+// escapeStr only handles single quotes — using it inside double-quoted strings
+// lets embedded " break the string and poison the QML parse (the root cause of
+// the "Expected token ','" class of runtime errors).
+const escapeDouble = (s: unknown): string => (typeof s === "string" ? s : String(s ?? "")).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+// Safe numeric/boolean coercion for QML property values. AI patches can
+// deliver undefined/null/NaN through fields the schema was supposed to
+// coerce — these helpers are the last line of defense before QML emission.
+const safeNum = (v: unknown, fallback = 0): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+const safeBool = (v: unknown, fallback = false): boolean =>
+  typeof v === "boolean" ? v : fallback;
 
 const indent = (depth: number) => "    ".repeat(depth);
 
@@ -85,7 +100,7 @@ const compId = (idx: number): string => `_page_${idx}`;
 // sanitise the user-typed name. Repeated names get suffixed by index so
 // the emitted QML stays valid.
 const varPropName = (v: Variable, idx: number, used: Set<string>): string => {
-  const slug = v.name.replace(/[^a-z0-9_]/gi, "_") || `v${idx}`;
+  const slug = (typeof v.name === "string" ? v.name : "").replace(/[^a-z0-9_]/gi, "_") || `v${idx}`;
   let name = `var_${slug}`;
   let n = 1;
   while (used.has(name)) { n++; name = `var_${slug}_${n}`; }
@@ -104,14 +119,17 @@ const qmlPropertyType = (t: VariableType): string =>
 // (`escapeStr` is single-quote-aware and would leave `"` unescaped — that
 // closes the string early on values like `["a","b"]`.)
 const qmlInitial = (v: Variable): string => {
+  // Coerce to string first — AI patches sometimes leave `initial` as
+  // undefined/null/object/number instead of the expected string.
+  const raw = typeof v.initial === "string" ? v.initial : String(v.initial ?? "");
   if (v.type === "number") {
-    const n = parseFloat(v.initial);
+    const n = parseFloat(raw);
     return Number.isFinite(n) ? String(n) : "0";
   }
   if (v.type === "boolean") {
-    return v.initial === "true" ? "true" : "false";
+    return raw === "true" ? "true" : "false";
   }
-  return JSON.stringify(v.initial);
+  return JSON.stringify(raw);
 };
 
 // Emit the QML value expression for a setVariable action's value field.
@@ -122,7 +140,7 @@ const setVariableExpr = (varType: VariableType, value: string): string => {
     return Number.isFinite(n) ? String(n) : "0";
   }
   if (varType === "boolean") return value === "true" ? "true" : "false";
-  return `"${escapeStr(value)}"`;
+  return `"${escapeDouble(value)}"`;
 };
 
 // CommonStyle → QML property lines (without the geometry — caller emits that).
@@ -131,24 +149,24 @@ const setVariableExpr = (varType: VariableType, value: string): string => {
 const styleLines = (raw: CommonStyle | undefined, i: string): string[] => {
   const s = raw ?? defaultStyle();
   const lines: string[] = [
-    `${i}    color: '${escapeStr(s.backgroundColor)}'`,
-    `${i}    radius: ${s.borderRadius}`,
+    `${i}    color: '${escapeStr(s.backgroundColor ?? "transparent")}'`,
+    `${i}    radius: ${safeNum(s.borderRadius)}`,
   ];
-  if (s.borderWidth > 0) {
-    lines.push(`${i}    border.color: '${escapeStr(s.borderColor)}'`);
-    lines.push(`${i}    border.width: ${s.borderWidth}`);
+  if (safeNum(s.borderWidth) > 0) {
+    lines.push(`${i}    border.color: '${escapeStr(s.borderColor ?? "transparent")}'`);
+    lines.push(`${i}    border.width: ${safeNum(s.borderWidth)}`);
   }
-  if (s.opacity !== 1) lines.push(`${i}    opacity: ${s.opacity}`);
-  if (s.rotation !== 0) lines.push(`${i}    rotation: ${s.rotation}`);
+  if (safeNum(s.opacity, 1) !== 1) lines.push(`${i}    opacity: ${safeNum(s.opacity, 1)}`);
+  if (safeNum(s.rotation) !== 0) lines.push(`${i}    rotation: ${safeNum(s.rotation)}`);
   return lines;
 };
 
 const geomLines = (n: Node, i: string): string[] => {
   const lines = [
-    `${i}    x: ${n.x}`,
-    `${i}    y: ${n.y}`,
-    `${i}    width: ${n.width}`,
-    `${i}    height: ${n.height}`,
+    `${i}    x: ${safeNum(n.x)}`,
+    `${i}    y: ${safeNum(n.y)}`,
+    `${i}    width: ${safeNum(n.width, 100)}`,
+    `${i}    height: ${safeNum(n.height, 40)}`,
   ];
   if (n.visibleWhen) lines.push(`${i}    visible: ${safeExpr(n.visibleWhen, "true")}`);
   return lines;
@@ -206,7 +224,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
   }
   if (action.kind === "openUrl") {
     if (!action.url) return null;
-    return `Qt.openUrlExternally("${escapeStr(action.url)}")`;
+    return `Qt.openUrlExternally("${escapeDouble(action.url)}")`;
   }
   if (action.kind === "callModule") {
     if (!action.moduleId || !action.method) return null;
@@ -219,7 +237,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
       // the symptom that bit the stopwatch app. Surface a runtime log so
       // the user can see in Basecamp logs that the wiring references an
       // unknown module/method, instead of staring at a dead button.
-      return `console.log("[lgx] button onClick references unknown ${action.moduleId}.${action.method}() — fix the wiring or rebuild the backend module")`;
+      return `console.log("[lgx] button onClick references unknown " + "${escapeDouble(action.moduleId)}.${escapeDouble(action.method)}" + "() — fix the wiring or rebuild the backend module")`;
     }
     // Render each declared arg using its declared type. Number args are
     // emitted with a decimal point (e.g. 3.0 not 3) so QML creates a
@@ -233,12 +251,12 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
         return Number.isFinite(n) ? qmlDouble(n) : "0.0";
       }
       if (p.type === "boolean") return a.value === "true" ? "true" : "false";
-      return `"${escapeStr(a.value)}"`;
+      return `"${escapeDouble(a.value)}"`;
     });
     // Guard + try/catch: the module may not be connected yet (Basecamp loads
     // core modules asynchronously). Without this, a race at startup or a
     // missing module silently kills the handler.
-    const callExpr = `logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+    const callExpr = `logos.callModule("${escapeDouble(action.moduleId)}", "${escapeDouble(action.method)}", [${argsExprs.join(", ")}])`;
     return `if (typeof logos !== "undefined" && logos.callModule) { try { ${callExpr}; } catch(_e) { console.log("[lgx] callModule error:", _e); } }`;
   }
   if (action.kind === "callModuleToVariable") {
@@ -249,7 +267,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     const spec = findModuleMethod(action.moduleId, action.method)
       ?? ctx.extraMethods.get(action.moduleId)?.get(action.method);
     if (!spec) {
-      return `console.log("[lgx] callModuleToVariable references unknown ${action.moduleId}.${action.method}() — variable will not update")`;
+      return `console.log("[lgx] callModuleToVariable references unknown " + "${escapeDouble(action.moduleId)}.${escapeDouble(action.method)}" + "() — variable will not update")`;
     }
     const argsExprs = spec.args.map((p, idx) => {
       const a: CallModuleArg = (action.args ?? [])[idx] ?? { value: "", mode: "literal" };
@@ -260,7 +278,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
         return Number.isFinite(n) ? qmlDouble(n) : "0.0";
       }
       if (p.type === "boolean") return a.value === "true" ? "true" : "false";
-      return `"${escapeStr(a.value)}"`;
+      return `"${escapeDouble(a.value)}"`;
     });
     // logos.callModule() returns a QString. Coerce to the variable's type:
     //   number  → Number(raw) with fallback to 0
@@ -268,7 +286,7 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     //   string  → direct (already a string)
     // Wrapped in try/catch + logos guard so a disconnected module doesn't
     // break the handler.
-    const rawCall = `logos.callModule("${escapeStr(action.moduleId)}", "${escapeStr(action.method)}", [${argsExprs.join(", ")}])`;
+    const rawCall = `logos.callModule("${escapeDouble(action.moduleId)}", "${escapeDouble(action.method)}", [${argsExprs.join(", ")}])`;
     let assignExpr: string;
     if (varType === "number") {
       assignExpr = `var _r = ${rawCall}; app.${prop} = Number(_r) || 0`;
@@ -287,12 +305,12 @@ const onClickQml = (action: ButtonAction | undefined, ctx: EmitCtx): string | nu
     // the expression form so a bad splice doesn't kill the whole handler.
     const payloadExpr = action.payloadMode === "expression"
       ? safeExpr(action.payload || "", '""')
-      : `"${escapeStr(action.payload ?? "")}"`;
+      : `"${escapeDouble(action.payload ?? "")}"`;
     // Route through the shared delivery_relay (sendMessage), NOT
     // delivery_module directly — the relay owns lifecycle + status and is
     // the same .lgx for every project. Comma-paired with sentCount bump so
     // the debug overlay reflects activity.
-    return `(logos.callModule("${DELIVERY_RELAY_ID}", "sendMessage", ["${escapeStr(topic)}", ${payloadExpr}]), app.sentCount += 1)`;
+    return `(logos.callModule("${DELIVERY_RELAY_ID}", "sendMessage", ["${escapeDouble(topic)}", ${payloadExpr}]), app.sentCount += 1)`;
   }
   if (action.kind === "appendToList") {
     const prop = ctx.varQmlByVarId.get(action.varId);
@@ -339,7 +357,7 @@ export const usesDelivery = (app: AppState): boolean => {
   const actionUsesDelivery = (a: ButtonAction | undefined): boolean =>
     !!a && a.kind === "sendMessage";
   for (const t of app.triggers ?? []) {
-    if (t.actions.some(actionUsesDelivery)) return true;
+    if ((t.actions ?? []).some(actionUsesDelivery)) return true;
   }
   const walk = (n: Node): boolean => {
     if (n.kind === "Button" && actionUsesDelivery(n.onClick)) return true;
@@ -371,10 +389,11 @@ const boundProp = (varId: string | undefined, ctx: EmitCtx): string | null => {
 };
 
 // Common visibility line for any node's outer Rectangle. Returns "" if no
-// visibleWhen is set.
+// visibleWhen is set. Validated via safeExpr so a malformed AI expression
+// can't break the entire Main.qml parse.
 const visibleLine = (n: Node, i: string): string | null => {
   if (!n.visibleWhen) return null;
-  return `${i}    visible: ${n.visibleWhen}`;
+  return `${i}    visible: ${safeExpr(n.visibleWhen, "true")}`;
 };
 
 const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
@@ -419,16 +438,16 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}    Text {`,
         `${i}        anchors.fill: parent`,
         textLine,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
-        `${i}        color: '${escapeStr(node.color)}'`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 16)}`,
+        `${i}        color: '${escapeStr(node.color ?? "#1f2d3d")}'`,
         `${i}        font.weight: ${fontWeightToQml(node.fontWeight)}`,
         node.italic ? `${i}        font.italic: true` : null,
         `${i}        horizontalAlignment: ${textAlignToQml(node.textAlign)}`,
         `${i}        verticalAlignment: Text.AlignVCenter`,
         node.fontFamily ? `${i}        font.family: '${escapeStr(node.fontFamily)}'` : null,
-        node.letterSpacing !== 0 ? `${i}        font.letterSpacing: ${node.letterSpacing}` : null,
-        node.lineHeight !== 1 ? `${i}        lineHeight: ${node.lineHeight}` : null,
-        node.lineHeight !== 1 ? `${i}        lineHeightMode: Text.ProportionalHeight` : null,
+        safeNum(node.letterSpacing) !== 0 ? `${i}        font.letterSpacing: ${safeNum(node.letterSpacing)}` : null,
+        safeNum(node.lineHeight, 1.2) !== 1.2 ? `${i}        lineHeight: ${safeNum(node.lineHeight, 1.2)}` : null,
+        safeNum(node.lineHeight, 1.2) !== 1.2 ? `${i}        lineHeightMode: Text.ProportionalHeight` : null,
         `${i}    }`,
       ];
       return [
@@ -497,8 +516,8 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}        anchors.fill: parent`,
         bp ? `${i}        text: app.${bp}` : `${i}        text: '${escapeStr(node.text)}'`,
         `${i}        placeholderText: '${escapeStr(node.placeholder)}'`,
-        `${i}        readOnly: ${node.readOnly}`,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
+        `${i}        readOnly: ${safeBool(node.readOnly)}`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 14)}`,
         bp ? `${i}        onTextChanged: app.${bp} = text` : null,
         `${i}    }`,
       ];
@@ -517,8 +536,8 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}    CheckBox {`,
         `${i}        anchors.fill: parent`,
         `${i}        text: '${escapeStr(node.text)}'`,
-        bp ? `${i}        checked: app.${bp}` : `${i}        checked: ${node.checked}`,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
+        bp ? `${i}        checked: app.${bp}` : `${i}        checked: ${safeBool(node.checked)}`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 14)}`,
         bp ? `${i}        onCheckedChanged: app.${bp} = checked` : null,
         `${i}    }`,
       ];
@@ -537,8 +556,8 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}    Switch {`,
         `${i}        anchors.fill: parent`,
         `${i}        text: '${escapeStr(node.text)}'`,
-        bp ? `${i}        checked: app.${bp}` : `${i}        checked: ${node.checked}`,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
+        bp ? `${i}        checked: app.${bp}` : `${i}        checked: ${safeBool(node.checked)}`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 14)}`,
         bp ? `${i}        onCheckedChanged: app.${bp} = checked` : null,
         `${i}    }`,
       ];
@@ -556,10 +575,10 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
       const inner: (string | null)[] = [
         `${i}    Slider {`,
         `${i}        anchors.fill: parent`,
-        `${i}        from: ${node.from}`,
-        `${i}        to: ${node.to}`,
-        bp ? `${i}        value: app.${bp}` : `${i}        value: ${node.value}`,
-        `${i}        stepSize: ${node.stepSize}`,
+        `${i}        from: ${safeNum(node.from)}`,
+        `${i}        to: ${safeNum(node.to, 100)}`,
+        bp ? `${i}        value: app.${bp}` : `${i}        value: ${safeNum(node.value, 50)}`,
+        `${i}        stepSize: ${safeNum(node.stepSize, 1)}`,
         bp ? `${i}        onValueChanged: app.${bp} = value` : null,
         `${i}    }`,
       ];
@@ -576,10 +595,10 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
       const inner: string[] = [
         `${i}    ProgressBar {`,
         `${i}        anchors.fill: parent`,
-        `${i}        from: ${node.from}`,
-        `${i}        to: ${node.to}`,
-        `${i}        value: ${node.value}`,
-        `${i}        indeterminate: ${node.indeterminate}`,
+        `${i}        from: ${safeNum(node.from)}`,
+        `${i}        to: ${safeNum(node.to, 100)}`,
+        `${i}        value: ${safeNum(node.value, 50)}`,
+        `${i}        indeterminate: ${safeBool(node.indeterminate)}`,
         `${i}    }`,
       ];
       return [
@@ -599,8 +618,8 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}        anchors.fill: parent`,
         bp ? `${i}        text: app.${bp}` : `${i}        text: '${escapeStr(node.text)}'`,
         `${i}        placeholderText: '${escapeStr(node.placeholder)}'`,
-        `${i}        readOnly: ${node.readOnly}`,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
+        `${i}        readOnly: ${safeBool(node.readOnly)}`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 14)}`,
         `${i}        wrapMode: ${wrap}`,
         bp ? `${i}        onTextChanged: app.${bp} = text` : null,
         `${i}    }`,
@@ -619,8 +638,8 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}    RadioButton {`,
         `${i}        anchors.fill: parent`,
         `${i}        text: '${escapeStr(node.text)}'`,
-        `${i}        checked: ${node.checked}`,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
+        `${i}        checked: ${safeBool(node.checked)}`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 14)}`,
         `${i}    }`,
       ];
       return [
@@ -636,11 +655,11 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
       const inner: string[] = [
         `${i}    SpinBox {`,
         `${i}        anchors.fill: parent`,
-        `${i}        from: ${node.from}`,
-        `${i}        to: ${node.to}`,
-        `${i}        value: ${node.value}`,
-        `${i}        stepSize: ${node.stepSize}`,
-        `${i}        editable: ${node.editable}`,
+        `${i}        from: ${safeNum(node.from)}`,
+        `${i}        to: ${safeNum(node.to, 100)}`,
+        `${i}        value: ${safeNum(node.value)}`,
+        `${i}        stepSize: ${safeNum(node.stepSize, 1)}`,
+        `${i}        editable: ${safeBool(node.editable, true)}`,
         `${i}    }`,
       ];
       return [
@@ -656,7 +675,7 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
       const inner: string[] = [
         `${i}    BusyIndicator {`,
         `${i}        anchors.fill: parent`,
-        `${i}        running: ${node.running}`,
+        `${i}        running: ${safeBool(node.running, true)}`,
         `${i}    }`,
       ];
       return [
@@ -674,8 +693,8 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}    ComboBox {`,
         `${i}        anchors.fill: parent`,
         `${i}        model: [${items}]`,
-        `${i}        currentIndex: ${node.currentIndex}`,
-        `${i}        font.pixelSize: ${node.pixelSize}`,
+        `${i}        currentIndex: ${safeNum(node.currentIndex)}`,
+        `${i}        font.pixelSize: ${safeNum(node.pixelSize, 14)}`,
         `${i}    }`,
       ];
       return [
@@ -693,7 +712,7 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         `${i}        anchors.fill: parent`,
         `${i}        source: '${escapeStr(node.src)}'`,
         `${i}        fillMode: ${fitToQml(node.fit)}`,
-        `${i}        playing: ${node.playing}`,
+        `${i}        playing: ${safeBool(node.playing, true)}`,
         `${i}        clip: true`,
         `${i}    }`,
       ];
@@ -728,29 +747,29 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
         ? [
             `${i}            delegate: Rectangle {`,
             `${i}                color: '${escapeStr(node.itemBackgroundColor)}'`,
-            `${i}                radius: ${node.itemBorderRadius}`,
-            `${i}                width: _bubbleText.implicitWidth + ${node.itemPadding * 2}`,
-            `${i}                height: _bubbleText.implicitHeight + ${node.itemPadding * 2}`,
+            `${i}                radius: ${safeNum(node.itemBorderRadius)}`,
+            `${i}                width: _bubbleText.implicitWidth + ${safeNum(node.itemPadding) * 2}`,
+            `${i}                height: _bubbleText.implicitHeight + ${safeNum(node.itemPadding) * 2}`,
             `${i}                Text {`,
             `${i}                    id: _bubbleText`,
             `${i}                    anchors.centerIn: parent`,
             `${i}                    text: typeof modelData === "string" ? modelData : JSON.stringify(modelData)`,
-            `${i}                    font.pixelSize: ${node.itemPixelSize}`,
-            `${i}                    color: '${escapeStr(node.itemColor)}'`,
+            `${i}                    font.pixelSize: ${safeNum(node.itemPixelSize, 14)}`,
+            `${i}                    color: '${escapeStr(node.itemColor ?? "#1f2d3d")}'`,
             `${i}                }`,
             `${i}            }`,
           ]
         : [
             `${i}            delegate: Text {`,
             `${i}                text: typeof modelData === "string" ? modelData : JSON.stringify(modelData)`,
-            `${i}                font.pixelSize: ${node.itemPixelSize}`,
-            `${i}                color: '${escapeStr(node.itemColor)}'`,
+            `${i}                font.pixelSize: ${safeNum(node.itemPixelSize, 14)}`,
+            `${i}                color: '${escapeStr(node.itemColor ?? "#1f2d3d")}'`,
             `${i}            }`,
           ];
       const inner: string[] = [
         `${i}    ${layout} {`,
         `${i}        anchors.fill: parent`,
-        `${i}        spacing: ${node.gap}`,
+        `${i}        spacing: ${safeNum(node.gap, 6)}`,
         `${i}        Repeater {`,
         `${i}            model: ${modelExpr}`,
         ...delegateLines,
@@ -771,7 +790,7 @@ const emitNode = (node: Node, depth: number, ctx: EmitCtx): string => {
 // Render an action sequence as a single QML/JS statement block. Used for
 // both Button.onClick (a single action) and trigger handlers (a list).
 const actionBlockJs = (actions: ButtonAction[], ctx: EmitCtx): string => {
-  const stmts = actions.map((a) => onClickQml(a, ctx)).filter((s): s is string => !!s);
+  const stmts = (actions ?? []).map((a) => onClickQml(a, ctx)).filter((s): s is string => !!s);
   if (stmts.length === 0) return "";
   // Each statement gets its own line; semicolons separate them.
   return stmts.map((s) => `${s};`).join(" ");
@@ -820,7 +839,7 @@ const triggersQml = (
     );
     for (const topic of topics) {
       lines.push(
-        `${indent}        try { logos.callModule("${DELIVERY_RELAY_ID}", "subscribeToTopic", ["${escapeStr(topic)}"]); } catch(e) {}`,
+        `${indent}        try { logos.callModule("${DELIVERY_RELAY_ID}", "subscribeToTopic", ["${escapeDouble(topic)}"]); } catch(e) {}`,
       );
     }
     lines.push(`${indent}    }`);
@@ -840,7 +859,7 @@ const triggersQml = (
     const body = actionBlockJs(t.actions, ctx);
     lines.push(
       `${indent}    if (typeof logos !== "undefined" && logos.onModuleEvent) {`,
-      `${indent}        logos.onModuleEvent("${escapeStr(t.moduleId!)}", "${escapeStr(t.eventName!)}", function(data) {`,
+      `${indent}        logos.onModuleEvent("${escapeDouble(t.moduleId!)}", "${escapeDouble(t.eventName!)}", function(data) {`,
       `${indent}            ${body}`,
       `${indent}        });`,
       `${indent}    }`,
@@ -881,7 +900,7 @@ const triggersQml = (
       const filter = (typeof t.topic === "string" ? t.topic : "").trim();
       if (!body) continue;
       if (filter) {
-        lines.push(`${indent}            if (topic === "${escapeStr(filter)}") { ${body} }`);
+        lines.push(`${indent}            if (topic === "${escapeDouble(filter)}") { ${body} }`);
       } else {
         lines.push(`${indent}            ${body}`);
       }
@@ -1110,6 +1129,25 @@ export const emitMainQml = (app: AppState, forExport: boolean): string => {
   lines.push(`}`);
 
   const body = lines.join("\n");
+
+  // Post-emit safety net: verify braces and string literals are balanced.
+  // If the emitter produced broken QML (from bad AI data that slipped past
+  // schema validation), return a minimal safe fallback instead of poisoning
+  // the preview/export with a parse error.
+  if (!qmlStructuralCheck(body)) {
+    const fallback = `Rectangle { width: ${w}; height: ${h}; color: "#fff"\n` +
+      `    Text { anchors.centerIn: parent; text: "QML generation error — try regenerating"; color: "red" }\n` +
+      `}`;
+    if (!forExport) return fallback;
+    const imports = [
+      "import QtQuick 2.15",
+      "import QtQuick.Controls 2.15",
+      "import QtQuick.Layouts 1.15",
+      "",
+    ].join("\n");
+    return imports + "\n" + fallback + "\n";
+  }
+
   if (!forExport) return body;
   const imports = [
     "import QtQuick 2.15",
@@ -1118,4 +1156,41 @@ export const emitMainQml = (app: AppState, forExport: boolean): string => {
     "",
   ].join("\n");
   return imports + "\n" + body + "\n";
+};
+
+// Quick structural check: balanced braces and string literals. Does NOT
+// parse full QML — just catches the most common emitter bugs (unclosed
+// brace from a bad action block, broken string from unescaped quotes).
+// Returns true when the QML looks structurally sound.
+const qmlStructuralCheck = (qml: string): boolean => {
+  let braceDepth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  for (let i = 0; i < qml.length; i++) {
+    const ch = qml[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (inSingle) { if (ch === "'") inSingle = false; continue; }
+    if (inDouble) { if (ch === '"') inDouble = false; continue; }
+    // Skip // line comments — they contain English text with apostrophes
+    // (e.g. "doesn't") that would break string tracking.
+    if (ch === "/" && qml[i + 1] === "/") {
+      const nl = qml.indexOf("\n", i + 2);
+      i = nl === -1 ? qml.length : nl;
+      continue;
+    }
+    // Skip /* ... */ block comments (same reason as line comments).
+    if (ch === "/" && qml[i + 1] === "*") {
+      const end = qml.indexOf("*/", i + 2);
+      i = end === -1 ? qml.length : end + 1;
+      continue;
+    }
+    if (ch === "'") { inSingle = true; continue; }
+    if (ch === '"') { inDouble = true; continue; }
+    if (ch === "{") braceDepth++;
+    if (ch === "}") braceDepth--;
+    if (braceDepth < 0) return false;
+  }
+  return braceDepth === 0 && !inSingle && !inDouble;
 };

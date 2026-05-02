@@ -58,10 +58,10 @@ const normaliseSpec = (raw: CoreModuleSpec): CoreModuleSpec => ({
   dependencies: Array.isArray(raw.dependencies) ? raw.dependencies : [],
   methods: (Array.isArray(raw.methods) ? raw.methods : []).map((m) => ({
     ...m,
-    name: typeof m.name === "string" ? m.name : "unnamed",
+    name: (typeof m.name === "string" ? m.name : "unnamed").replace(/[^a-zA-Z0-9_]/g, "_"),
     args: Array.isArray(m.args) ? m.args.map((a) => ({
       ...a,
-      name: typeof a.name === "string" ? a.name : "arg",
+      name: (typeof a.name === "string" ? a.name : "arg").replace(/[^a-zA-Z0-9_]/g, "_"),
       type: typeof a.type === "string" ? a.type : "string" as const,
     })) : [],
     returns: typeof m.returns === "string" ? m.returns : "void" as const,
@@ -69,8 +69,9 @@ const normaliseSpec = (raw: CoreModuleSpec): CoreModuleSpec => ({
   })),
   state: (Array.isArray(raw.state) ? raw.state : []).map((s) => ({
     ...s,
-    name: typeof s.name === "string" ? s.name : "value",
-    cppType: typeof s.cppType === "string" ? s.cppType : "std::string",
+    name: (typeof s.name === "string" ? s.name : "value").replace(/[^a-zA-Z0-9_]/g, "_"),
+    cppType: typeof s.cppType === "string" && s.cppType.trim() ? s.cppType : "std::string",
+    initial: typeof s.initial === "string" ? s.initial : undefined,
   })),
   events: Array.isArray(raw.events) ? raw.events : [],
   tests: Array.isArray(raw.tests) ? raw.tests.map((t) => ({
@@ -140,18 +141,29 @@ interface QtFeature {
 }
 
 const QT_FEATURES: QtFeature[] = [
+  // Qt6::Network — the most common for API-fetching modules
   {
     pattern: /\bQNetwork(?:AccessManager|Request|Reply|Cookie|CookieJar)\b/,
     includes: ["QNetworkAccessManager", "QNetworkRequest", "QNetworkReply"],
     findPackage: "Qt6Network",
     linkLib: "Qt6::Network",
   },
+  // Qt6::Sql — for local database storage
+  {
+    pattern: /\bQSql(?:Database|Query|Error|Record|Field|Driver|Index|Result|TableModel|QueryModel|RelationalTableModel)?\b/,
+    includes: ["QSqlDatabase", "QSqlQuery", "QSqlError", "QSqlRecord"],
+    findPackage: "Qt6Sql",
+    linkLib: "Qt6::Sql",
+  },
+  // Qt6::Core classes (already linked, just need includes)
   {
     pattern: /\bQJson(?:Document|Object|Array|Value|ParseError)\b/,
     includes: ["QJsonDocument", "QJsonObject", "QJsonArray", "QJsonValue", "QJsonParseError"],
   },
   { pattern: /\bQTimer\b/,            includes: ["QTimer"] },
   { pattern: /\bQDateTime\b/,         includes: ["QDateTime"] },
+  { pattern: /\bQDate\b/,             includes: ["QDate"] },
+  { pattern: /\bQTime\b(?!\s*:)/,     includes: ["QTime"] },
   { pattern: /\bQUrl(?:Query)?\b/,    includes: ["QUrl", "QUrlQuery"] },
   { pattern: /\bQByteArray\b/,        includes: ["QByteArray"] },
   { pattern: /\bQString(?:List)?\b/,  includes: ["QString", "QStringList"] },
@@ -160,11 +172,30 @@ const QT_FEATURES: QtFeature[] = [
   { pattern: /\bQVariant\b/,          includes: ["QVariant"] },
   { pattern: /\bQObject\b/,           includes: ["QObject"] },
   { pattern: /\bqDebug\b|\bqWarning\b|\bqInfo\b/, includes: ["QDebug"] },
+  { pattern: /\bQFile\b/,             includes: ["QFile"] },
+  { pattern: /\bQDir\b/,              includes: ["QDir"] },
+  { pattern: /\bQTextStream\b/,       includes: ["QTextStream"] },
+  { pattern: /\bQIODevice\b/,         includes: ["QIODevice"] },
+  { pattern: /\bQRegularExpression\b/, includes: ["QRegularExpression"] },
+  { pattern: /\bQCryptographicHash\b/, includes: ["QCryptographicHash"] },
+  { pattern: /\bQRandomGenerator\b/,  includes: ["QRandomGenerator"] },
+  { pattern: /\bQUuid\b/,             includes: ["QUuid"] },
+  { pattern: /\bQElapsedTimer\b/,     includes: ["QElapsedTimer"] },
+  { pattern: /\bQStandardPaths\b/,    includes: ["QStandardPaths"] },
+  { pattern: /\bQSettings\b/,         includes: ["QSettings"] },
+  { pattern: /\bQProcess\b/,          includes: ["QProcess"] },
+  { pattern: /\bQThread\b/,           includes: ["QThread"] },
+  { pattern: /\bQMutex\b/,            includes: ["QMutex"] },
+  { pattern: /\bQEventLoop\b/,        includes: ["QEventLoop"] },
+  { pattern: /\bQCoreApplication\b/,  includes: ["QCoreApplication"] },
 ];
 
 // Non-Qt feature detection: nlohmann::json aliases (LogosMap / LogosList).
 // The generator maps these to QVariantMap / QVariantList in the dispatch
 // glue — lets methods return structured payloads natively.
+// IMPORTANT: logos_json.h includes <nlohmann/json.hpp> which is NOT bundled
+// with the logos-cpp-sdk — it must be added to nix.packages.build in
+// metadata.json so mkLogosModule resolves it from nixpkgs.
 const detectLogosJson = (corpus: string): boolean =>
   /\bLogos(?:Map|List)\b/.test(corpus);
 
@@ -206,8 +237,12 @@ const detectQtNeeds = (spec: CoreModuleSpec): DetectedQtNeeds => {
 };
 
 // True when the spec uses LogosMap/LogosList anywhere — used to inject
-// the <logos_json.h> include in the impl.cpp.
+// the <logos_json.h> include + nlohmann-json build dependency.
+// Also true when the module declares events, because the emitEvent
+// callback signature uses LogosList.
 const usesLogosJson = (spec: CoreModuleSpec): boolean => {
+  // Events use LogosList in the emitEvent callback signature
+  if ((spec.events ?? []).length > 0) return true;
   const corpus = [
     ...spec.methods.map((m) => m.body ?? ""),
     ...spec.methods.map((m) => m.cppReturn ?? ""),
@@ -233,6 +268,24 @@ const usesLogosJson = (spec: CoreModuleSpec): boolean => {
 const metadataJson = (spec: CoreModuleSpec): string => {
   const id = sanitiseId(spec.id);
   const detected = detectQtNeeds(spec);
+  const wantsLogosJson = usesLogosJson(spec);
+
+  // When LogosMap/LogosList is used, nlohmann-json must be available at
+  // build time. logos_json.h includes <nlohmann/json.hpp> which isn't
+  // bundled with the logos-cpp-sdk. The correct way to supply it is via
+  // nix.packages.build — mkLogosModule maps these strings to nixpkgs
+  // packages (e.g. pkgs.nlohmann_json) and adds them to nativeBuildInputs.
+  // NOTE: nix.external_libraries is for flake-input-based bundled libs
+  // (like .so/.dylib in lib/), NOT for nixpkgs packages.
+  const buildPkgs: string[] = [];
+  const findPkgs = [...detected.findPackages];
+  const linkLibs = [...detected.linkLibs];
+  if (wantsLogosJson) {
+    buildPkgs.push("nlohmann_json");
+    findPkgs.push("nlohmann_json");
+    linkLibs.push("nlohmann_json::nlohmann_json");
+  }
+
   return JSON.stringify({
     name: id,
     version: spec.version || "1.0.0",
@@ -249,13 +302,13 @@ const metadataJson = (spec: CoreModuleSpec): string => {
     include: [],
     capabilities: [],
     nix: {
-      packages: { build: [], runtime: [] },
+      packages: { build: buildPkgs, runtime: [] },
       external_libraries: [],
       cmake: {
-        find_packages: detected.findPackages,
+        find_packages: findPkgs,
         extra_sources: [],
         extra_include_dirs: [],
-        extra_link_libraries: detected.linkLibs,
+        extra_link_libraries: linkLibs,
       },
     },
   }, null, 2) + "\n";
@@ -279,7 +332,7 @@ const flakeNix = (spec: CoreModuleSpec): string => {
   }
   return [
     `{`,
-    `  description = "${spec.description ? spec.description.replace(/[\\"]/g, "\\$&") : spec.name || id}";`,
+    `  description = "${(spec.description || spec.name || id).replace(/[\\"]/g, "\\$&").replace(/\$/g, "\\$")}";`,
     ``,
     `  inputs = {`,
     `    logos-module-builder.url = "github:logos-co/logos-module-builder";`,
@@ -527,8 +580,9 @@ const implCpp = (spec: CoreModuleSpec): string => {
           `class ${cls}::Private {`,
           `public:`,
           ...spec.state.map((s) => {
+            const safeName = (s.name || "value").replace(/[^a-zA-Z0-9_]/g, "_");
             const init = s.initial ? `{ ${s.initial} }` : "";
-            return `    ${s.cppType} m_${s.name}${init};`;
+            return `    ${s.cppType || "std::string"} m_${safeName}${init};`;
           }),
           `};`,
           ``,
