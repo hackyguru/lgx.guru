@@ -35,7 +35,7 @@ import {
   type ProjectMeta,
 } from "./lib/projects";
 import { suggestKickoffMethod, wireLiveData, type LiveDataSpec } from "./lib/wireLiveData";
-import { Sun, Moon, CircleHalf, Trash } from "@phosphor-icons/react";
+import { Sun, Moon, CircleHalf, Trash, Code } from "@phosphor-icons/react";
 
 // Renderer iframe URL — same-origin static files. Next.js serves them
 // from `web/public/renderer/` with the COOP/COEP headers configured in
@@ -1384,15 +1384,26 @@ export default function BuilderClient() {
   // Returns the new variable's id so callers (e.g. the inline "+ new"
   // button in the setVariable action picker) can wire it up immediately
   // without a render round-trip.
-  const addVariable = (preferName?: string): VariableId => {
+  //
+  // Accepts either a bare name (legacy callers in the action pickers) or a
+  // full config (the New Variable modal) — the modal sets type + initial
+  // up front so users don't have to inline-edit a freshly-created row.
+  const addVariable = (
+    input?: string | { name?: string; type?: VariableType; initial?: string },
+  ): VariableId => {
+    const cfg = typeof input === "string" ? { name: input } : input ?? {};
     const used = new Set(app.variables.map((v) => v.name));
-    let name = preferName?.trim() || "var";
+    let name = cfg.name?.trim() || "var";
     if (used.has(name)) {
       let n = 1;
       while (used.has(`${name}${n}`)) n++;
       name = `${name}${n}`;
     }
-    const v = newVariable(name);
+    const v: Variable = {
+      ...newVariable(name),
+      ...(cfg.type ? { type: cfg.type } : {}),
+      ...(cfg.initial !== undefined ? { initial: cfg.initial } : {}),
+    };
     dispatch({
       type: "commit",
       app: { ...app, variables: [...app.variables, v] },
@@ -1451,36 +1462,50 @@ export default function BuilderClient() {
   // for Button.onClick. When a trigger has multiple actions they run
   // sequentially.
 
-  const addTrigger = (kind: TriggerKind) => {
-    const t = newTrigger(kind);
+  // Accepts either a bare kind (legacy callers) or a full config (the New
+  // Trigger modal) so users can fill in topic / interval / event up front.
+  const addTrigger = (
+    input: TriggerKind | {
+      kind: TriggerKind;
+      intervalMs?: number;
+      topic?: string;
+      moduleId?: string;
+      eventName?: string;
+    },
+  ) => {
+    const cfg = typeof input === "string" ? { kind: input } : input;
+    const t = newTrigger(cfg.kind);
     let extraVars: Variable[] = [];
-    if (kind === "moduleEvent") {
+    if (cfg.kind === "moduleEvent") {
+      if (cfg.moduleId) t.moduleId = cfg.moduleId;
+      if (cfg.eventName) t.eventName = cfg.eventName;
       // Default to the first enabled module + its first event so the
-      // dropdowns aren't blank.
-      const mod = app.modules.map(findModuleSpec).find((m) => m && (m.events?.length ?? 0) > 0);
-      if (mod) {
-        t.moduleId = mod.id;
-        t.eventName = mod.events?.[0]?.name;
+      // dropdowns aren't blank when the modal didn't pre-pick something.
+      if (!t.moduleId || !t.eventName) {
+        const mod = app.modules.map(findModuleSpec).find((m) => m && (m.events?.length ?? 0) > 0);
+        if (mod) {
+          if (!t.moduleId) t.moduleId = mod.id;
+          if (!t.eventName) t.eventName = mod.events?.[0]?.name;
+        }
       }
-    } else if (kind === "onMessageReceived") {
+    } else if (cfg.kind === "onMessageReceived") {
       // Sensible default topic so the editor renders something readable;
       // the user is expected to overwrite this with their app's topic.
-      t.topic = "/myapp/1/messages/json";
-      // Pre-populate a working setup so "+ message" results in something
-      // that already works instead of a hollow trigger that the user then
-      // has to wire up. Auto-create a `lastMessage` variable + a default
-      // action that captures the incoming payload into it. The user can
-      // bind a Text widget to var_lastMessage and immediately see receives;
-      // they're free to delete / rename / customize from there.
+      t.topic = cfg.topic?.trim() || "/myapp/1/messages/json";
+      // Pre-populate a working setup so a fresh onMessageReceived trigger
+      // already does something instead of being a hollow shell. Auto-create
+      // a `lastMessage` variable + a default action that captures the
+      // incoming payload into it. User can bind a Text widget to it and
+      // immediately see receives; rename / delete from there.
       const v: Variable = { id: newId(), name: "lastMessage", type: "string", initial: "(none yet)" };
       extraVars = [v];
       t.actions = [
         { kind: "setVariable", varId: v.id, value: "payload", mode: "expression" } as ButtonAction,
       ];
-    } else if (kind === "interval") {
+    } else if (cfg.kind === "interval") {
       // 1s default cadence — slow enough that an empty trigger isn't a
       // CPU drain, fast enough that a stopwatch-style display feels alive.
-      t.intervalMs = 1000;
+      t.intervalMs = cfg.intervalMs && cfg.intervalMs > 0 ? cfg.intervalMs : 1000;
     }
     dispatch({
       type: "commit",
@@ -2263,6 +2288,20 @@ export default function BuilderClient() {
   const [askAIOpen, setAskAIOpen] = useState(false);
   const [aiHistory, setAiHistory] = useState<AIHistoryEntry[]>([]);
   const [moduleDetail, setModuleDetail] = useState<ModuleInfo | null>(null);
+  // New-variable / new-trigger modals. Replaces the previous inline + buttons
+  // that created with defaults — users now fill in the relevant fields up
+  // front and the freshly-created row already reflects their intent.
+  const [newVarOpen, setNewVarOpen] = useState(false);
+  const [newTrigOpen, setNewTrigOpen] = useState(false);
+  // Read-only viewer for the generated QML. Pulled out of the inspector
+  // (where it was an inline <details>) so the inspector stays focused on
+  // editing the selected node and the QML view has room to breathe.
+  const [qmlOpen, setQmlOpen] = useState(false);
+  // Read-only viewer for the user's custom backend's C++ source bundle —
+  // every file generateCoreModuleFiles emits (impl.h/impl.cpp, flake.nix,
+  // tests, etc.). Same intent as the QML modal: keep the inspector clean
+  // while still letting the user peek at what gets shipped.
+  const [coreSrcOpen, setCoreSrcOpen] = useState(false);
   const [exportUi, setExportUi] = useState(true);
   const [exportCore, setExportCore] = useState(false);
   const [exportRelay, setExportRelay] = useState(false);
@@ -2567,7 +2606,7 @@ export default function BuilderClient() {
           <button
             className="ml-1.5 rounded-pill gradient-accent px-4 py-1 text-xs font-medium text-white shadow-sm transition-opacity hover:opacity-90"
             onClick={() => setExportOpen(true)}
-          >Export…</button>
+          >Export</button>
         </div>
       </header>
 
@@ -2626,7 +2665,7 @@ export default function BuilderClient() {
               <>
                 <VariablesPanel
                   variables={app.variables}
-                  onAdd={addVariable}
+                  onAdd={() => setNewVarOpen(true)}
                   onUpdate={updateVariable}
                   onDelete={deleteVariable}
                 />
@@ -2636,7 +2675,7 @@ export default function BuilderClient() {
                   variables={app.variables}
                   enabledModuleIds={app.modules}
                   coreModule={app.coreModule}
-                  onAdd={addTrigger}
+                  onAdd={() => setNewTrigOpen(true)}
                   onUpdate={updateTrigger}
                   onDelete={deleteTrigger}
                   onAddAction={addTriggerAction}
@@ -2967,23 +3006,28 @@ export default function BuilderClient() {
               onWireLiveData={handleWireLiveData}
             />
           ) : null}
-          <details className="mt-6">
-            <summary className="cursor-pointer text-xs font-semibold uppercase text-ink-muted dark:text-ink-muted">
-              Generated QML
-            </summary>
-            {/*
-              The generated QML embeds page-id-derived nav keys; ids are
-              made with Date.now() so server and client diverge. Marking the
-              <pre> as hydration-safe lets React swap to the client value
-              silently instead of throwing a mismatch.
-            */}
-            <pre
-              suppressHydrationWarning
-              className="mt-2 max-h-64 overflow-auto rounded bg-surface-warm p-2 text-[10px] leading-tight text-ink-muted"
+          {/* Generated source viewers — open in modals rather than expanding
+              inline, so the inspector stays focused on editing. Both are
+              advanced/diagnostic; most users never need them. The C++
+              button only renders when there's actually a custom backend. */}
+          <div className="mt-6 flex flex-col gap-2">
+            <button
+              onClick={() => setQmlOpen(true)}
+              className="flex w-full items-center justify-center gap-2 rounded-pill border border-border-subtle bg-canvas px-3 py-2 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
             >
-              {qmlExport}
-            </pre>
-          </details>
+              <Code size={14} weight="duotone" />
+              View generated QML
+            </button>
+            {hasCoreModule && (
+              <button
+                onClick={() => setCoreSrcOpen(true)}
+                className="flex w-full items-center justify-center gap-2 rounded-pill border border-border-subtle bg-canvas px-3 py-2 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+              >
+                <Code size={14} weight="duotone" />
+                View module C++ source
+              </button>
+            )}
+          </div>
         </aside>
       </div>
 
@@ -3294,6 +3338,54 @@ cp result/${app.coreModule!.id}.lgx ~/Desktop/`}</pre>
       <ModuleDetailModal
         info={moduleDetail}
         onClose={() => setModuleDetail(null)}
+      />
+
+      <NewVariableModal
+        open={newVarOpen}
+        existingNames={app.variables.map((v) => v.name)}
+        onClose={() => setNewVarOpen(false)}
+        onCreate={(cfg) => {
+          addVariable(cfg);
+          setNewVarOpen(false);
+        }}
+      />
+
+      <GeneratedQmlModal
+        open={qmlOpen}
+        qml={qmlExport}
+        onClose={() => setQmlOpen(false)}
+      />
+
+      <CoreModuleSourceModal
+        open={coreSrcOpen}
+        spec={app.coreModule ?? null}
+        onClose={() => setCoreSrcOpen(false)}
+      />
+
+      <NewTriggerModal
+        open={newTrigOpen}
+        enabledModules={[
+          ...app.modules
+            .map((id) => findModuleSpec(id))
+            .filter((m): m is ModuleSpec => m !== undefined),
+          ...(app.coreModule
+            ? [{
+                id: app.coreModule.id,
+                name: `${app.coreModule.name || app.coreModule.id} (this project)`,
+                description: app.coreModule.description || "Your project's own backend module.",
+                methods: app.coreModule.methods.map((m) => ({
+                  name: m.name, args: m.args,
+                  returns: m.returns, description: m.description,
+                })),
+                events: app.coreModule.events ?? [],
+              }]
+            : []),
+        ]}
+        onClose={() => setNewTrigOpen(false)}
+        onCreate={(cfg) => {
+          addTrigger(cfg);
+          setNewTrigOpen(false);
+        }}
       />
 
       <AskAIModal
@@ -5792,7 +5884,7 @@ function TriggersPanel({
   variables: Variable[];
   enabledModuleIds: ModuleId[];
   coreModule: CoreModuleSpec | undefined;
-  onAdd: (kind: TriggerKind) => void;
+  onAdd: () => void;
   onUpdate: (id: TriggerId, patch: Partial<Trigger>) => void;
   onDelete: (id: TriggerId) => void;
   onAddAction: (id: TriggerId) => void;
@@ -5822,39 +5914,18 @@ function TriggersPanel({
       title="Triggers"
       defaultOpen={triggers.length > 0}
       badge={triggers.length > 0 ? triggers.length : undefined}
+      headerRight={
+        <button
+          onClick={onAdd}
+          className="flex h-5 w-5 items-center justify-center rounded border border-border-soft text-xs leading-none text-ink-muted hover:bg-surface-cool"
+          title="Add a new trigger"
+        >+</button>
+      }
     >
-      {/* Action buttons live below the title on their own row so they always
-          fit the column width and stay aligned even when labels grow. */}
-      <div className="mb-2 flex items-center gap-1">
-        <button
-          onClick={() => onAdd("appStart")}
-          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
-          title="Run actions when the widget loads"
-        >+ load</button>
-        <button
-          onClick={() => onAdd("interval")}
-          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
-          title="Run actions every N milliseconds while the widget is open (polling, stopwatch tick, etc.)"
-        >+ tick</button>
-        <button
-          onClick={() => onAdd("onMessageReceived")}
-          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool"
-          title="Run actions when a message arrives on a content topic"
-        >+ message</button>
-        <button
-          onClick={() => onAdd("moduleEvent")}
-          disabled={enabledModules.every((m) => (m.events?.length ?? 0) === 0)}
-          className="flex-1 rounded border border-border-soft px-1 py-0.5 text-[10px] text-ink-muted hover:bg-surface-cool disabled:opacity-40"
-          title="Advanced: run actions when a module emits a raw event"
-        >+ event</button>
-      </div>
-      <p className="mb-2 text-[10px] leading-tight text-ink-muted">
-        React to widget load, incoming messages, or raw module events.
-      </p>
       <div className="flex flex-col gap-2">
         {triggers.length === 0 && (
           <p className="text-[10px] leading-tight text-ink-muted">
-            No triggers yet. Add &quot;on load&quot; for setup, or &quot;on message&quot; to react to incoming messages.
+            No triggers yet. React to widget load, intervals, incoming messages, or module events — click + to add one.
           </p>
         )}
         {triggers.map((t) => (
@@ -6703,4 +6774,663 @@ function LayersPanel({
   renderRow(root, 0);
 
   return <div className="text-xs">{rows}</div>;
+}
+
+// ── New Variable modal ─────────────────────────────────────────────────────
+//
+// Replaces the previous inline "+" → blank row → user retypes flow. Lets
+// the user pick name + type + initial value up front so the freshly
+// created variable already reflects their intent and doesn't need
+// inline-editing afterward. Submits via onCreate({ name, type, initial }).
+
+function NewVariableModal({
+  open,
+  existingNames,
+  onClose,
+  onCreate,
+}: {
+  open: boolean;
+  existingNames: string[];
+  onClose: () => void;
+  onCreate: (cfg: { name: string; type: VariableType; initial: string }) => void;
+}) {
+  const [name, setName] = useState("");
+  const [type, setType] = useState<VariableType>("string");
+  const [initial, setInitial] = useState("");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // Reset on each open so the modal feels fresh; auto-focus the name input
+  // for keyboard-first creation.
+  useEffect(() => {
+    if (!open) return;
+    setName("");
+    setType("string");
+    setInitial("");
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }, [open]);
+
+  // Escape closes (no backdrop-click for forms — too easy to lose work).
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const trimmed = name.trim();
+  const collides = trimmed.length > 0 && existingNames.includes(trimmed);
+  const valid = !collides; // Empty name is fine — addVariable picks a default.
+
+  const submit = () => {
+    if (!valid) return;
+    // Coerce booleans to a literal so the value is unambiguous downstream.
+    const init = type === "boolean"
+      ? (initial === "true" ? "true" : "false")
+      : initial;
+    onCreate({ name: trimmed, type, initial: init });
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <form
+        onSubmit={(e) => { e.preventDefault(); submit(); }}
+        className="flex w-full max-w-[420px] flex-col overflow-hidden rounded-card-lg border border-border-subtle bg-canvas shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="New variable"
+      >
+        <header className="flex items-start justify-between gap-4 border-b border-border-subtle px-6 py-5">
+          <h2 className="font-display text-[18px] font-medium leading-[1.15] tracking-tight text-ink">
+            New variable
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="-mt-1 -mr-1 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+          >×</button>
+        </header>
+
+        <div className="space-y-4 px-6 py-5">
+          <div>
+            <label htmlFor="newvar-name" className="eyebrow">Name</label>
+            <input
+              id="newvar-name"
+              ref={inputRef}
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="counter, lastMessage, isReady"
+              className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 font-mono text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none"
+            />
+            {collides && (
+              <p className="mt-1 text-[11px] text-danger">
+                A variable named <span className="font-mono">{trimmed}</span> already exists.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <p className="eyebrow">Type</p>
+            <div className="mt-1.5 grid grid-cols-3 gap-2">
+              {(["string", "number", "boolean"] as VariableType[]).map((t) => (
+                <label
+                  key={t}
+                  className={`flex cursor-pointer items-center justify-center rounded-control border px-2 py-1.5 text-[12px] font-medium transition-colors ${
+                    type === t
+                      ? "border-accent bg-canvas text-ink"
+                      : "border-border-subtle bg-canvas text-ink-muted hover:border-border-soft hover:text-ink"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="newvar-type"
+                    value={t}
+                    checked={type === t}
+                    onChange={() => setType(t)}
+                    className="sr-only"
+                  />
+                  {t}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="newvar-initial" className="eyebrow">Initial value</label>
+            {type === "boolean" ? (
+              <select
+                id="newvar-initial"
+                value={initial === "true" ? "true" : "false"}
+                onChange={(e) => setInitial(e.target.value)}
+                className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 text-[12px] text-ink focus:border-accent focus:outline-none"
+              >
+                <option value="false">false</option>
+                <option value="true">true</option>
+              </select>
+            ) : (
+              <input
+                id="newvar-initial"
+                type={type === "number" ? "number" : "text"}
+                value={initial}
+                onChange={(e) => setInitial(e.target.value)}
+                placeholder={type === "number" ? "0" : "(empty)"}
+                className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none"
+              />
+            )}
+          </div>
+        </div>
+
+        <footer className="flex items-center justify-end gap-2 border-t border-border-subtle px-6 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-pill border border-border-soft bg-canvas px-4 py-1.5 text-[12px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+          >Cancel</button>
+          <button
+            type="submit"
+            disabled={!valid}
+            className="rounded-pill bg-action px-5 py-1.5 text-[12px] font-medium text-action-on transition-opacity hover:opacity-90 disabled:opacity-40"
+          >Create</button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+// ── New Trigger modal ──────────────────────────────────────────────────────
+//
+// Replaces the previous inline 4-button row (+ load / + tick / + message /
+// + event) with a single dedicated modal that picks the kind via radio
+// cards and surfaces the kind-specific config (interval ms, topic, module
+// + event) up front. Submits via onCreate({ kind, ...kindFields }).
+
+const TRIGGER_KIND_OPTIONS: { kind: TriggerKind; label: string; description: string }[] = [
+  { kind: "appStart",          label: "When the widget loads",   description: "Run once at startup. Use for initial fetches or setup." },
+  { kind: "interval",          label: "Every N milliseconds",    description: "Polling, stopwatch ticks, periodic UI refreshes." },
+  { kind: "onMessageReceived", label: "When a message arrives",  description: "React to incoming delivery_module messages on a topic." },
+  { kind: "moduleEvent",       label: "When a module emits an event", description: "Advanced — react to a module's raw event stream." },
+];
+
+function NewTriggerModal({
+  open,
+  enabledModules,
+  onClose,
+  onCreate,
+}: {
+  open: boolean;
+  enabledModules: ModuleSpec[];
+  onClose: () => void;
+  onCreate: (cfg: {
+    kind: TriggerKind;
+    intervalMs?: number;
+    topic?: string;
+    moduleId?: string;
+    eventName?: string;
+  }) => void;
+}) {
+  const [kind, setKind] = useState<TriggerKind>("appStart");
+  const [intervalMs, setIntervalMs] = useState(1000);
+  const [topic, setTopic] = useState("/myapp/1/messages/json");
+  const [moduleId, setModuleId] = useState("");
+  const [eventName, setEventName] = useState("");
+
+  const modulesWithEvents = enabledModules.filter((m) => (m.events?.length ?? 0) > 0);
+
+  useEffect(() => {
+    if (!open) return;
+    setKind("appStart");
+    setIntervalMs(1000);
+    setTopic("/myapp/1/messages/json");
+    // Pre-pick the first module/event so the moduleEvent kind isn't blank.
+    const firstMod = modulesWithEvents[0];
+    setModuleId(firstMod?.id ?? "");
+    setEventName(firstMod?.events?.[0]?.name ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const moduleEventBlocked = kind === "moduleEvent" && modulesWithEvents.length === 0;
+  const intervalInvalid = kind === "interval" && (!Number.isFinite(intervalMs) || intervalMs <= 0);
+  const valid = !moduleEventBlocked && !intervalInvalid;
+
+  const submit = () => {
+    if (!valid) return;
+    if (kind === "interval") onCreate({ kind, intervalMs });
+    else if (kind === "onMessageReceived") onCreate({ kind, topic: topic.trim() });
+    else if (kind === "moduleEvent") onCreate({ kind, moduleId, eventName });
+    else onCreate({ kind });
+  };
+
+  // Fetch event list for the currently-selected module so the event picker
+  // populates correctly.
+  const selectedModule = modulesWithEvents.find((m) => m.id === moduleId);
+  const events = selectedModule?.events ?? [];
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <form
+        onSubmit={(e) => { e.preventDefault(); submit(); }}
+        className="flex max-h-[90vh] w-full max-w-[480px] flex-col overflow-hidden rounded-card-lg border border-border-subtle bg-canvas shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="New trigger"
+      >
+        <header className="flex items-start justify-between gap-4 border-b border-border-subtle px-6 py-5">
+          <h2 className="font-display text-[18px] font-medium leading-[1.15] tracking-tight text-ink">
+            New trigger
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="-mt-1 -mr-1 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+          >×</button>
+        </header>
+
+        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+          <div>
+            <p className="eyebrow">When should it fire?</p>
+            <div className="mt-2 space-y-2">
+              {TRIGGER_KIND_OPTIONS.map((opt) => {
+                const blocked = opt.kind === "moduleEvent" && modulesWithEvents.length === 0;
+                return (
+                  <label
+                    key={opt.kind}
+                    className={`flex cursor-pointer items-start gap-3 rounded-card border p-3 transition-colors ${
+                      kind === opt.kind
+                        ? "border-accent bg-canvas"
+                        : "border-border-subtle bg-canvas hover:border-border-soft"
+                    } ${blocked ? "cursor-not-allowed opacity-50" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="newtrig-kind"
+                      value={opt.kind}
+                      checked={kind === opt.kind}
+                      onChange={() => setKind(opt.kind)}
+                      disabled={blocked}
+                      className="mt-0.5 h-3.5 w-3.5 accent-ink"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[12px] font-medium text-ink">{opt.label}</div>
+                      <p className="mt-0.5 text-[11px] leading-snug text-ink-muted">{opt.description}</p>
+                      {blocked && (
+                        <p className="mt-1 text-[10px] text-warning">
+                          No installed module exposes events. Add a module from the Modules tab first.
+                        </p>
+                      )}
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Kind-specific fields */}
+          {kind === "interval" && (
+            <div>
+              <label htmlFor="newtrig-interval" className="eyebrow">Interval (milliseconds)</label>
+              <input
+                id="newtrig-interval"
+                type="number"
+                min={1}
+                value={intervalMs}
+                onChange={(e) => setIntervalMs(Number(e.target.value))}
+                className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+              />
+              <p className="mt-1 text-[11px] leading-snug text-ink-muted">
+                1000 = once a second. 100 ms is fine for stopwatch-style ticks; faster than that wastes CPU.
+              </p>
+            </div>
+          )}
+
+          {kind === "onMessageReceived" && (
+            <div>
+              <label htmlFor="newtrig-topic" className="eyebrow">Topic</label>
+              <input
+                id="newtrig-topic"
+                type="text"
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                placeholder="/myapp/1/messages/json"
+                className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 font-mono text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none"
+              />
+              <p className="mt-1 text-[11px] leading-snug text-ink-muted">
+                A <span className="font-mono">lastMessage</span> variable + a default capture action will be created automatically.
+              </p>
+            </div>
+          )}
+
+          {kind === "moduleEvent" && modulesWithEvents.length > 0 && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="newtrig-module" className="eyebrow">Module</label>
+                <select
+                  id="newtrig-module"
+                  value={moduleId}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setModuleId(next);
+                    const m = modulesWithEvents.find((mm) => mm.id === next);
+                    setEventName(m?.events?.[0]?.name ?? "");
+                  }}
+                  className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-2 py-2 text-[12px] text-ink focus:border-accent focus:outline-none"
+                >
+                  {modulesWithEvents.map((m) => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="newtrig-event" className="eyebrow">Event</label>
+                <select
+                  id="newtrig-event"
+                  value={eventName}
+                  onChange={(e) => setEventName(e.target.value)}
+                  className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-2 py-2 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+                >
+                  {events.map((ev) => (
+                    <option key={ev.name} value={ev.name}>{ev.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <footer className="flex items-center justify-end gap-2 border-t border-border-subtle px-6 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-pill border border-border-soft bg-canvas px-4 py-1.5 text-[12px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+          >Cancel</button>
+          <button
+            type="submit"
+            disabled={!valid}
+            className="rounded-pill bg-action px-5 py-1.5 text-[12px] font-medium text-action-on transition-opacity hover:opacity-90 disabled:opacity-40"
+          >Create</button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+// ── Generated QML modal ────────────────────────────────────────────────────
+//
+// Read-only viewer for the QML emitted from the current AppState. Pulled
+// out of the inspector's inline <details> so the QML has room to breathe
+// (~820px wide, mono font, generous line-height) and the inspector stays
+// focused on editing the selected node. Includes Copy-to-clipboard since
+// copying the QML for debugging or pasting in a question is the #1 reason
+// to look at it.
+
+function GeneratedQmlModal({
+  open,
+  qml,
+  onClose,
+}: {
+  open: boolean;
+  qml: string;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open) setCopied(false);
+  }, [open]);
+
+  if (!open) return null;
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(qml);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API may be blocked in sandboxed contexts; silent no-op.
+    }
+  };
+
+  const lineCount = qml.split("\n").length;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[90vh] w-full max-w-[820px] flex-col overflow-hidden rounded-card-lg border border-border-subtle bg-canvas shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="Generated QML"
+      >
+        <header className="flex items-start justify-between gap-4 border-b border-border-subtle px-6 py-5">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <h2 className="font-display text-[18px] font-medium leading-[1.15] tracking-tight text-ink">
+                Generated QML
+              </h2>
+              <span className="font-mono text-[11px] text-ink-muted">{lineCount} lines</span>
+            </div>
+            <p className="mt-1 text-[12px] leading-snug text-ink-muted">
+              Read-only preview of the QML emitted from this project — same source the renderer iframe runs.
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={handleCopy}
+              className="rounded-pill border border-border-soft bg-canvas px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+            >
+              {copied ? "Copied ✓" : "Copy"}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="-mt-1 -mr-1 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+            >×</button>
+          </div>
+        </header>
+
+        <div className="flex-1 overflow-hidden p-4">
+          {/* The generated QML embeds page-id-derived nav keys; ids come
+              from Date.now() so server and client diverge.
+              suppressHydrationWarning lets React keep the client value
+              silently instead of throwing a mismatch on first paint. */}
+          <pre
+            suppressHydrationWarning
+            className="h-full overflow-auto rounded-card bg-surface-warm p-4 font-mono text-[11px] leading-relaxed text-ink"
+          >
+            {qml}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Core module source modal ───────────────────────────────────────────────
+//
+// Read-only viewer for the full source bundle generateCoreModuleFiles emits
+// for the user's custom backend — impl.h / impl.cpp, flake.nix, CMakeLists,
+// tests, README, etc. Two-pane: file picker on the left, source viewer on
+// the right. Same design language as GeneratedQmlModal; wider (920px) and
+// taller because the bundle has multiple files and code lines run long.
+// Files are generated lazily inside useMemo so we only pay the codegen
+// cost when the modal opens with a new spec.
+
+function CoreModuleSourceModal({
+  open,
+  spec,
+  onClose,
+}: {
+  open: boolean;
+  spec: CoreModuleSpec | null;
+  onClose: () => void;
+}) {
+  const files = useMemo(
+    () => (spec ? generateCoreModuleFiles(spec) : []),
+    [spec],
+  );
+  const [activePath, setActivePath] = useState<string>("");
+  const [copied, setCopied] = useState(false);
+
+  // Pick a sensible default file when the modal opens — prefer the impl.cpp
+  // (where the user's logic actually lives), fall back to the first file.
+  useEffect(() => {
+    if (!open) return;
+    setCopied(false);
+    if (files.length === 0) return;
+    const impl = files.find((f) => f.path.endsWith("_impl.cpp"));
+    setActivePath((prev) => (prev && files.some((f) => f.path === prev)) ? prev : (impl?.path ?? files[0].path));
+  }, [open, files]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open || !spec) return null;
+
+  const decoder = new TextDecoder();
+  const active = files.find((f) => f.path === activePath) ?? files[0];
+  const activeText = active ? decoder.decode(active.data) : "";
+  const lineCount = activeText ? activeText.split("\n").length : 0;
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(activeText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API can be blocked in sandboxed contexts; silent no-op.
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex h-[90vh] w-full max-w-[920px] flex-col overflow-hidden rounded-card-lg border border-border-subtle bg-canvas shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="Module C++ source"
+      >
+        <header className="flex items-start justify-between gap-4 border-b border-border-subtle px-6 py-5">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <h2 className="font-display text-[18px] font-medium leading-[1.15] tracking-tight text-ink">
+                Module source
+              </h2>
+              <span className="font-mono text-[11px] text-ink-muted">{spec.id}</span>
+              <span className="rounded-pill bg-surface-cool px-2 py-0.5 text-[10px] font-medium text-ink-muted">
+                {files.length} file{files.length === 1 ? "" : "s"}
+              </span>
+            </div>
+            <p className="mt-1 text-[12px] leading-snug text-ink-muted">
+              Read-only preview of every file the codegen emits for this backend — same bundle the export and GitHub-build paths ship.
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={handleCopy}
+              disabled={!active}
+              className="rounded-pill border border-border-soft bg-canvas px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink disabled:opacity-40"
+              title={active ? `Copy ${active.path} to clipboard` : "No file selected"}
+            >
+              {copied ? "Copied ✓" : "Copy file"}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="-mt-1 -mr-1 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+            >×</button>
+          </div>
+        </header>
+
+        <div className="flex flex-1 min-h-0">
+          {/* File picker — sidebar style. Mono path so it reads as a tree;
+              active row gets the warm surface treatment so the selection
+              is visible at a glance. */}
+          <nav
+            aria-label="Source files"
+            className="w-56 shrink-0 overflow-y-auto border-r border-border-subtle bg-canvas py-2"
+          >
+            <ul className="flex flex-col gap-0.5 px-2">
+              {files.map((f) => {
+                const isActive = f.path === activePath;
+                const sizeKb = (f.data.byteLength / 1024).toFixed(1);
+                return (
+                  <li key={f.path}>
+                    <button
+                      type="button"
+                      onClick={() => setActivePath(f.path)}
+                      className={`block w-full rounded-control px-2 py-1.5 text-left transition-colors ${
+                        isActive
+                          ? "bg-surface-warm text-ink"
+                          : "text-ink-muted hover:bg-surface-warm hover:text-ink"
+                      }`}
+                    >
+                      <div className="font-mono text-[11px] leading-tight break-all">
+                        {f.path}
+                      </div>
+                      <div className="mt-0.5 text-[10px] text-ink-muted">
+                        {sizeKb} KB
+                      </div>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </nav>
+
+          {/* Source viewer — flex-1 fills the remaining space. */}
+          <div className="flex-1 min-w-0 overflow-hidden p-4">
+            <pre
+              suppressHydrationWarning
+              className="h-full overflow-auto rounded-card bg-surface-warm p-4 font-mono text-[11px] leading-relaxed text-ink"
+            >
+              {activeText}
+            </pre>
+            {active && (
+              <p className="mt-2 text-right font-mono text-[10px] text-ink-muted">
+                {lineCount} lines
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }

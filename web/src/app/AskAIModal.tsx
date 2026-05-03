@@ -185,7 +185,15 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
         {/* Header */}
         <header className="flex items-center justify-between border-b border-border-subtle px-4 py-3">
           <div className="min-w-0 flex-1">
-            <div className="font-display text-[15px] font-medium tracking-tight text-ink">Ask AI</div>
+            {/* Vibecode wordmark in place of "Ask AI" text. dark:invert
+                mirrors the lgx-logo treatment so the wordmark flips
+                cleanly between light and dark modes. */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="/vibecode.svg"
+              alt="Vibecode"
+              className="h-5 dark:invert"
+            />
           </div>
           <div className="flex items-center gap-1.5">
             {history.length > 0 && (

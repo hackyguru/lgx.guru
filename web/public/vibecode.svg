@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 185 31.3">
+<!-- SVG created with Arrow, by QuiverAI (https://quiver.ai) -->
+  <!-- Pure black-and-white palette: white fill, black stroke. With
+       `dark:invert` on the consuming <img> the mark flips to black fill
+       / white stroke in dark mode — clean monochrome, no chromatic
+       artifacts (the original yellow inverted to blue, which broke the
+       brand pairing with /lgx-logo.svg). -->
+  <style type="text/css">.cls-0 {fill:#FFFFFF;stroke:#000000;stroke-width:2;stroke-miterlimit:10;}</style>
+  <path class="cls-0" d="m2 9.5 7.2-0.9v11.9l5.1-0.5v-10.6l8-0.9v12.9l-5.3 0.5v6.5l-10 1v-6.3l-5 0.4v-14z"/>
+  <path class="cls-0" d="m25.6 3.7 7.9-1.1v5.6l-7.9 0.7v-5.2zm0.1 7.2 7.7-0.7v18.4l-7.7 0.8v-18.5z"/>
+  <path class="cls-0" d="m36.9 3.1 8.2-1.1v7.2l7.8-0.8v2.1l6-0.6v16l-5.4 0.5v2l-11.1 1v-1.8l-5.5 0.4v-24.9zm8.2 20.6 5.7-0.6v-8.2l-5.7 0.5v8.3z"/>
+  <path class="cls-0" d="m62.4 11.9 6.2-0.6v-1.8l9.3-0.9v1.9l6-0.6v16.3l-5.3 0.6v1.6l-10.8 1v-2l-5.4 0.4v-15.9zm7.8 3.1v2.4l6.1-0.5v-2.4l-6.1 0.5zm0 7.1v2.2l6.1-0.6v-1.1l7.4-0.7v-1.7l-13.5 1.3v0.6z"/>
+  <path class="cls-0" d="m87.3 11.9 6.1-0.6v-1.8l9.2-0.9v2l6.2-0.6v5.9l-8.3 1v-2l-5.2 0.5v8.3l5.2-0.5v-1.8l8.2-0.8v5.2l-5.5 0.6v2l-10.5 1v-1.8l-5.4 0.4v-16.1z"/>
+  <path class="cls-0" d="m112.4 11.9 6-0.6v-1.8l9.4-0.9v2l6.3-0.6v15.8l-5.5 0.6v2l-10.9 1v-2l-5.3 0.4v-15.9zm7.7 3.5v8.3l5.8-0.6v-8.2l-5.8 0.5z"/>
+  <path class="cls-0" d="m151.4 3.1 8.1-1v23.8l-5.6 0.5v2l-10.7 1v-2l-5.6 0.4v-15.9l6.3-0.6v-1.8l7.5-0.7v-5.7zm-6 12.3v8.3l5.8-0.6v-8.2l-5.8 0.5z"/>
+  <path class="cls-0" d="m163 11.9 5.8-0.6v-1.8l8.8-0.9v1.9l5.3-0.5v16.3l-4.6 0.4v1.7l-10.2 1v-2l-5.1 0.4v-15.9zm7.4 3.5v2l5.7-0.5v-2.1l-5.7 0.6zm0 6.8v2.1l5.7-0.4v-1.3l6.8-0.7v-1.7l-12.5 1.3v0.7z"/>
+</svg>
