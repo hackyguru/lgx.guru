@@ -2955,32 +2955,31 @@ export default function BuilderClient() {
                 </div>
               </label>
 
-              <label
-                className={`flex items-start gap-2 rounded border p-2 ${
-                  deliveryNeedsRelay
-                    ? "border-warning bg-warning-bg cursor-pointer hover:bg-warning-bg/80"
-                    : "border-border-subtle cursor-pointer hover:bg-surface-warm"
-                }`}
-              >
-                <input
-                  type="checkbox"
-                  checked={exportRelay || deliveryNeedsRelay}
-                  disabled={deliveryNeedsRelay}
-                  onChange={(e) => setExportRelay(e.target.checked)}
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div>
-                  <div className="text-xs font-semibold text-ink">
-                    <span className="font-mono">delivery_relay.lgx</span> (pre-built, ready to install){" "}
-                    {deliveryNeedsRelay && (
+              {/* Relay is only shown when the project actually uses
+                  delivery (sendMessage actions or onMessageReceived
+                  triggers — see usesDelivery in qmlEmit.ts). Projects
+                  that don't use it shouldn't see an unrelated checkbox
+                  cluttering the export dialog. When shown it's always
+                  required + force-checked, so we drop the optional path. */}
+              {deliveryNeedsRelay && (
+                <label className="flex items-start gap-2 rounded border border-warning bg-warning-bg p-2 cursor-pointer hover:bg-warning-bg/80">
+                  <input
+                    type="checkbox"
+                    checked
+                    disabled
+                    className="mt-0.5 h-4 w-4"
+                  />
+                  <div>
+                    <div className="text-xs font-semibold text-ink">
+                      <span className="font-mono">delivery_relay.lgx</span> (pre-built, ready to install){" "}
                       <span className="ml-1 rounded bg-warning-bg dark:bg-warning-bg px-1 py-0.5 text-[9px] font-mono text-warning">required</span>
-                    )}
+                    </div>
+                    <div className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
+                      Bundled C++ relay that owns <span className="font-mono">delivery_module</span>&apos;s lifecycle and exposes <span className="font-mono">sendMessage</span> / <span className="font-mono">subscribeToTopic</span> / <span className="font-mono">takeRecentMessages</span> to widgets. Same file for every project — install once per Basecamp; reuse across all your delivery widgets.
+                    </div>
                   </div>
-                  <div className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
-                    Bundled C++ relay that owns <span className="font-mono">delivery_module</span>&apos;s lifecycle and exposes <span className="font-mono">sendMessage</span> / <span className="font-mono">subscribeToTopic</span> / <span className="font-mono">takeRecentMessages</span> to widgets. Same file for every project — install once per Basecamp; reuse across all your delivery widgets.
-                  </div>
-                </div>
-              </label>
+                </label>
+              )}
 
               {/* Custom backend block. UI plugins above are platform-
                   independent QML, but core modules ship native code so

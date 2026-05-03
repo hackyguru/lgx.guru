@@ -84,6 +84,25 @@ function lintBodies(spec: CoreModuleSpec): string[] {
         `Move cross-module orchestration to the UI layer (callModule actions on buttons, moduleEvent triggers) instead.`
       );
     }
+    // Bare `m_<field>` access (not via `d->`) is the #1 self-inflicted
+    // build failure: every state field lives in the Private pimpl, and
+    // the impl class itself has no `m_X` members. Catch lines like
+    // `m_count = 0` or `if (m_fetching)` — but allow `d->m_X` and
+    // declarations like `int m_count = 0` (no, that pattern is illegal
+    // inside a method body for our pimpl, so flagging is correct).
+    {
+      const bareM = /(?<!->\s*)(?<!::)(?<!\.)\bm_[a-zA-Z_][a-zA-Z0-9_]*\b/g;
+      const matches = new Set<string>();
+      let mm: RegExpExecArray | null;
+      while ((mm = bareM.exec(body)) !== null) matches.add(mm[0]);
+      if (matches.size > 0) {
+        issues.push(
+          `Method ${m.name}: accesses ${[...matches].slice(0, 3).join(", ")}${matches.size > 3 ? ", …" : ""} directly, ` +
+          `but state lives in the Private pimpl on the .cpp side. Use \`d->m_<name>\` for every field — e.g. \`d->m_count\` not \`m_count\`. ` +
+          `The impl class has no \`m_X\` members of its own.`
+        );
+      }
+    }
     if (/\bLogosAPI\b/.test(body) || /\bLogosResult\b/.test(body)) {
       issues.push(
         `Method ${m.name}: references LogosAPI/LogosResult. The LogosAPI surface isn't exposed in lgx.guru-built modules. ` +
@@ -225,23 +244,23 @@ async function buildCoreModuleLocal(spec: CoreModuleSpec): Promise<BuildResult> 
   const compileMs = Date.now() - startedAt;
 
   if (code !== 0) {
-    return { ok: false, phase: "compile", errors: parseCompileErrors(stderr), stderrTail: tail(stderr, 40), durationMs: compileMs };
+    return { ok: false, phase: "compile", errors: parseCompileErrors(stderr), stderrTail: tail(stderr, 80), durationMs: compileMs };
   }
 
   const storePath = stdout.trim().split("\n").filter(Boolean)[0];
   if (!storePath) {
-    return { ok: false, phase: "compile", errors: ["nix build returned no output path"], stderrTail: tail(stderr, 40), durationMs: compileMs };
+    return { ok: false, phase: "compile", errors: ["nix build returned no output path"], stderrTail: tail(stderr, 80), durationMs: compileMs };
   }
 
   let entries: string[];
   try {
     entries = await readdir(storePath);
   } catch (err) {
-    return { ok: false, phase: "compile", errors: [`could not read build output ${storePath}: ${(err as Error).message}`], stderrTail: tail(stderr, 40), durationMs: compileMs };
+    return { ok: false, phase: "compile", errors: [`could not read build output ${storePath}: ${(err as Error).message}`], stderrTail: tail(stderr, 80), durationMs: compileMs };
   }
   const lgx = entries.find((f) => f.endsWith(".lgx"));
   if (!lgx) {
-    return { ok: false, phase: "compile", errors: [`no .lgx artifact in build output (saw: ${entries.join(", ") || "empty"})`], stderrTail: tail(stderr, 40), durationMs: compileMs };
+    return { ok: false, phase: "compile", errors: [`no .lgx artifact in build output (saw: ${entries.join(", ") || "empty"})`], stderrTail: tail(stderr, 80), durationMs: compileMs };
   }
 
   // Copy out so a future nix-store --gc doesn't reclaim the artifact and
@@ -349,22 +368,39 @@ function runNixBuild(dir: string, target: string): Promise<{ code: number; stdou
   });
 }
 
-// Pull `error: ...` lines out of nix/cmake/g++ stderr. Compilers vary in
-// shape but all use `error:` so this catches the common surface cleanly.
-// Falls back to the last 30 lines if no obvious error markers exist.
+// Pull `error: ...` lines out of nix/cmake/g++ stderr WITH enough trailing
+// context that the AI can actually fix the issue. The error itself is one
+// line ("no member named X"), but the relevant context — the source snippet
+// the carat (^~~~) points at, and any "note: expanded from macro …" lines —
+// follows it. Without that, the AI was retrying blind on macro-only output.
+// Each error block now includes:
+//   - 1 line of pre-context (file path / line / col, if any)
+//   - the `error:` line
+//   - up to 12 lines of post-context, terminated when we hit another
+//     `error:` / `warning:` / blank-blank gap / hard cap
 function parseCompileErrors(stderr: string): string[] {
   const lines = stderr.split("\n");
   const out: string[] = [];
+  const POST_LIMIT = 12;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!/error:/i.test(line)) continue;
-    // Include the previous line if it looks like a compiler source-pointer
-    // (the pre-error line typically carries line/column context).
     const prev = i > 0 ? lines[i - 1] : "";
-    const ctx = prev && !/^\s*$/.test(prev) ? `${prev}\n` : "";
-    out.push(`${ctx}${line}`);
+    const pre = prev && !/^\s*$/.test(prev) ? `${prev}\n` : "";
+
+    const post: string[] = [];
+    for (let j = i + 1; j < lines.length && post.length < POST_LIMIT; j++) {
+      const next = lines[j];
+      // New diagnostic boundary — stop. Don't double-count the next error;
+      // the outer loop will pick it up.
+      if (/^[^\s].*error:/i.test(next) || /^[^\s].*warning:/i.test(next)) break;
+      // Two consecutive blanks → end of this diagnostic's context block.
+      if (next === "" && lines[j - 1] === "") break;
+      post.push(next);
+    }
+    out.push(`${pre}${line}${post.length > 0 ? "\n" + post.join("\n") : ""}`);
   }
-  return out.length > 0 ? out : [tail(stderr, 30)];
+  return out.length > 0 ? out : [tail(stderr, 60)];
 }
 
 function tail(s: string, n: number): string {

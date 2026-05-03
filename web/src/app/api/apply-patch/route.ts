@@ -628,7 +628,11 @@ export async function POST(request: NextRequest) {
   const MAX_ITER = 5;
   // Build retries (per build_backend_module call). Bounded inside the
   // build branch — distinct from MAX_ITER, which counts whole turns.
-  const MAX_BUILD_RETRIES = 3;
+  // Each retry is 30s–10min of nix wallclock, so this isn't free, but the
+  // most common shape of failure is "AI gets the diagnostic wrong on the
+  // first try and needs another shot." Empirically attempts 4–6 still
+  // converge on tricky modules (network fetch, JSON parsing).
+  const MAX_BUILD_RETRIES = 6;
 
   // Sanitize the incoming app state — client-side data may have stale or
   // missing fields. The Zod schema coerces to safe defaults.

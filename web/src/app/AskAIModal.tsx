@@ -84,6 +84,19 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
     onClose();
   };
 
+  // Escape closes the panel. Without a backdrop to click on, this is the
+  // keyboard-only escape hatch.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // close is stable enough — re-evaluating only on open/pending toggle
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, pending]);
+
   const ask = async () => {
     const trimmed = prompt.trim();
     if (trimmed.length < 3 || pending) return;
@@ -161,14 +174,14 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
   ];
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-canvas/40 px-4 dark:bg-black/60"
-      onClick={close}
+    // Right-edge slide-over panel. No backdrop — the canvas + inspector
+    // stay visible and interactive while the user iterates with AI. Closes
+    // via the X button or Escape key (see effect above).
+    <aside
+      role="dialog"
+      aria-label="Ask AI"
+      className="fixed inset-y-0 right-0 z-50 flex w-[min(420px,92vw)] flex-col overflow-hidden border-l border-border-subtle bg-canvas shadow-2xl"
     >
-      <div
-        className="flex max-h-[85vh] w-full max-w-160 flex-col overflow-hidden rounded-lg border border-border-subtle bg-canvas shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
         {/* Header */}
         <header className="flex items-center justify-between border-b border-border-subtle px-4 py-3">
           <div className="min-w-0 flex-1">
@@ -199,8 +212,9 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
           </div>
         </header>
 
-        {/* Scrollable conversation area */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3" style={{ minHeight: "200px", maxHeight: "calc(85vh - 160px)" }}>
+        {/* Scrollable conversation area — flex-1 fills the full panel
+            height between header and footer. */}
+        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3">
           {/* Empty state with examples */}
           {isEmpty && (
             <div className="space-y-3">
@@ -309,11 +323,10 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
             </button>
           </div>
           <div className="mt-1 text-[10px] text-ink-muted">
-            {pending ? "Cmd-Z reverts applied changes." : "Cmd/Ctrl+Enter to send."}
+            {pending ? "Cmd-Z reverts applied changes." : "Cmd/Ctrl+Enter to send. Esc closes."}
           </div>
         </footer>
-      </div>
-    </div>
+    </aside>
   );
 }
 

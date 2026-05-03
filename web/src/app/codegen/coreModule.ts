@@ -580,9 +580,16 @@ const implCpp = (spec: CoreModuleSpec): string => {
           `class ${cls}::Private {`,
           `public:`,
           ...spec.state.map((s) => {
-            const safeName = (s.name || "value").replace(/[^a-zA-Z0-9_]/g, "_");
+            // Normalize field names: the AI sometimes returns "m_foo" and
+            // sometimes "foo", but its method bodies always reference
+            // `d->m_foo`. Strip a leading m_ before re-prepending so the
+            // declaration is always `m_<stem>` and matches the body — this
+            // prevents "no member named 'm_foo'; did you mean 'm_m_foo'?"
+            // build failures that used to cost full multi-minute cycles.
+            const raw = (s.name || "value").replace(/[^a-zA-Z0-9_]/g, "_");
+            const stem = raw.replace(/^m_+/, "") || "value";
             const init = s.initial ? `{ ${s.initial} }` : "";
-            return `    ${s.cppType || "std::string"} m_${safeName}${init};`;
+            return `    ${s.cppType || "std::string"} m_${stem}${init};`;
           }),
           `};`,
           ``,

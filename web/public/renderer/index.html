@@ -15,7 +15,12 @@
     </style>
   </head>
   <body>
-    <div id="spinner">Loading Qt-WASM renderer…</div>
+    <!-- Empty by default — the parent app (BuilderClient/RendererStatus)
+         overlays its own LGX-branded loading UI on top of this iframe, so
+         showing text here would collide with the logo. The error/exit
+         paths below populate this div with a message when something goes
+         wrong; an empty spinner is invisible. -->
+    <div id="spinner"></div>
     <div id="screen"></div>
 
     <script src="qml-renderer.js"></script>
