@@ -185,17 +185,14 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
         {/* Header */}
         <header className="flex items-center justify-between border-b border-border-subtle px-4 py-3">
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-semibold text-ink">Ask AI</div>
-            <div className="text-[11px] text-ink-muted">
-              Describe changes in plain English. History is kept so you can track every change.
-            </div>
+            <div className="font-display text-[15px] font-medium tracking-tight text-ink">Ask AI</div>
           </div>
           <div className="flex items-center gap-1.5">
             {history.length > 0 && (
               <button
                 onClick={() => onHistory([])}
                 disabled={!!pending}
-                className="rounded px-2 py-1 text-[10px] text-ink-muted hover:bg-surface-cool hover:text-ink disabled:opacity-30"
+                className="rounded-pill px-2.5 py-1 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink disabled:opacity-30"
                 title="Clear history"
               >
                 Clear
@@ -204,10 +201,10 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
             <button
               onClick={close}
               disabled={!!pending}
-              className="-mr-1 rounded p-1 text-ink-muted hover:bg-surface-cool hover:text-ink-muted disabled:opacity-30 dark:hover:text-ink"
+              className="-mr-1 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink disabled:opacity-30"
               aria-label="Close"
             >
-              x
+              ×
             </button>
           </div>
         </header>
@@ -217,20 +214,18 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
         <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3">
           {/* Empty state with examples */}
           {isEmpty && (
-            <div className="space-y-3">
-              <div className="py-4 text-center text-[11px] text-ink-muted">
+            <div className="space-y-4">
+              <div className="py-4 text-center text-[12px] leading-snug text-ink-muted">
                 No changes yet. Ask AI to modify your app.
               </div>
               <div>
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-ink-muted">
-                  Examples
-                </div>
-                <ul className="mt-1 space-y-1">
+                <p className="eyebrow">Examples</p>
+                <ul className="mt-2 space-y-1.5">
                   {examples.map((ex) => (
                     <li key={ex}>
                       <button
                         onClick={() => setPrompt(ex)}
-                        className="w-full rounded border border-border-subtle px-2 py-1.5 text-left text-[11px] leading-snug text-ink-muted hover:border-border-soft hover:bg-surface-warm dark:hover:border-border-soft"
+                        className="w-full rounded-control border border-border-subtle bg-canvas px-3 py-2 text-left text-[12px] leading-snug text-ink-muted transition-colors hover:border-border-soft hover:bg-surface-warm hover:text-ink"
                       >
                         {ex}
                       </button>
@@ -312,12 +307,12 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
               rows={2}
               placeholder={pending ? "Waiting for response..." : "What should change?"}
               disabled={!!pending}
-              className="flex-1 resize-none rounded border border-border-soft bg-canvas px-3 py-2 text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none disabled:opacity-50 dark:placeholder:text-ink-muted"
+              className="flex-1 resize-none rounded-control border border-border-soft bg-canvas px-3 py-2 text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none disabled:opacity-50"
             />
             <button
               onClick={ask}
               disabled={prompt.trim().length < 3 || !!pending}
-              className="self-end rounded gradient-accent px-3 py-2 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
+              className="rounded-pill gradient-accent px-4 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
             >
               {pending ? "..." : "Send"}
             </button>

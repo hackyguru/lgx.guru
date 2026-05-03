@@ -227,3 +227,43 @@ code, kbd, samp, pre {
   letter-spacing: -0.03em;
   font-weight: 500;
 }
+
+/* ── Scrollbars ────────────────────────────────────────────────────────────
+   Match the design vocab: thin, transparent track, subtle thumb in
+   border-soft tone that lifts to ink-muted on hover. Driven through the
+   --color-* custom properties so dark mode flips automatically. We apply
+   it globally because the editor has many overflow-y panels (sidebars,
+   inspector, AI sidebar, modal bodies) and a cohesive treatment beats the
+   default chrome scrollbar showing up in some places and not others. */
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-soft) transparent;
+}
+
+/* WebKit / Chromium / Safari */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-border-soft);
+  border-radius: 9999px;
+  /* The transparent border + background-clip combo is the standard trick
+     for an inset thumb — gives the appearance of margin around the thumb
+     without it actually overlapping the track. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background-color 120ms ease;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-muted);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}

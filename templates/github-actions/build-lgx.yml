@@ -132,6 +132,21 @@ jobs:
           node tools/merge-lgx.mjs variants/ build/merged.lgx
           ls -lh build/
 
+      # Pick up any prebuilt cross-platform UI .lgx the editor pushed under
+      # prebuilt/ (the QML widget is built in-browser, doesn't need a runner)
+      # and ship it in the same release. End users get both halves of the
+      # widget — the platform-independent UI and the per-OS backend — from
+      # one Releases page instead of round-tripping through the editor.
+      - name: Include prebuilt UI .lgx (if any)
+        run: |
+          if compgen -G "prebuilt/*.lgx" > /dev/null; then
+            cp prebuilt/*.lgx build/
+            echo "Included prebuilt UI artifacts:"
+            ls -lh build/
+          else
+            echo "No prebuilt artifacts to include"
+          fi
+
       - name: Upload merged artifact (run-scoped, downloadable for ~90 days)
         uses: actions/upload-artifact@v4
         with:
@@ -144,7 +159,11 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: build-${{ github.run_number }}
-          files: build/merged.lgx
+          # Glob picks up the merged backend AND any prebuilt UI .lgx the
+          # editor pushed. The workflow still fails if the merged file is
+          # missing because the build job's matrix is the only source of
+          # the backend, and that's the must-have artifact.
+          files: build/*.lgx
           prerelease: false
           fail_on_unmatched_files: true
         env:

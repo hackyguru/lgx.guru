@@ -333,10 +333,22 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ── Public entry point ────────────────────────────────────────────────────
 
+export interface PushExtras {
+  // Prebuilt artifacts to ship alongside the backend build in the GitHub
+  // release. Each is uploaded under `prebuilt/<basename>` in the repo;
+  // the workflow's merge job copies them into build/ before the release
+  // step so they appear as release assets next to the merged backend lgx.
+  // Today this carries the cross-platform UI .lgx the editor builds in
+  // the browser — putting it in the same release means whoever clones
+  // the build doesn't need to round-trip through the editor for the UI.
+  prebuiltAssets?: { filename: string; data: Uint8Array }[];
+}
+
 export async function pushAndBuild(
   cfg: GitHubConfig,
   files: CodegenFile[],
   onProgress?: ProgressFn,
+  extras: PushExtras = {},
 ): Promise<Blob> {
   // Validate config early so the caller sees a clear error rather than
   // an opaque GitHub 401 down the line.
@@ -355,6 +367,10 @@ export async function pushAndBuild(
     ...files.map((f) => ({ path: f.path, data: f.data })),
     { path: ".github/workflows/build-lgx.yml", data: enc.encode(BUILD_LGX_YML) },
     { path: "tools/merge-lgx.mjs",              data: enc.encode(MERGE_LGX_MJS) },
+    ...(extras.prebuiltAssets ?? []).map((a) => ({
+      path: `prebuilt/${a.filename}`,
+      data: a.data,
+    })),
   ];
 
   // Cancel any stale runs before pushing new files.

@@ -124,7 +124,7 @@ export function RendererStatus({
   if (status.kind === "ready") return null;
 
   const wrap =
-    "absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-surface-warm/95/95 px-6 text-center";
+    "absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-surface-warm/95 px-6 text-center";
 
   if (status.kind === "checking") {
     return (
@@ -137,7 +137,7 @@ export function RendererStatus({
   if (status.kind === "unsupported") {
     return (
       <div className={wrap}>
-        <div className="text-sm font-semibold text-ink-muted">
+        <div className="font-display text-[18px] font-medium tracking-tight text-ink">
           Live preview unavailable
         </div>
         <ul className="max-w-md list-disc pl-4 text-left text-xs text-ink-muted marker:text-ink-muted">
@@ -170,16 +170,16 @@ export function RendererStatus({
   if (status.kind === "timeout") {
     return (
       <div className={wrap}>
-        <div className="text-sm font-semibold text-warning dark:text-warning">
+        <div className="font-display text-[18px] font-medium tracking-tight text-warning">
           Renderer is taking longer than expected
         </div>
-        <div className="max-w-sm text-[11px] text-ink-muted">
+        <div className="max-w-sm text-[12px] leading-snug text-ink-muted">
           The renderer didn&apos;t finish loading in 60 seconds. This can happen on
           slow connections or if the Qt-WASM build is unreachable.
         </div>
         <button
           onClick={onRetry}
-          className="mt-1 rounded border border-border-soft bg-canvas px-2 py-1 text-xs text-ink-muted hover:bg-surface-warm"
+          className="mt-1 rounded-pill border border-border-soft bg-canvas px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
         >
           Reload renderer
         </button>
@@ -190,18 +190,18 @@ export function RendererStatus({
   // error
   return (
     <div className={wrap}>
-      <div className="text-sm font-semibold text-danger dark:text-danger">
+      <div className="font-display text-[18px] font-medium tracking-tight text-danger">
         Renderer failed to load
       </div>
-      <div className="max-w-sm text-[11px] text-ink-muted">
+      <div className="max-w-sm text-[12px] leading-snug text-ink-muted">
         {status.message}
       </div>
-      <div className="max-w-sm break-all text-[10px] text-ink-muted">
+      <div className="max-w-sm break-all font-mono text-[10px] text-ink-muted">
         {url}
       </div>
       <button
         onClick={onRetry}
-        className="mt-1 rounded border border-border-soft bg-canvas px-2 py-1 text-xs text-ink-muted hover:bg-surface-warm"
+        className="mt-1 rounded-pill border border-border-soft bg-canvas px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
       >
         Reload renderer
       </button>

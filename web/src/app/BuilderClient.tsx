@@ -35,7 +35,7 @@ import {
   type ProjectMeta,
 } from "./lib/projects";
 import { suggestKickoffMethod, wireLiveData, type LiveDataSpec } from "./lib/wireLiveData";
-import { Sun, Moon, CircleHalf } from "@phosphor-icons/react";
+import { Sun, Moon, CircleHalf, Trash } from "@phosphor-icons/react";
 
 // Renderer iframe URL — same-origin static files. Next.js serves them
 // from `web/public/renderer/` with the COOP/COEP headers configured in
@@ -458,6 +458,21 @@ const saveToStorage = (projectId: string, s: SaveState) => {
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export default function BuilderClient() {
+  // SSR/hydration gate. The reducer below seeds AppState through newApp(),
+  // which calls newId() — and newId() bakes Date.now() into every id. That
+  // means the server's lazy-init AppState carries different ids than the
+  // client's, so any DOM attribute derived from app state mismatches at
+  // hydration time. React 19 surfaces this as the "tree hydrated but some
+  // attributes ... didn't match the client" warning.
+  //
+  // Fix: render a deterministic placeholder until after first mount, then
+  // swap in the real editor. The hooks below all still run during SSR and
+  // first commit (so hook ordering stays valid), but the JSX they produce
+  // isn't rendered until mounted=true — which only flips inside useEffect,
+  // i.e. after hydration completes. No mismatch possible.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+
   // First render must produce identical HTML on the server and the client
   // for hydration to succeed. We initialise from defaults and apply any
   // localStorage-restored snapshot in a post-mount effect below.
@@ -2123,7 +2138,10 @@ export default function BuilderClient() {
   const hasCoreModule = !!app.coreModule && app.coreModule.id.trim().length > 0;
 
   // ── Export: UI plugin (.lgx) ─────────────────────────────────────────────
-  const handleExportUi = async () => {
+  // Builds the UI .lgx in-memory and returns the blob + filename. Factored
+  // out of handleExportUi so the GitHub-build path can grab the same bytes
+  // and ship them as a release asset alongside the multi-arch backend lgx.
+  const buildUiLgxBlob = async (): Promise<{ blob: Blob; filename: string }> => {
     const name = sanitizeName(moduleMeta.name) || "my_widget";
 
     // Collect every Image node's data URL across every page, write each to
@@ -2184,10 +2202,15 @@ export default function BuilderClient() {
       extraFiles: allExtras,
       dependencies: uiDeps,
     });
-    const url = URL.createObjectURL(result.blob);
+    return { blob: result.blob, filename: result.filename };
+  };
+
+  const handleExportUi = async () => {
+    const { blob, filename } = await buildUiLgxBlob();
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = result.filename;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -2302,10 +2325,25 @@ export default function BuilderClient() {
         setBuilding(true);
         try {
           const files = generateCoreModuleFiles(app.coreModule!);
+
+          // If the user also wants the UI in this build, build the UI .lgx
+          // in-browser and ship it as a prebuilt release asset. The workflow's
+          // merge job picks it up out of prebuilt/ and attaches it to the
+          // release alongside the multi-arch backend lgx — so anyone grabbing
+          // the release gets both halves of the widget without re-opening the
+          // editor.
+          const prebuiltAssets: { filename: string; data: Uint8Array }[] = [];
+          if (exportUi) {
+            const ui = await buildUiLgxBlob();
+            const uiBytes = new Uint8Array(await ui.blob.arrayBuffer());
+            prebuiltAssets.push({ filename: ui.filename, data: uiBytes });
+          }
+
           const lgx = await pushAndBuild(
             ghSettings,
             files,
             (phase) => setBuildProgress(phase),
+            { prebuiltAssets },
           );
           // Save the multi-arch .lgx the workflow returned.
           const id = app.coreModule!.id || "my_module";
@@ -2345,6 +2383,34 @@ export default function BuilderClient() {
   const canUndo = hist.past.length > 0;
   const canRedo = hist.future.length > 0;
 
+  // SSR / pre-hydration: render a deterministic spinner. See comment on
+  // `mounted` at the top of this component. All hooks above ran already,
+  // so hook ordering across renders stays consistent.
+  if (!mounted) {
+    return (
+      <div
+        className="flex h-screen items-center justify-center bg-canvas"
+        role="status"
+        aria-label="Loading editor"
+      >
+        <svg
+          className="h-7 w-7 animate-spin text-ink-muted"
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" opacity="0.2" />
+          <path
+            d="M22 12a10 10 0 0 1-10 10"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+          />
+        </svg>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen flex-col bg-surface-warm text-ink">
       <header className="flex h-12 items-center justify-between border-b border-border-subtle bg-canvas px-4">
@@ -2368,11 +2434,11 @@ export default function BuilderClient() {
                   window.location.assign("/dashboard");
                 }}
                 title="Back to all projects"
-                className="ml-1 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-normal text-ink-muted transition-colors hover:bg-surface-cool hover:text-ink dark:text-ink-muted"
+                className="ml-1 flex items-center gap-1 rounded-pill px-2 py-0.5 text-[11px] font-normal text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
               >
                 Projects
               </a>
-              <span className="text-ink-muted dark:text-ink-muted">/</span>
+              <span className="text-ink-muted">/</span>
               <button
                 onClick={() => {
                   const next = window.prompt("Rename project", activeProject.name);
@@ -2383,7 +2449,7 @@ export default function BuilderClient() {
                   setActiveProject({ ...activeProject, name: trimmed });
                 }}
                 title="Click to rename"
-                className="min-w-0 truncate rounded px-1.5 py-0.5 text-ink transition-colors hover:bg-surface-cool"
+                className="min-w-0 truncate rounded-pill px-2 py-0.5 text-ink transition-colors hover:bg-surface-warm"
               >
                 {activeProject.name}
               </button>
@@ -2394,17 +2460,17 @@ export default function BuilderClient() {
           {/* Primary AI action — distinct accent so it stands out */}
           <button
             onClick={() => setAskAIOpen(true)}
-            className="rounded-md gradient-accent px-2.5 py-1 text-xs font-medium text-white transition-opacity hover:opacity-90"
+            className="rounded-pill gradient-accent px-3 py-1 text-xs font-medium text-white transition-opacity hover:opacity-90"
             title="Describe a change in plain English; AI wires it up (variables, triggers, bindings)."
           >Ask AI</button>
 
           {/* Templates dropdown */}
           <div className="relative">
             <button
-              className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
+              className={`rounded-pill border px-3 py-1 text-xs transition-colors ${
                 templatesOpen
-                  ? "border-accent bg-surface-warm text-accent dark:border-accent dark:bg-surface-warm dark:text-accent"
-                  : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft"
+                  ? "border-accent bg-surface-warm text-accent"
+                  : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft hover:text-ink"
               }`}
               onClick={() => setTemplatesOpen((v) => !v)}
               title="Replace canvas with a starter template"
@@ -2416,11 +2482,11 @@ export default function BuilderClient() {
                   onClick={() => setTemplatesOpen(false)}
                 />
                 <div
-                  className="absolute right-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-lg border border-border-subtle bg-canvas shadow-lg"
+                  className="absolute right-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-card border border-border-subtle bg-canvas shadow-lg"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="border-b border-border-subtle px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-ink-muted dark:text-ink-muted">
-                    Pick a template
+                  <div className="border-b border-border-subtle px-3 py-2.5">
+                    <p className="eyebrow">Pick a template</p>
                   </div>
                   <div className="max-h-80 overflow-y-auto py-1">
                     {TEMPLATES.map((t) => (
@@ -2429,8 +2495,8 @@ export default function BuilderClient() {
                         className="block w-full px-3 py-2 text-left transition-colors hover:bg-surface-warm"
                         onClick={() => applyTemplate(t)}
                       >
-                        <div className="text-xs font-medium text-ink">{t.name}</div>
-                        <div className="mt-0.5 text-[10px] leading-snug text-ink-muted">{t.description}</div>
+                        <div className="text-[12px] font-medium text-ink">{t.name}</div>
+                        <div className="mt-0.5 text-[11px] leading-snug text-ink-muted">{t.description}</div>
                       </button>
                     ))}
                   </div>
@@ -2440,19 +2506,19 @@ export default function BuilderClient() {
           </div>
 
           {/* Subtle divider between primary tools and file ops */}
-          <span className="mx-0.5 h-5 w-px bg-surface-cool" />
+          <span className="mx-0.5 h-5 w-px bg-border-subtle" />
 
           {/* File ops */}
           <button
-            className="rounded-md border border-border-subtle bg-canvas px-2.5 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft"
+            className="rounded-pill border border-border-subtle bg-canvas px-3 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft hover:text-ink"
             onClick={() => designFileInputRef.current?.click()}
             title="Open a .lgx-design.json or a .lgx exported from this editor"
           >Open</button>
           <button
-            className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
+            className={`rounded-pill border px-3 py-1 text-xs transition-colors ${
               saveFeedback === "saved"
-                ? "border-success bg-success-bg text-success dark:border-success dark:bg-success-bg/60 dark:text-success"
-                : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft"
+                ? "border-success bg-success-bg text-success"
+                : "border-border-subtle bg-canvas text-ink-muted hover:bg-surface-warm hover:border-border-soft hover:text-ink"
             }`}
             onClick={handleSaveLocal}
             title="Save this project to your browser (⌘S). Opens from the dashboard. For a portable backup, use Export → Download project (.json)."
@@ -2469,27 +2535,27 @@ export default function BuilderClient() {
             }}
           />
 
-          <span className="mx-0.5 h-5 w-px bg-surface-cool" />
+          <span className="mx-0.5 h-5 w-px bg-border-subtle" />
 
           {/* History */}
           <button
-            className="rounded-md border border-border-subtle bg-canvas px-2.5 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft disabled:opacity-30 disabled:cursor-not-allowed"
+            className="rounded-pill border border-border-subtle bg-canvas px-3 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed"
             disabled={!canUndo}
             onClick={() => dispatch({ type: "undo" })}
             title="Undo (⌘Z)"
           >Undo</button>
           <button
-            className="rounded-md border border-border-subtle bg-canvas px-2.5 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft disabled:opacity-30 disabled:cursor-not-allowed"
+            className="rounded-pill border border-border-subtle bg-canvas px-3 py-1 text-xs text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed"
             disabled={!canRedo}
             onClick={() => dispatch({ type: "redo" })}
             title="Redo (⌘⇧Z)"
           >Redo</button>
 
-          <span className="mx-0.5 h-5 w-px bg-surface-cool" />
+          <span className="mx-0.5 h-5 w-px bg-border-subtle" />
 
           {/* Theme toggle — icon-only */}
           <button
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-border-subtle bg-canvas text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft hover:text-ink dark:text-ink-muted"
+            className="flex h-7 w-7 items-center justify-center rounded-pill border border-border-subtle bg-canvas text-ink-muted transition-colors hover:bg-surface-warm hover:border-border-soft hover:text-ink"
             onClick={cycleTheme}
             title={`Theme: ${themePref} (click to cycle light → dark → system)`}
             aria-label="Cycle theme"
@@ -2499,7 +2565,7 @@ export default function BuilderClient() {
 
           {/* Primary export action — pulled visually distinct */}
           <button
-            className="ml-1.5 rounded-md gradient-accent px-3 py-1 text-xs font-medium text-white shadow-sm transition-opacity hover:opacity-90"
+            className="ml-1.5 rounded-pill gradient-accent px-4 py-1 text-xs font-medium text-white shadow-sm transition-opacity hover:opacity-90"
             onClick={() => setExportOpen(true)}
           >Export…</button>
         </div>
@@ -2511,7 +2577,7 @@ export default function BuilderClient() {
               module, Components). Scrolls so any combination of panels fits.
             - bottom: Layers, capped to 40% of the column height with its own
               scroll so deeply-nested designs stay manageable. */}
-        <aside className="flex w-60 shrink-0 flex-col border-r border-border-subtle bg-canvas min-h-0">
+        <aside className="flex w-96 shrink-0 flex-col border-r border-border-subtle bg-canvas min-h-0">
           {/* Tab strip — three mode-based views, only one rendered at a
               time. Badges (count when non-zero) signal that a tab has
               content even when not currently active. */}
@@ -2824,7 +2890,7 @@ export default function BuilderClient() {
         </main>
 
         {/* Inspector */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-l border-border-subtle bg-canvas p-3">
+        <aside className="w-80 shrink-0 overflow-y-auto border-l border-border-subtle bg-canvas p-4">
           <ModulePanel
             meta={moduleMeta}
             onChange={setModuleMeta}
@@ -2844,15 +2910,19 @@ export default function BuilderClient() {
               Inspector
             </span>
             {(selectedIds.size > 0 && (selectedIds.size > 1 || (primaryNode && primaryId !== root.id))) && (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1">
                 <button
-                  className="text-[11px] text-ink-muted dark:text-ink-muted hover:underline"
+                  className="rounded-pill px-2 py-1 text-[11px] text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
                   onClick={duplicateSelected}
                 >duplicate</button>
                 <button
-                  className="text-[11px] text-danger hover:underline"
+                  className="rounded-pill p-1.5 text-ink-muted transition-colors hover:bg-danger-bg hover:text-danger"
                   onClick={deleteSelected}
-                >delete</button>
+                  aria-label="Delete selected"
+                  title="Delete selected"
+                >
+                  <Trash size={14} weight="duotone" />
+                </button>
               </div>
             )}
           </div>
@@ -2918,295 +2988,305 @@ export default function BuilderClient() {
       </div>
 
       {exportOpen && (
+        // Export modal redesigned to match Titan vocabulary: warm canvas
+        // surface, sage feature cards, eyebrow section labels, font-display
+        // headline, pill-shaped CTAs. Wider (520px) so the GitHub config
+        // form doesn't crowd the radio cards. Scrollable body for cases
+        // with both a custom core and a long progress strip.
         <div
-          className="fixed inset-0 z-30 flex items-center justify-center bg-black/30"
+          className="fixed inset-0 z-30 flex items-center justify-center bg-ink/40 px-4 backdrop-blur-sm"
           onClick={() => setExportOpen(false)}
         >
           <div
-            className="w-[440px] rounded-lg bg-canvas p-5 shadow-xl"
+            className="flex max-h-[90vh] w-full max-w-160 flex-col overflow-hidden rounded-card-lg border border-border-subtle bg-canvas shadow-2xl"
             onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-label="Export project"
           >
-            <div className="mb-3">
-              <div className="text-sm font-semibold text-ink">Export project</div>
-              <div className="text-[11px] text-ink-muted dark:text-ink-muted">
-                Pick what to download. Each artifact ships as a separate <span className="font-mono">.lgx</span>; install whichever ones aren&apos;t already in your Basecamp.
+            {/* Header */}
+            <header className="flex items-start justify-between gap-4 border-b border-border-subtle px-6 py-5">
+              <div className="min-w-0">
+                <h2 className="font-display text-[20px] font-medium leading-[1.15] tracking-tight text-ink">
+                  Export this project
+                </h2>
               </div>
-              {deliveryNeedsRelay && (
-                <div className="mt-2 rounded border border-warning bg-warning-bg dark:bg-warning-bg p-2 text-[11px] leading-tight text-warning">
-                  <span className="font-semibold">Delivery is enabled.</span> Install both the UI and the bundled <span className="font-mono">delivery_relay.lgx</span> on every Basecamp instance. The relay is the same file for every project — install once, reuse forever.
-                </div>
-              )}
-            </div>
-            <div className="flex flex-col gap-3">
-              <label className="flex items-start gap-2 rounded border border-border-subtle p-2 cursor-pointer hover:bg-surface-warm">
-                <input
-                  type="checkbox"
-                  checked={exportUi}
-                  onChange={(e) => setExportUi(e.target.checked)}
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div>
-                  <div className="text-xs font-semibold text-ink">
-                    UI plugin (<span className="font-mono">.lgx</span>, portable)
-                  </div>
-                  <div className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
-                    The QML widget — the thing the user sees. Always available; UI-only widgets are complete with just this. Built and packaged in the canonical portable shape, ready to drop into Basecamp.
-                  </div>
-                </div>
-              </label>
-
-              {/* Relay is only shown when the project actually uses
-                  delivery (sendMessage actions or onMessageReceived
-                  triggers — see usesDelivery in qmlEmit.ts). Projects
-                  that don't use it shouldn't see an unrelated checkbox
-                  cluttering the export dialog. When shown it's always
-                  required + force-checked, so we drop the optional path. */}
-              {deliveryNeedsRelay && (
-                <label className="flex items-start gap-2 rounded border border-warning bg-warning-bg p-2 cursor-pointer hover:bg-warning-bg/80">
-                  <input
-                    type="checkbox"
-                    checked
-                    disabled
-                    className="mt-0.5 h-4 w-4"
-                  />
-                  <div>
-                    <div className="text-xs font-semibold text-ink">
-                      <span className="font-mono">delivery_relay.lgx</span> (pre-built, ready to install){" "}
-                      <span className="ml-1 rounded bg-warning-bg dark:bg-warning-bg px-1 py-0.5 text-[9px] font-mono text-warning">required</span>
-                    </div>
-                    <div className="text-[10px] leading-tight text-ink-muted dark:text-ink-muted">
-                      Bundled C++ relay that owns <span className="font-mono">delivery_module</span>&apos;s lifecycle and exposes <span className="font-mono">sendMessage</span> / <span className="font-mono">subscribeToTopic</span> / <span className="font-mono">takeRecentMessages</span> to widgets. Same file for every project — install once per Basecamp; reuse across all your delivery widgets.
-                    </div>
-                  </div>
-                </label>
-              )}
-
-              {/* Custom backend block. UI plugins above are platform-
-                  independent QML, but core modules ship native code so
-                  they need to be compiled for the target Basecamp's OS.
-                  Two paths: build locally (single-arch, fast) or via
-                  GitHub Actions (multi-arch, multi-platform install). */}
-              <div
-                className={`rounded border p-3 ${
-                  hasCoreModule
-                    ? "border-border-subtle"
-                    : "border-border-subtle bg-surface-warm/50 opacity-60"
-                }`}
-              >
-                <label className="flex cursor-pointer items-start gap-2">
-                  <input
-                    type="checkbox"
-                    checked={exportCore && hasCoreModule}
-                    disabled={!hasCoreModule}
-                    onChange={(e) => setExportCore(e.target.checked)}
-                    className="mt-0.5 h-4 w-4"
-                  />
-                  <div>
-                    <div className="text-xs font-semibold text-ink">
-                      Custom backend module
-                      {hasCoreModule && (
-                        <span className="ml-1 rounded bg-surface-cool px-1 py-0.5 font-mono text-[9px] font-normal text-ink-muted">
-                          {app.coreModule!.id}
-                        </span>
-                      )}
-                    </div>
-                    <div className="mt-0.5 text-[10px] leading-tight text-ink-muted">
-                      {hasCoreModule
-                        ? "Native C++ — needs compilation for the target OS. Pick a build path:"
-                        : "Only shown when you've added a module via Ask AI → build a backend. Most apps don't need this."}
-                    </div>
-                  </div>
-                </label>
-
-                {hasCoreModule && exportCore && (
-                  <div className="mt-3 ml-6 grid gap-2 sm:grid-cols-2">
-                    {/* Option 1: Build locally on user's machine */}
-                    <label
-                      className={`flex cursor-pointer flex-col gap-1 rounded border p-2 transition-colors ${
-                        coreBuildMethod === "local"
-                          ? "border-accent bg-surface-warm dark:border-accent dark:bg-surface-warm/40"
-                          : "border-border-subtle hover:border-border-soft"
-                      }`}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="radio"
-                          name="coreBuildMethod"
-                          value="local"
-                          checked={coreBuildMethod === "local"}
-                          onChange={() => setCoreBuildMethod("local")}
-                          className="h-3.5 w-3.5"
-                        />
-                        <div className="text-[11px] font-semibold text-ink">
-                          Build locally
-                        </div>
-                      </div>
-                      <div className="text-[10px] leading-tight text-ink-muted">
-                        Downloads a source archive. You run <span className="font-mono">nix build</span> on your machine — produces a <span className="font-mono">.lgx</span> for whatever OS you ran it on. ~30s with warm cache.
-                      </div>
-                      <div className="mt-0.5 text-[9px] text-ink-muted">
-                        Requires: <a className="underline hover:text-ink-muted dark:hover:text-ink-muted" href="https://nixos.org/download" target="_blank" rel="noopener">nix</a> on PATH.
-                      </div>
-                    </label>
-
-                    {/* Option 2: Build via GitHub Actions */}
-                    <label
-                      className={`flex cursor-pointer flex-col gap-1 rounded border p-2 transition-colors ${
-                        coreBuildMethod === "github"
-                          ? "border-accent bg-surface-warm dark:border-accent dark:bg-surface-warm/40"
-                          : "border-border-subtle hover:border-border-soft"
-                      }`}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="radio"
-                          name="coreBuildMethod"
-                          value="github"
-                          checked={coreBuildMethod === "github"}
-                          onChange={() => setCoreBuildMethod("github")}
-                          className="h-3.5 w-3.5"
-                        />
-                        <div className="text-[11px] font-semibold text-ink">
-                          Build via GitHub
-                        </div>
-                        {isGitHubConfigured(ghSettings) && (
-                          <span className="ml-auto rounded bg-success-bg px-1 py-0.5 text-[9px] font-mono text-success dark:bg-success-bg dark:text-success">configured</span>
-                        )}
-                      </div>
-                      <div className="text-[10px] leading-tight text-ink-muted">
-                        Pushes your spec to a GitHub repo, Actions builds it for both Linux and macOS in parallel. Returns a single multi-arch <span className="font-mono">.lgx</span> installable on any Basecamp.
-                      </div>
-                      <div className="mt-0.5 text-[9px] text-ink-muted">
-                        $0 on public repos · ~5–10 min per build.
-                      </div>
-                    </label>
-                  </div>
-                )}
-
-                {/* Inline build instructions when "local" is selected — the
-                    user knows exactly what to do after the download. */}
-                {hasCoreModule && exportCore && coreBuildMethod === "local" && (
-                  <div className="mt-2 ml-6 rounded bg-surface-warm p-2 font-mono text-[10px] leading-relaxed text-ink-muted">
-                    <div className="mb-0.5 text-[9px] uppercase tracking-wider text-ink-muted">After download:</div>
-                    tar -xzf {app.coreModule!.id}-core-source.lgx<br />
-                    cd {app.coreModule!.id}-core && nix build &apos;.#lgx-portable&apos;<br />
-                    cp result/{app.coreModule!.id}.lgx ~/Desktop/
-                  </div>
-                )}
-
-                {/* GitHub config form — shown inline when "Build via GitHub"
-                    is selected so the user doesn't have to navigate to a
-                    separate Settings panel. PAT lives in localStorage; this
-                    is the BYO-token MVP, replaced by GitHub App OAuth later. */}
-                {hasCoreModule && exportCore && coreBuildMethod === "github" && !building && (
-                  <div className="mt-2 ml-6 space-y-2 rounded border border-border-subtle bg-surface-warm p-2">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
-                      GitHub configuration
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-medium text-ink-muted">Repo</label>
-                      <input
-                        type="text"
-                        placeholder="username/lgx-modules"
-                        value={ghSettings.repo}
-                        onChange={(e) => saveGhSettings({ ...ghSettings, repo: e.target.value.trim() })}
-                        className="mt-0.5 w-full rounded border border-border-soft bg-canvas px-1.5 py-1 font-mono text-[11px] text-ink"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[10px] font-medium text-ink-muted">
-                        Fine-grained PAT
-                        <span className="ml-1 font-normal text-ink-muted"> — needs Contents: R/W, Workflows: R/W, Actions: R, Metadata: R</span>
-                      </label>
-                      <input
-                        type="password"
-                        placeholder="github_pat_…"
-                        value={ghSettings.token}
-                        onChange={(e) => saveGhSettings({ ...ghSettings, token: e.target.value })}
-                        className="mt-0.5 w-full rounded border border-border-soft bg-canvas px-1.5 py-1 font-mono text-[11px] text-ink"
-                      />
-                      <a
-                        href="https://github.com/settings/personal-access-tokens/new"
-                        target="_blank"
-                        rel="noopener"
-                        className="mt-1 inline-block text-[10px] text-accent hover:underline dark:text-accent"
-                      >Generate one →</a>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={probeGh}
-                        disabled={ghProbing || !ghSettings.repo || !ghSettings.token}
-                        className="rounded border border-border-soft bg-canvas px-2 py-1 text-[10px] text-ink-muted hover:bg-surface-warm disabled:opacity-40"
-                      >{ghProbing ? "Testing…" : "Test connection"}</button>
-                      {ghProbe && (
-                        <span className={`text-[10px] ${ghProbe.ok ? "text-success" : "text-danger"}`}>
-                          {ghProbe.msg}
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-[9px] leading-snug text-ink-muted">
-                      Settings are stored in this browser only. The token never reaches lgx.guru&apos;s server — your browser talks directly to api.github.com.
-                    </div>
-                  </div>
-                )}
-
-                {/* Live build progress when a GitHub build is in flight. */}
-                {hasCoreModule && exportCore && coreBuildMethod === "github" && (building || buildProgress) && (
-                  <div className="mt-2 ml-6 rounded border border-accent bg-surface-warm p-2 dark:border-accent dark:bg-surface-warm/40">
-                    <div className="text-[10px] font-semibold uppercase tracking-wider text-accent">
-                      Build in progress
-                    </div>
-                    <div className="mt-1 text-[11px] text-ink-muted">
-                      {!buildProgress && "Starting…"}
-                      {buildProgress?.kind === "pushing" && `Pushing files (${buildProgress.fileIndex + 1}/${buildProgress.totalFiles}): ${buildProgress.path}`}
-                      {buildProgress?.kind === "triggering" && "Triggering workflow…"}
-                      {buildProgress?.kind === "queued" && "Queued — waiting for a runner…"}
-                      {buildProgress?.kind === "running" && `Building on GitHub… (${buildProgress.elapsedSec}s)`}
-                      {buildProgress?.kind === "downloading" && "Downloading artifact…"}
-                      {buildProgress?.kind === "done" && "Done ✓ (download starting)"}
-                      {buildProgress?.kind === "error" && (
-                        <span className="text-danger">
-                          Error: {buildProgress.message}
-                          {buildProgress.logsUrl && (
-                            <> — <a className="underline" href={buildProgress.logsUrl} target="_blank" rel="noopener">view logs</a></>
-                          )}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Editor backup — separate from the .lgx artifacts above
-                  because it's not installable. It's the round-trippable
-                  JSON snapshot of the editor state, useful for sharing a
-                  project with someone or moving it to another browser. */}
-              <div className="mt-1 flex items-start gap-2 rounded border border-dashed border-border-soft bg-surface-warm/40 p-2">
-                <div className="flex-1">
-                  <div className="text-xs font-semibold text-ink">
-                    Project file (<span className="font-mono">.lgx-design.json</span>)
-                  </div>
-                  <div className="text-[10px] leading-tight text-ink-muted">
-                    Portable backup of this editor session — pages, variables, triggers, custom backend spec, and assets. Re-import via <span className="font-semibold">Open</span>. Your project is auto-saved to this browser; this is for moving it elsewhere.
-                  </div>
-                </div>
-                <button
-                  onClick={handleDownloadDesign}
-                  className="shrink-0 rounded border border-border-soft bg-canvas px-2 py-1 text-[10px] font-medium text-ink-muted hover:bg-surface-warm"
-                >Download</button>
-              </div>
-            </div>
-            <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 onClick={() => setExportOpen(false)}
-                className="rounded border border-border-soft px-3 py-1.5 text-xs text-ink-muted hover:bg-surface-warm"
-              >Cancel</button>
+                aria-label="Close"
+                className="-mt-1 -mr-1 shrink-0 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+              >×</button>
+            </header>
+
+            {/* Body */}
+            <div className="flex-1 overflow-y-auto px-6 py-5">
+              <section>
+                <p className="eyebrow">Files to install</p>
+
+                <div className="mt-3 space-y-2.5">
+                  {/* UI widget — always offered. Cross-platform pure QML
+                      built in the browser. */}
+                  <label className="flex cursor-pointer items-start gap-3 rounded-card border border-border-subtle bg-canvas p-4 transition-colors hover:bg-surface-warm">
+                    <input
+                      type="checkbox"
+                      checked={exportUi}
+                      onChange={(e) => setExportUi(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 accent-ink"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <span className="text-[13px] font-medium text-ink">UI widget</span>
+                        <span className="font-mono text-[11px] text-ink-muted">{sanitizeName(moduleMeta.name) || "my_widget"}.lgx</span>
+                        <span className="rounded-pill bg-surface-cool px-2 py-0.5 text-[10px] font-medium text-ink-muted">cross-platform</span>
+                      </div>
+                      <p className="mt-1.5 text-[12px] leading-snug text-ink-muted">
+                        The visual interface — pages, components, triggers, all the wiring. Pure QML, so the same file installs on macOS and Linux. Required for the widget to render.
+                      </p>
+                    </div>
+                  </label>
+
+                  {/* Relay — only shown when delivery is in use. */}
+                  {deliveryNeedsRelay && (
+                    <div className="flex items-start gap-3 rounded-card border border-warning bg-warning-bg p-4">
+                      <input
+                        type="checkbox"
+                        checked
+                        disabled
+                        className="mt-0.5 h-4 w-4 accent-warning"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-baseline gap-2">
+                          <span className="text-[13px] font-medium text-ink">Delivery relay</span>
+                          <span className="font-mono text-[11px] text-ink-muted">delivery_relay.lgx</span>
+                          <span className="rounded-pill bg-warning/15 px-2 py-0.5 text-[10px] font-medium text-warning">required</span>
+                        </div>
+                        <p className="mt-1.5 text-[12px] leading-snug text-ink-muted">
+                          Pre-built C++ relay needed for <span className="font-mono">sendMessage</span> / <span className="font-mono">onMessageReceived</span>. Same file for every project — install once per Basecamp and every delivery-enabled widget reuses it.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Custom backend — only when a core module exists. */}
+                  {hasCoreModule && (
+                    <div className="rounded-card border border-border-subtle bg-canvas">
+                      <label className="flex cursor-pointer items-start gap-3 p-4 transition-colors hover:bg-surface-warm">
+                        <input
+                          type="checkbox"
+                          checked={exportCore}
+                          onChange={(e) => setExportCore(e.target.checked)}
+                          className="mt-0.5 h-4 w-4 accent-ink"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex flex-wrap items-baseline gap-2">
+                            <span className="text-[13px] font-medium text-ink">Custom backend</span>
+                            <span className="font-mono text-[11px] text-ink-muted">{app.coreModule!.id}.lgx</span>
+                            <span className="rounded-pill bg-surface-cool px-2 py-0.5 text-[10px] font-medium text-ink-muted">native C++</span>
+                          </div>
+                          <p className="mt-1.5 text-[12px] leading-snug text-ink-muted">
+                            The backend logic the AI built for you. Native C++ — has to be compiled for the OS your Basecamp runs on. Pick how to build it below.
+                          </p>
+                        </div>
+                      </label>
+
+                      {/* Build method — visible only when the backend is checked */}
+                      {exportCore && (
+                        <div className="border-t border-border-subtle bg-surface-warm/40 p-4">
+                          <p className="eyebrow mb-3">Build method</p>
+                          <div className="grid gap-2 sm:grid-cols-2">
+                            <label
+                              className={`flex cursor-pointer flex-col gap-1.5 rounded-card border p-3 transition-colors ${
+                                coreBuildMethod === "local"
+                                  ? "border-accent bg-canvas"
+                                  : "border-border-subtle bg-canvas hover:border-border-soft"
+                              }`}
+                            >
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="radio"
+                                  name="coreBuildMethod"
+                                  value="local"
+                                  checked={coreBuildMethod === "local"}
+                                  onChange={() => setCoreBuildMethod("local")}
+                                  className="h-3.5 w-3.5 accent-ink"
+                                />
+                                <span className="text-[12px] font-medium text-ink">Build locally</span>
+                              </div>
+                              <p className="text-[11px] leading-snug text-ink-muted">
+                                Download a source archive and run <span className="font-mono">nix build</span> on your own machine. Single OS (whichever you run it on). ~30s with warm cache.
+                              </p>
+                              <p className="text-[10px] text-ink-muted">
+                                Requires{" "}
+                                <a className="underline hover:text-ink" href="https://nixos.org/download" target="_blank" rel="noopener">nix</a>{" "}
+                                on your PATH.
+                              </p>
+                            </label>
+
+                            <label
+                              className={`flex cursor-pointer flex-col gap-1.5 rounded-card border p-3 transition-colors ${
+                                coreBuildMethod === "github"
+                                  ? "border-accent bg-canvas"
+                                  : "border-border-subtle bg-canvas hover:border-border-soft"
+                              }`}
+                            >
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="radio"
+                                  name="coreBuildMethod"
+                                  value="github"
+                                  checked={coreBuildMethod === "github"}
+                                  onChange={() => setCoreBuildMethod("github")}
+                                  className="h-3.5 w-3.5 accent-ink"
+                                />
+                                <span className="text-[12px] font-medium text-ink">Build via GitHub</span>
+                                {isGitHubConfigured(ghSettings) && (
+                                  <span className="ml-auto rounded-pill bg-success-bg px-2 py-0.5 text-[10px] font-medium text-success">connected</span>
+                                )}
+                              </div>
+                              <p className="text-[11px] leading-snug text-ink-muted">
+                                Push to your repo; Actions compiles for both Linux and macOS, attaches a multi-arch <span className="font-mono">.lgx</span> + the UI widget to a Release.
+                              </p>
+                              <p className="text-[10px] text-ink-muted">
+                                Free on public repos · ~5–10 min per build.
+                              </p>
+                            </label>
+                          </div>
+
+                          {/* Local: post-download instructions */}
+                          {coreBuildMethod === "local" && (
+                            <div className="mt-3 rounded-card bg-canvas p-3">
+                              <p className="eyebrow mb-2">After download</p>
+                              <pre className="overflow-x-auto font-mono text-[11px] leading-relaxed text-ink">{`tar -xzf ${app.coreModule!.id}-core-source.lgx
+cd ${app.coreModule!.id}-core && nix build '.#lgx-portable'
+cp result/${app.coreModule!.id}.lgx ~/Desktop/`}</pre>
+                            </div>
+                          )}
+
+                          {/* GitHub: config form */}
+                          {coreBuildMethod === "github" && !building && (
+                            <div className="mt-3 space-y-3 rounded-card bg-canvas p-3">
+                              <p className="eyebrow">GitHub configuration</p>
+                              <div>
+                                <label className="text-[11px] font-medium text-ink-muted">Repo</label>
+                                <input
+                                  type="text"
+                                  placeholder="username/lgx-modules"
+                                  value={ghSettings.repo}
+                                  onChange={(e) => saveGhSettings({ ...ghSettings, repo: e.target.value.trim() })}
+                                  className="mt-1 w-full rounded-control border border-border-soft bg-canvas px-2 py-1.5 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+                                />
+                              </div>
+                              <div>
+                                <label className="text-[11px] font-medium text-ink-muted">
+                                  Fine-grained PAT
+                                  <span className="ml-1 font-normal text-ink-muted">— Contents R/W, Workflows R/W, Actions R, Metadata R</span>
+                                </label>
+                                <input
+                                  type="password"
+                                  placeholder="github_pat_…"
+                                  value={ghSettings.token}
+                                  onChange={(e) => saveGhSettings({ ...ghSettings, token: e.target.value })}
+                                  className="mt-1 w-full rounded-control border border-border-soft bg-canvas px-2 py-1.5 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+                                />
+                                <a
+                                  href="https://github.com/settings/personal-access-tokens/new"
+                                  target="_blank"
+                                  rel="noopener"
+                                  className="mt-1.5 inline-block text-[11px] text-accent hover:underline"
+                                >
+                                  Generate a token →
+                                </a>
+                              </div>
+                              <div className="flex items-center gap-3">
+                                <button
+                                  onClick={probeGh}
+                                  disabled={ghProbing || !ghSettings.repo || !ghSettings.token}
+                                  className="rounded-pill border border-border-soft bg-canvas px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink disabled:opacity-40"
+                                >
+                                  {ghProbing ? "Testing…" : "Test connection"}
+                                </button>
+                                {ghProbe && (
+                                  <span className={`text-[11px] font-medium ${ghProbe.ok ? "text-success" : "text-danger"}`}>
+                                    {ghProbe.msg}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[10px] leading-snug text-ink-muted">
+                                Stored in this browser only. The token never reaches lgx.guru — your browser talks directly to api.github.com.
+                              </p>
+                            </div>
+                          )}
+
+                          {/* GitHub: live build progress */}
+                          {coreBuildMethod === "github" && (building || buildProgress) && (
+                            <div className="mt-3 rounded-card border border-accent bg-canvas p-3">
+                              <p className="eyebrow text-accent">Build in progress</p>
+                              <p className="mt-1.5 text-[12px] leading-snug text-ink-muted">
+                                {!buildProgress && "Starting…"}
+                                {buildProgress?.kind === "pushing" && `Pushing files (${buildProgress.fileIndex + 1}/${buildProgress.totalFiles}): ${buildProgress.path}`}
+                                {buildProgress?.kind === "triggering" && "Triggering workflow…"}
+                                {buildProgress?.kind === "queued" && "Queued — waiting for a runner…"}
+                                {buildProgress?.kind === "running" && `Building on GitHub… (${buildProgress.elapsedSec}s)`}
+                                {buildProgress?.kind === "downloading" && "Downloading artifact…"}
+                                {buildProgress?.kind === "done" && "Done ✓ (download starting)"}
+                                {buildProgress?.kind === "error" && (
+                                  <span className="text-danger">
+                                    Error: {buildProgress.message}
+                                    {buildProgress.logsUrl && (
+                                      <> — <a className="underline hover:text-ink" href={buildProgress.logsUrl} target="_blank" rel="noopener">view logs</a></>
+                                    )}
+                                  </span>
+                                )}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              {/* Editor-state backup — separate section because it's not
+                  installable, it's a portable JSON snapshot for moving the
+                  project between browsers. */}
+              <section className="mt-6">
+                <p className="eyebrow">Editor backup</p>
+                <div className="mt-3 flex items-center gap-3 rounded-card border border-dashed border-border-soft bg-surface-warm/40 p-4">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <span className="text-[13px] font-medium text-ink">Project file</span>
+                      <span className="font-mono text-[11px] text-ink-muted">.lgx-design.json</span>
+                    </div>
+                    <p className="mt-1.5 text-[12px] leading-snug text-ink-muted">
+                      Round-trippable JSON — every page, variable, trigger, asset, and backend spec. Re-import via <span className="font-medium text-ink">Open</span>. Auto-saved here; this is for moving the project elsewhere.
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleDownloadDesign}
+                    className="shrink-0 rounded-pill border border-border-soft bg-canvas px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+                  >
+                    Download
+                  </button>
+                </div>
+              </section>
+            </div>
+
+            {/* Footer */}
+            <footer className="flex items-center justify-end gap-2 border-t border-border-subtle px-6 py-4">
+              <button
+                onClick={() => setExportOpen(false)}
+                className="rounded-pill border border-border-soft bg-canvas px-4 py-1.5 text-[12px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+              >
+                Cancel
+              </button>
               <button
                 onClick={runExport}
-                disabled={!exportUi && !(exportCore && hasCoreModule) && !(exportRelay || deliveryNeedsRelay)}
-                className="rounded bg-action px-3 py-1.5 text-xs font-medium text-action-on hover:opacity-90 disabled:opacity-40"
-              >Export</button>
-            </div>
+                disabled={!exportUi && !(exportCore && hasCoreModule) && !deliveryNeedsRelay}
+                className="rounded-pill bg-action px-5 py-1.5 text-[12px] font-medium text-action-on transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                Export
+              </button>
+            </footer>
           </div>
         </div>
       )}
@@ -5665,9 +5745,12 @@ function PagesPanel({
                   {pages.length > 1 && (
                     <button
                       onClick={(e) => { e.stopPropagation(); onDelete(p.id); }}
-                      className="text-[10px] text-danger opacity-0 group-hover:opacity-100 hover:underline"
-                      title="Delete"
-                    >del</button>
+                      className="rounded-pill p-1 text-ink-muted opacity-0 transition-colors group-hover:opacity-100 hover:bg-danger-bg hover:text-danger"
+                      aria-label="Delete page"
+                      title="Delete page"
+                    >
+                      <Trash size={12} weight="duotone" />
+                    </button>
                   )}
                 </>
               )}
@@ -5838,8 +5921,12 @@ function TriggerEditor({
         <span className="flex-1" />
         <button
           onClick={onDelete}
-          className="text-[10px] text-danger hover:underline"
-        >del</button>
+          className="rounded-pill p-1 text-ink-muted transition-colors hover:bg-danger-bg hover:text-danger"
+          aria-label="Delete trigger"
+          title="Delete trigger"
+        >
+          <Trash size={12} weight="duotone" />
+        </button>
       </div>
       {trigger.kind === "interval" && (
         <div className="mb-1.5 flex items-center gap-1">
@@ -6337,8 +6424,12 @@ function CoreMethodEditor({
         </select>
         <button
           onClick={onDelete}
-          className="text-[10px] text-danger hover:underline"
-        >del</button>
+          className="rounded-pill p-1 text-ink-muted transition-colors hover:bg-danger-bg hover:text-danger"
+          aria-label="Delete method"
+          title="Delete method"
+        >
+          <Trash size={12} weight="duotone" />
+        </button>
       </div>
       {method.args.length > 0 && (
         <div className="mb-1 flex flex-col gap-0.5">
@@ -6428,9 +6519,12 @@ function VariablesPanel({
                 />
                 <button
                   onClick={() => onDelete(v.id)}
-                  className="text-[10px] text-danger hover:underline"
+                  className="rounded-pill p-1 text-ink-muted transition-colors hover:bg-danger-bg hover:text-danger"
+                  aria-label="Delete variable"
                   title="Delete variable"
-                >del</button>
+                >
+                  <Trash size={12} weight="duotone" />
+                </button>
               </div>
               <div className="flex items-center gap-1">
                 <select
