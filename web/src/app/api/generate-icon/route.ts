@@ -5,18 +5,29 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const body = (await req.json()) as {
+    name?: string;
+    description?: string;
+    auth?: { apiKey?: unknown };
+  };
+
+  // Prefer the user's BYO key (sent by the browser) over the local env
+  // var. OpenAI's image API only — no NVIDIA fallback here, since the
+  // image endpoint isn't part of NVIDIA Integrate's compat surface.
+  const byoKey = typeof body?.auth?.apiKey === "string" ? body.auth.apiKey.trim() : "";
+  const apiKey = byoKey || process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return Response.json(
-      { error: "No OPENAI_API_KEY configured on the server." },
-      { status: 500 },
+      {
+        error:
+          "No OpenAI API key configured. Open the AI sidebar's settings " +
+          "(gear icon) and paste your OpenAI key — it stays in this browser only.",
+      },
+      { status: 401 },
     );
   }
 
-  const { name, description } = (await req.json()) as {
-    name?: string;
-    description?: string;
-  };
+  const { name, description } = body;
 
   const subject = name || "app";
   const extra = description ? ` The module does: ${description}.` : "";

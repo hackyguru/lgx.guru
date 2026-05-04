@@ -7,6 +7,14 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import type { AppState, CoreModuleSpec } from "./types";
+import {
+  emptyAISettings,
+  isAIConfigured,
+  readAISettings,
+  settingsToRequestAuth,
+  writeAISettings,
+  type AISettings,
+} from "./lib/aiSettings";
 
 type ResultKind = "patch" | "build";
 
@@ -58,6 +66,15 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
+  // BYO key state. Loaded once from localStorage when the panel opens
+  // and re-read after the settings modal closes (cheap; lets users edit
+  // in another tab without losing their place).
+  const [aiSettings, setAiSettings] = useState<AISettings>(emptyAISettings);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    if (open) setAiSettings(readAISettings());
+  }, [open]);
+
   // Auto-focus input when opened
   useEffect(() => {
     if (open) setTimeout(() => inputRef.current?.focus(), 50);
@@ -106,10 +123,20 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
     setPending({ prompt: promptText, startedAt: Date.now() });
 
     try {
+      // BYO auth — pass the user's key in the request body if they set
+      // one. Server prefers it over env. settingsToRequestAuth returns
+      // null when the key field is empty, in which case we omit `auth`
+      // entirely and the server falls through to env-based credentials
+      // (local-dev / npx CLI flow).
+      const auth = settingsToRequestAuth(aiSettings);
       const res = await fetch("/api/apply-patch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: promptText, app }),
+        body: JSON.stringify({
+          prompt: promptText,
+          app,
+          ...(auth ? { auth } : {}),
+        }),
       });
       const data = await res.json();
       const resultKind: ResultKind = data?.kind === "build" ? "build" : "patch";
@@ -196,6 +223,23 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
             />
           </div>
           <div className="flex items-center gap-1.5">
+            {/* AI settings gear — opens the BYO key modal. Highlighted
+                with the warning ring when no key is configured anywhere
+                (server env or BYO), so users see the prompt before
+                hitting Send and getting a 401 back. */}
+            <button
+              onClick={() => setSettingsOpen(true)}
+              disabled={!!pending}
+              className={`rounded-pill px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-30 ${
+                isAIConfigured(aiSettings)
+                  ? "text-ink-muted hover:bg-surface-warm hover:text-ink"
+                  : "border border-warning bg-warning-bg text-warning hover:bg-warning-bg/80"
+              }`}
+              title={isAIConfigured(aiSettings) ? "AI settings" : "Set your OpenAI key"}
+              aria-label="AI settings"
+            >
+              {isAIConfigured(aiSettings) ? "Settings" : "Set key"}
+            </button>
             {history.length > 0 && (
               <button
                 onClick={() => onHistory([])}
@@ -329,7 +373,203 @@ export function AskAIModal({ open, onClose, app, dispatch, history, onHistory }:
             {pending ? "Cmd-Z reverts applied changes." : "Cmd/Ctrl+Enter to send. Esc closes."}
           </div>
         </footer>
+
+        {/* BYO key settings — modal sibling so it stacks above the
+            sidebar's z-50 and dims everything behind it. Re-reads the
+            stored settings on close so the chat sees the new key. */}
+        <AISettingsModal
+          open={settingsOpen}
+          onClose={() => {
+            setSettingsOpen(false);
+            setAiSettings(readAISettings());
+          }}
+        />
     </aside>
+  );
+}
+
+// ── BYO API-key settings modal ─────────────────────────────────────────────
+//
+// Stores the user's OpenAI / NVIDIA key in this browser's localStorage
+// and passes it on every Ask AI / icon-generate request. The key never
+// reaches lgx.guru's own servers — the browser sends it directly to the
+// /api/* route which forwards it to the chosen provider.
+
+function AISettingsModal({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState<AISettings>(emptyAISettings);
+
+  // Load fresh settings on each open so the modal reflects whatever's
+  // currently stored (including changes made in another tab).
+  useEffect(() => {
+    if (open) setDraft(readAISettings());
+  }, [open]);
+
+  // Escape closes without saving — Save button is the only commit path.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const save = () => {
+    writeAISettings({
+      provider: draft.provider,
+      apiKey: draft.apiKey.trim(),
+      model: draft.model.trim(),
+    });
+    onClose();
+  };
+
+  const clear = () => {
+    writeAISettings(emptyAISettings);
+    setDraft(emptyAISettings);
+  };
+
+  const placeholder = draft.provider === "nvidia" ? "nvapi-…" : "sk-…";
+  const modelHint = draft.provider === "nvidia"
+    ? "NVIDIA model id (e.g. z-ai/glm-5.1). Leave blank for default."
+    : "OpenAI model id (e.g. gpt-5, gpt-4o, o3-mini). Leave blank for gpt-4o.";
+  const tokenUrl = draft.provider === "nvidia"
+    ? "https://build.nvidia.com/explore/discover"
+    : "https://platform.openai.com/api-keys";
+
+  return (
+    <div
+      className="fixed inset-0 z-60 flex items-center justify-center bg-ink/40 px-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <form
+        onSubmit={(e) => { e.preventDefault(); save(); }}
+        className="flex w-full max-w-115 flex-col overflow-hidden rounded-card-lg border border-border-subtle bg-canvas shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="AI settings"
+      >
+        <header className="flex items-start justify-between gap-4 border-b border-border-subtle px-6 py-5">
+          <div className="min-w-0">
+            <h2 className="font-display text-[18px] font-medium leading-[1.15] tracking-tight text-ink">
+              AI settings
+            </h2>
+            <p className="mt-1 text-[12px] leading-snug text-ink-muted">
+              Bring your own key — stored only in this browser, sent directly to the provider.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="-mt-1 -mr-1 rounded-pill px-2 py-1 text-[14px] leading-none text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+          >×</button>
+        </header>
+
+        <div className="space-y-4 px-6 py-5">
+          <div>
+            <p className="eyebrow">Provider</p>
+            <div className="mt-1.5 grid grid-cols-2 gap-2">
+              {([
+                { id: "openai", label: "OpenAI" },
+                { id: "nvidia", label: "NVIDIA" },
+              ] as const).map((opt) => (
+                <label
+                  key={opt.id}
+                  className={`flex cursor-pointer items-center justify-center rounded-control border px-2 py-2 text-[12px] font-medium transition-colors ${
+                    draft.provider === opt.id
+                      ? "border-accent bg-canvas text-ink"
+                      : "border-border-subtle bg-canvas text-ink-muted hover:border-border-soft hover:text-ink"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="ai-provider"
+                    value={opt.id}
+                    checked={draft.provider === opt.id}
+                    onChange={() => setDraft((d) => ({ ...d, provider: opt.id }))}
+                    className="sr-only"
+                  />
+                  {opt.label}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="ai-key" className="eyebrow">API key</label>
+            <input
+              id="ai-key"
+              type="password"
+              value={draft.apiKey}
+              onChange={(e) => setDraft((d) => ({ ...d, apiKey: e.target.value }))}
+              placeholder={placeholder}
+              autoComplete="off"
+              spellCheck={false}
+              className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 font-mono text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none"
+            />
+            <a
+              href={tokenUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1.5 inline-block text-[11px] text-accent hover:underline"
+            >
+              Get a {draft.provider === "nvidia" ? "NVIDIA" : "OpenAI"} key →
+            </a>
+          </div>
+
+          <div>
+            <label htmlFor="ai-model" className="eyebrow">
+              Model <span className="ml-1 font-normal normal-case tracking-normal text-ink-muted">— optional</span>
+            </label>
+            <input
+              id="ai-model"
+              type="text"
+              value={draft.model}
+              onChange={(e) => setDraft((d) => ({ ...d, model: e.target.value }))}
+              placeholder={draft.provider === "nvidia" ? "z-ai/glm-5.1" : "gpt-4o"}
+              className="mt-1.5 w-full rounded-control border border-border-soft bg-canvas px-3 py-2 font-mono text-[12px] text-ink placeholder:text-ink-muted focus:border-accent focus:outline-none"
+            />
+            <p className="mt-1.5 text-[11px] leading-snug text-ink-muted">{modelHint}</p>
+          </div>
+
+          <p className="text-[10px] leading-snug text-ink-muted">
+            Stored in this browser only. The key never reaches lgx.guru — your browser sends it directly to {draft.provider === "nvidia" ? "NVIDIA Integrate" : "OpenAI"} via the editor&apos;s API route.
+          </p>
+        </div>
+
+        <footer className="flex items-center justify-between gap-2 border-t border-border-subtle px-6 py-4">
+          <button
+            type="button"
+            onClick={clear}
+            disabled={!draft.apiKey}
+            className="rounded-pill px-3 py-1.5 text-[11px] font-medium text-ink-muted transition-colors hover:bg-danger-bg hover:text-danger disabled:opacity-30"
+          >
+            Clear key
+          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-pill border border-border-soft bg-canvas px-4 py-1.5 text-[12px] font-medium text-ink-muted transition-colors hover:bg-surface-warm hover:text-ink"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="rounded-pill bg-action px-5 py-1.5 text-[12px] font-medium text-action-on transition-opacity hover:opacity-90"
+            >
+              Save
+            </button>
+          </div>
+        </footer>
+      </form>
+    </div>
   );
 }
 

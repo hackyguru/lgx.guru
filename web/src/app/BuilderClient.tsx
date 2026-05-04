@@ -26,6 +26,7 @@ import {
   writeGitHubSettings,
   type GitHubSettings,
 } from "./lib/githubSettings";
+import { readAISettings, settingsToRequestAuth } from "./lib/aiSettings";
 import { pushAndBuild, type BuildPhase } from "./lib/githubBuilder";
 import { ModuleDetailModal, ModuleInfo } from "./ModuleDetailModal";
 import { AskAIModal, AIHistoryEntry } from "./AskAIModal";
@@ -734,10 +735,17 @@ export default function BuilderClient() {
     setIconError(null);
     setIconGenerating(true);
     try {
+      // BYO key — same store as the Ask AI sidebar uses. Falls back to
+      // server env when the user hasn't configured one (local-dev flow).
+      const auth = settingsToRequestAuth(readAISettings());
       const res = await fetch("/api/generate-icon", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: moduleMeta.name, description: moduleMeta.description }),
+        body: JSON.stringify({
+          name: moduleMeta.name,
+          description: moduleMeta.description,
+          ...(auth ? { auth } : {}),
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to generate icon");
@@ -2772,27 +2780,12 @@ export default function BuilderClient() {
             )}
           </div>
 
-          {/* Layers — anchored at the bottom, capped to 40vh so it shares
-              column height fairly with the panels above. Internal scroll for
-              deep trees. */}
-          <div className="shrink-0 flex flex-col border-t border-border-subtle max-h-[40vh] min-h-[120px]">
-            <div className="flex shrink-0 items-center justify-between border-b border-border-subtle px-2.5 py-1.5">
-              <span className="text-xs font-semibold uppercase text-ink-muted dark:text-ink-muted">Layers</span>
-              <span className="text-[10px] text-ink-muted">drag to reorder</span>
-            </div>
-            <div className="flex-1 overflow-y-auto py-1">
-              <LayersPanel
-                root={root}
-                selectedIds={selectedIds}
-                onSelect={handleSelect}
-                collapsedIds={collapsedIds}
-                onToggleCollapsed={toggleCollapsed}
-                onToggleHidden={toggleHidden}
-                onToggleLocked={toggleLocked}
-                onMove={moveNode}
-              />
-            </div>
-          </div>
+          {/* Layers used to live here — moved below the canvas so it
+              occupies the empty space under the page where the grid
+              doesn't extend, and so the left sidebar can give its full
+              height to the Pages / Variables / Triggers / Modules
+              panels without the 40vh layer-tree cap. See the panel mount
+              inside <main> below the canvas <section>. */}
         </aside>
 
         {/* Single-pane canvas. The Qt-WASM iframe IS the canvas — it
@@ -2865,6 +2858,25 @@ export default function BuilderClient() {
                   onError={renderer.handleError}
                 />
               )}
+              {/* Grid overlay — sits on top of the iframe (whose Qt content
+                  paints a white bg that would otherwise cover any grid on
+                  the parent), and below the React overlays (CanvasArea,
+                  ResizeOverlay) which come after this in source order so
+                  widgets and selection chrome render above the grid.
+                  pointer-events:none so it doesn't intercept clicks. Spans
+                  the full canvas viewport, not just the page rect, so the
+                  workspace doesn't have a bare strip below the page. */}
+              {gridSize > 0 && !runMode && (
+                <div
+                  className="pointer-events-none absolute inset-0"
+                  style={{
+                    backgroundImage:
+                      "linear-gradient(rgba(0,0,0,0.06) 1px, transparent 1px)," +
+                      "linear-gradient(90deg, rgba(0,0,0,0.06) 1px, transparent 1px)",
+                    backgroundSize: `${gridSize}px ${gridSize}px`,
+                  }}
+                />
+              )}
               <RendererStatus
                 status={renderer.status}
                 url={RENDERER_URL}
@@ -2926,6 +2938,31 @@ export default function BuilderClient() {
               )}
             </div>
           </section>
+
+          {/* Layers — full width of the canvas column, sitting below the
+              canvas section. Page area is fixed (e.g. 1024×640) so the
+              workspace below the page tends to be empty surface anyway;
+              this fills it with something useful. Capped at 220px so the
+              canvas keeps the lion's share of vertical space; internal
+              scroll for deep trees. */}
+          <div className="shrink-0 flex flex-col border-t border-border-subtle bg-canvas max-h-[220px] min-h-[140px]">
+            <div className="flex shrink-0 items-center justify-between border-b border-border-subtle px-4 py-2">
+              <p className="eyebrow">Layers</p>
+              <span className="text-[11px] text-ink-muted">drag to reorder</span>
+            </div>
+            <div className="flex-1 overflow-y-auto px-2 py-1">
+              <LayersPanel
+                root={root}
+                selectedIds={selectedIds}
+                onSelect={handleSelect}
+                collapsedIds={collapsedIds}
+                onToggleCollapsed={toggleCollapsed}
+                onToggleHidden={toggleHidden}
+                onToggleLocked={toggleLocked}
+                onMove={moveNode}
+              />
+            </div>
+          </div>
         </main>
 
         {/* Inspector */}
@@ -3429,21 +3466,16 @@ function CanvasArea({
   guideOverlay: React.ReactNode;
   marquee: { x: number; y: number; w: number; h: number } | null;
 }) {
-  const gridStyle: React.CSSProperties = gridSize > 0
-    ? {
-        backgroundImage:
-          "linear-gradient(rgba(0,0,0,0.06) 1px, transparent 1px)," +
-          "linear-gradient(90deg, rgba(0,0,0,0.06) 1px, transparent 1px)",
-        backgroundSize: `${gridSize}px ${gridSize}px`,
-      }
-    : {};
   return (
     // Transparent background — the Qt-WASM canvas iframe BEHIND this layer
     // draws the actual widget pixels. A solid bg here would just hide them.
-    // The grid overlay (when enabled) is composited on top of the iframe.
+    // The grid pattern is now painted by the parent canvas div (so it
+    // extends across the entire workspace, not just the page rect),
+    // hence no inline grid styling here. gridSize is still relevant for
+    // snapping (handled in the move/resize handlers, not painting).
     <div
       className="relative inline-block"
-      style={{ width: root.width, height: root.height, ...gridStyle }}
+      style={{ width: root.width, height: root.height }}
       onPointerDown={onMarqueeStart}
       onDragOver={onCanvasDragOver}
       onDrop={(e) => onCanvasDrop(e, root.id)}

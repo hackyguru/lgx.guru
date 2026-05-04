@@ -27,7 +27,35 @@ const DEFAULT_NVIDIA_MODEL = "z-ai/glm-5.1";
 
 interface LLM { client: OpenAI; model: string; providerName: "OpenAI" | "NVIDIA" }
 
-function pickProvider(modelOverride?: string): LLM | null {
+// Auth params surfaced from the request body (BYO key) when the user
+// configured one in the AI Settings modal. Always wins over env when
+// present — env is now just a local-dev convenience fallback.
+interface RequestAuth {
+  provider?: "openai" | "nvidia";
+  apiKey?: string;
+  model?: string;
+}
+
+function pickProvider(modelOverride?: string, byo?: RequestAuth): LLM | null {
+  // BYO path — the user's browser sent a key. Trust the provider hint;
+  // fall back to OpenAI shape if the hint is missing/garbage.
+  if (byo?.apiKey) {
+    if (byo.provider === "nvidia") {
+      return {
+        client: new OpenAI({ apiKey: byo.apiKey, baseURL: NVIDIA_BASE_URL }),
+        model: modelOverride || byo.model || process.env.NVIDIA_MODEL || DEFAULT_NVIDIA_MODEL,
+        providerName: "NVIDIA",
+      };
+    }
+    return {
+      client: new OpenAI({ apiKey: byo.apiKey }),
+      model: modelOverride || byo.model || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+      providerName: "OpenAI",
+    };
+  }
+
+  // Env-fallback path — same as before. Lets `pnpm dev` and the npx
+  // CLI work without forcing every user to paste a key into the UI.
   const openaiKey = process.env.OPENAI_API_KEY;
   if (openaiKey) {
     return {
@@ -601,11 +629,29 @@ export async function POST(request: NextRequest) {
   const modelOverride = typeof (body as { model?: unknown })?.model === "string"
     ? (body as { model: string }).model
     : undefined;
-  const llm = pickProvider(modelOverride);
+  // BYO auth from the AI Settings modal — read off the request body and
+  // hand to pickProvider so it overrides env for this single request.
+  // Stays local to the user's browser → server → OpenAI; lgx.guru's host
+  // never persists or sees these keys.
+  const byo: RequestAuth | undefined = (() => {
+    const auth = (body as { auth?: unknown })?.auth;
+    if (!isPlainObject(auth)) return undefined;
+    const apiKey = typeof auth.apiKey === "string" ? auth.apiKey.trim() : "";
+    if (!apiKey) return undefined;
+    const providerRaw = typeof auth.provider === "string" ? auth.provider.toLowerCase() : "";
+    const provider: "openai" | "nvidia" = providerRaw === "nvidia" ? "nvidia" : "openai";
+    const model = typeof auth.model === "string" ? auth.model.trim() : undefined;
+    return { provider, apiKey, model };
+  })();
+  const llm = pickProvider(modelOverride, byo);
   if (!llm) {
     return Response.json(
-      { error: "No LLM API key set. Add OPENAI_API_KEY (preferred) or NVIDIA_API_KEY to web/.env.local." },
-      { status: 500 }
+      {
+        error:
+          "No LLM API key configured. Open the AI sidebar's settings (gear icon) and paste your OpenAI or NVIDIA key — " +
+          "it's stored in this browser only and sent directly to the provider.",
+      },
+      { status: 401 },
     );
   }
   const { client, model, providerName } = llm;

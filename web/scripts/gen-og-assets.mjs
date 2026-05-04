@@ -20,7 +20,7 @@
  * Run with: pnpm gen:og
  */
 
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import sharp from "sharp";
@@ -38,8 +38,29 @@ const logoInline = logoSvg
   .replace(/<\?xml[^?]+\?>/, "")
   .replace(/<style[^>]*>[\s\S]*?<\/style>/, "");
 
-// 1) icon.svg — straight copy of the logo, used as the modern-browser favicon.
-copyFileSync(resolve(publicDir, "lgx-logo.svg"), resolve(publicDir, "icon.svg"));
+// Favicon palette: pure black-and-white, no greys. Both shapes (cls-0
+// accent + cls-1 letterforms) collapse to solid black so the mark reads
+// as a clean silhouette at 16/32 px. The browser-tab variant adds a
+// prefers-color-scheme media query so the silhouette flips to white on
+// dark tab strips — without it the mark would disappear into a black tab.
+const FAVICON_STYLE_BW = `<style type="text/css">
+  .cls-0, .cls-1 { fill: #000000; }
+  @media (prefers-color-scheme: dark) {
+    .cls-0, .cls-1 { fill: #ffffff; }
+  }
+</style>`;
+const FAVICON_STYLE_BW_FLAT = `<style type="text/css">
+  .cls-0, .cls-1 { fill: #000000; }
+</style>`;
+
+// Replace the original two-tone style block with the pure-B&W one.
+const swapStyle = (svg, styleBlock) =>
+  svg.replace(/<style[^>]*>[\s\S]*?<\/style>/, styleBlock);
+
+// 1) icon.svg — modern-browser favicon. Includes the dark-mode media
+//    query so the mark adapts to dark tab strips.
+const iconSvgBW = swapStyle(logoSvg, FAVICON_STYLE_BW);
+writeFileSync(resolve(publicDir, "icon.svg"), iconSvgBW);
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 const writePng = async (svg, outName, width, height) => {
@@ -48,19 +69,23 @@ const writePng = async (svg, outName, width, height) => {
   console.log(`  ✓ ${outName}  (${width}x${height})`);
 };
 
-// 2) Favicons — logo on transparent at common sizes. Using the source SVG
-//    so the strokes scale crisply.
-await writePng(logoSvg, "favicon-32.png", 32, 32);
-await writePng(logoSvg, "favicon-16.png", 16, 16);
+// 2) Favicons — flat solid-black silhouette (PNG can't carry the dark-mode
+//    media query, and most browsers serve the SVG to modern users anyway;
+//    the PNGs are fallbacks for older clients).
+const logoSvgBwFlat = swapStyle(logoSvg, FAVICON_STYLE_BW_FLAT);
+await writePng(logoSvgBwFlat, "favicon-32.png", 32, 32);
+await writePng(logoSvgBwFlat, "favicon-16.png", 16, 16);
 
-// 3) Apple touch icon — 180x180 with breathing room and a canvas background
-//    so it sits well on iOS home screens (which apply rounded-rect mask).
+// 3) Apple touch icon — 180x180 with breathing room and a white canvas
+//    background so it sits well on iOS home screens (which apply a
+//    rounded-rect mask). Pure black logo on white — matches the favicon
+//    palette so all icon variants stay consistent.
 const appleIconSvg = `
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
   <rect width="180" height="180" fill="#ffffff"/>
   <g transform="translate(30, 30) scale(0.8)">
     ${logoInline.replace(/<svg[^>]*>/, "").replace(/<\/svg>$/, "")}
-    <style>.cls-0 {fill:#615e5b;}.cls-1 {fill:#111111;}</style>
+    <style>.cls-0, .cls-1 { fill: #000000; }</style>
   </g>
 </svg>`.trim();
 await writePng(appleIconSvg, "apple-touch-icon.png", 180, 180);

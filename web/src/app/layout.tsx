@@ -25,8 +25,8 @@ const SITE_DESCRIPTION =
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: `${SITE_NAME} — visual builder for Logos Basecamp`,
-    template: `%s · ${SITE_NAME}`,
+    default: "LGX Guru",
+    template: "%s · LGX Guru",
   },
   description: SITE_DESCRIPTION,
   applicationName: SITE_NAME,

@@ -184,7 +184,16 @@ export const TEMPLATES: Template[] = [
       const inputVarId = newId();
       const lastMsgVarId = newId();
       const logVarId = newId();
-      const topic = "/lgxguru/1/delivery-test/text";
+      // Per-install nonce — keeps the topic out of the public firehose. The
+      // shared `/lgxguru/1/delivery-test/text` topic was carrying every
+      // tester's history, which made the relay replay hundreds of historical
+      // messages on subscribe and overwrite var_lastMessage at full speed.
+      // The nonce is baked into the exported .lgx, so when a user ships the
+      // built widget to a partner, both Basecamps see the same topic and
+      // can talk to each other; only fresh `Apply template` runs get fresh
+      // topics and start clean.
+      const nonce = Math.random().toString(36).slice(2, 10);
+      const topic = `/lgxguru/1/delivery-test/${nonce}/text`;
       const variables: Variable[] = [
         { id: inputVarId,   name: "messageInput", type: "string", initial: "" },
         { id: lastMsgVarId, name: "lastMessage",  type: "string", initial: "(none yet)" },
@@ -212,9 +221,29 @@ export const TEMPLATES: Template[] = [
             fontWeight: "bold", textAlign: "left",
           }),
           txt({
-            x: 40, y: 64, width: 720, height: 36,
-            text: `Install this widget on two Basecamp instances. Whatever you send from one will appear on the other.\nTopic: ${topic}`,
-            pixelSize: 12, color: "#71717a", lineHeight: 1.4,
+            x: 40, y: 64, width: 720, height: 18,
+            text: "Install this widget on two Basecamp instances. Whatever you send from one will appear on the other.",
+            pixelSize: 12, color: "#71717a",
+          }),
+          // Topic strip — pulled out into its own row + monospace tone so
+          // users can read the nonce and copy it to a partner installing
+          // the same widget. (Under the hood the partner just installs the
+          // exported .lgx, which has the topic baked in — but the visible
+          // topic doubles as a "you're talking to /this/ channel" cue.)
+          rect({
+            x: 40, y: 88, width: 720, height: 28,
+            style: { ...defaultStyle(), backgroundColor: "#f4f4f5", borderColor: "#e4e4e7", borderWidth: 1, borderRadius: 6 },
+          }),
+          txt({
+            x: 52, y: 88, width: 60, height: 28,
+            text: "TOPIC", pixelSize: 10, color: "#a1a1aa",
+            fontFamily: "Menlo, monospace", letterSpacing: 1.4,
+            fontWeight: "bold", textAlign: "left",
+          }),
+          txt({
+            x: 112, y: 88, width: 596, height: 28,
+            text: topic, pixelSize: 11, color: "#27272a",
+            fontFamily: "Menlo, monospace", textAlign: "left",
           }),
 
           // Sender card

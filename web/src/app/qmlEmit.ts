@@ -876,6 +876,17 @@ const triggersQml = (
   //     by content topic, with `topic` and `payload` in scope of each block
   // The status overlay (auto-injected later) reads these properties.
   if (needsDelivery) {
+    // Build the set of topics THIS widget cares about (the topics on its
+    // own onMessageReceived triggers). Used below to filter out messages
+    // intended for other widgets — `takeRecentMessages` drains the relay's
+    // global queue, so a widget polling will see messages from every other
+    // delivery-using widget on the same Basecamp. Without this filter,
+    // recvCount inflates per inbound chat / other-widget message and the
+    // counter looks like a flood even though the user's actual subscribed
+    // topic is quiet.
+    const myTopicEntries = topics
+      .map((t) => `${JSON.stringify(t)}: 1`)
+      .join(", ");
     lines.push(``);
     lines.push(
       `${indent}Timer {`,
@@ -890,9 +901,16 @@ const triggersQml = (
       `${indent}        if (!raw) return;`,
       `${indent}        var msgs = [];`,
       `${indent}        try { msgs = JSON.parse(raw) || []; } catch(e) { return; }`,
+      `${indent}        var _myTopics = { ${myTopicEntries} };`,
       `${indent}        for (var _i = 0; _i < msgs.length; _i++) {`,
       `${indent}            var topic = msgs[_i].topic;`,
       `${indent}            var payload = msgs[_i].payload;`,
+      // Skip messages on topics this widget didn't subscribe to. They
+      // belong to another widget that's also pulling from the shared
+      // relay queue — counting them as "received" would be misleading
+      // (and historically caused the "100s of messages, UI never
+      // updates" symptom when chat + delivery_test coexisted).
+      `${indent}            if (!_myTopics[topic]) continue;`,
       `${indent}            app.recvCount += 1;`,
     );
     for (const t of onMsg) {

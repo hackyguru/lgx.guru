@@ -31,7 +31,7 @@ const HomePage = () => {
   return (
     <>
       <Head>
-        <title>lgx.guru — visual builder for Logos Basecamp</title>
+        <title>LGX Guru</title>
         <meta
           name="description"
           content="Build Logos Basecamp modules without writing code. Drag-and-drop editor, AI-wired logic, live Qt-WASM preview, cross-platform .lgx export."
